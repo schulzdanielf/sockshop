@@ -7,12 +7,13 @@ gen-complete-demo:
 .PHONY: check-complete-demo
 check-complete-demo:
 	awk '{print}' ${MANIFESTS}/* | diff complete-demo.yaml -
-.dockerimage: Dockerfile
-	docker build -t manifests-image .
-	touch .dockerimage
+
+.PHONY: ensure-dockerimage
+ensure-dockerimage: Dockerfile
+	@docker image inspect manifests-image >/dev/null 2>&1 || docker build -t manifests-image .
 
 .PHONY: docker-%
-docker-%: .dockerimage
+docker-%: ensure-dockerimage
 	docker \
 	  run \
 	  --rm \
