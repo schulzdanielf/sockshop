@@ -1,0 +1,94 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: loadtest
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: locust-script
+  namespace: loadtest
+data:
+  locustfile.py: |
+    from locust import HttpUser, between, task
+
+
+    class SockShopUser(HttpUser):
+        wait_time = between(1, 3)
+
+        @task(3)
+        def home(self):
+            self.client.get("/")
+
+        @task(2)
+        def catalogue(self):
+            self.client.get("/category.html")
+
+        @task(1)
+        def cart(self):
+            self.client.get("/cart")
+
+        @task(1)
+        def login_page(self):
+            self.client.get("/login")
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: locust-web
+  namespace: loadtest
+  labels:
+    app: locust-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: locust-web
+  template:
+    metadata:
+      labels:
+        app: locust-web
+    spec:
+      containers:
+      - name: locust
+        image: locustio/locust:2.27.0
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          exec locust \
+            -f /mnt/locust/locustfile.py \
+            --host "$TARGET_HOST" \
+            --web-host 0.0.0.0 \
+            --web-port 8089
+        env:
+        - name: TARGET_HOST
+          value: http://front-end.sock-shop.svc.cluster.local
+        - name: LOCUST_WEB_PORT
+          value: "8089"
+        ports:
+        - containerPort: 8089
+          name: web
+        volumeMounts:
+        - name: locust-script
+          mountPath: /mnt/locust
+      volumes:
+      - name: locust-script
+        configMap:
+          name: locust-script
+      nodeSelector:
+        kubernetes.io/os: linux
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: locust-web
+  namespace: loadtest
+spec:
+  selector:
+    app: locust-web
+  ports:
+  - name: web
+    port: 8089
+    targetPort: 8089

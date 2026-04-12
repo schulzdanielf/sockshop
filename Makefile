@@ -35,10 +35,11 @@ observability-down:
 
 .PHONY: loadtest-up
 loadtest-up:
-	kubectl apply -f deploy/kubernetes/manifests-loadtest/loadtest-dep.yaml
+	kubectl apply -f deploy/kubernetes/manifests-loadtest/loadtest-configmap.yaml
 
 .PHONY: loadtest-down
 loadtest-down:
+	kubectl delete -f deploy/kubernetes/manifests-loadtest/loadtest-configmap.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/manifests-loadtest/loadtest-dep.yaml --ignore-not-found
 
 .PHONY: observability-port-forward
@@ -48,6 +49,7 @@ observability-port-forward:
 	nohup kubectl port-forward -n monitoring svc/prometheus 9090:9090 >/tmp/pf-prometheus.log 2>&1 &
 	nohup kubectl port-forward -n jaeger svc/jaeger-query 16686:80 >/tmp/pf-jaeger.log 2>&1 &
 	nohup kubectl port-forward -n kube-system svc/kibana 5602:5601 >/tmp/pf-kibana.log 2>&1 &
+	nohup kubectl port-forward -n loadtest svc/locust-web 8089:8089 >/tmp/pf-locust.log 2>&1 &
 
 .PHONY: observability-stop-port-forward
 observability-stop-port-forward:
@@ -56,7 +58,7 @@ observability-stop-port-forward:
 	pkill -f "kubectl port-forward -n monitoring svc/prometheus" || true
 	pkill -f "kubectl port-forward -n jaeger svc/jaeger-query" || true
 	pkill -f "kubectl port-forward -n kube-system svc/kibana" || true
-
+	pkill -f "kubectl port-forward -n loadtest svc/locust-web" || true
 .PHONY: observability
 observability: observability-up observability-port-forward
 
@@ -67,9 +69,7 @@ port-forward:
 	nohup kubectl port-forward -n monitoring svc/prometheus 9090:9090 >/tmp/pf-prometheus.log 2>&1 &
 	nohup kubectl port-forward -n jaeger svc/jaeger-query 16686:80 >/tmp/pf-jaeger.log 2>&1 &
 	nohup kubectl port-forward -n kube-system svc/kibana 5602:5601 >/tmp/pf-kibana.log 2>&1 &
-
-.PHONY: port-foward
-port-foward: port-forward
+	nohup kubectl port-forward -n loadtest svc/locust-web 8089:8089 >/tmp/pf-locust.log 2>&1 &
 
 .PHONY: cluster-down
 cluster-down: observability-stop-port-forward loadtest-down observability-down app-down

@@ -1,0 +1,12 @@
+python3 experiment/script/run_experiment.py \
+  --locust-cmd "kubectl -n loadtest exec deploy/locust-web -- locust" \
+  --locust-file /mnt/locust/locustfile.py \
+  --locust-host http://front-end.sock-shop.svc.cluster.local \
+  --users 50 \
+  --spawn-rate 20 \
+  --rounds 3 \
+  --warmup-seconds 60 \
+  --run-seconds 600 \
+  --sample-interval-seconds 30 \
+  --prom-url http://localhost:9090 \
+  --output-csv experiment/data/resultado_experimento_1.csv
