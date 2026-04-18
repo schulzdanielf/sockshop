@@ -21,8 +21,6 @@ spec:
         args:
         - --config=/etc/otel-collector-config/config.yaml
         ports:
-        - name: prom-rw
-          containerPort: 19291
         - name: otlp-grpc
           containerPort: 4317
         - name: otlp-http

@@ -13,6 +13,8 @@ spec:
     metadata:
       labels:
         name: front-end
+      annotations:
+        instrumentation.opentelemetry.io/inject-nodejs: "sock-shop/frontend-nodejs"
     spec:
       containers:
       - name: front-end
@@ -32,13 +34,15 @@ spec:
         - name: OTEL_SERVICE_NAME
           value: front-end
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: http://otel-collector:4318
+          value: http://otel-collector.monitoring.svc.cluster.local:4318
         - name: OTEL_EXPORTER_OTLP_PROTOCOL
           value: http/protobuf
+        - name: OTEL_PROPAGATORS
+          value: tracecontext,baggage,b3multi
         - name: OTEL_TRACES_EXPORTER
           value: otlp
         - name: OTEL_METRICS_EXPORTER
-          value: none
+          value: otlp
         - name: OTEL_LOGS_EXPORTER
           value: none
         securityContext:

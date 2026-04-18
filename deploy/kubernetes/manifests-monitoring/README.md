@@ -24,3 +24,27 @@ Once the grafana pod is in the Running state apply the `23-grafana-import-dash-b
 `kubectl apply -f 23-grafana-import-dash-batch.yaml`
 
 Grafana will be exposed on the NodePort `31300` 
+
+### OpenTelemetry
+
+Deploy the OpenTelemetry Collector manifests from 27 to 29:
+
+`kubectl apply -f 27-otel-collector-configmap.yaml -f 28-otel-collector-dep.yaml -f 29-otel-collector-svc.yaml`
+
+Install the OpenTelemetry Operator (required for Node.js auto-instrumentation):
+
+`kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml`
+
+Apply the front-end Instrumentation CR:
+
+`kubectl apply -f 33-otel-instrumentation-frontend.yaml`
+
+### Tempo
+
+Deploy Tempo and Grafana datasources manifests:
+
+`kubectl apply -f 34-tempo-configmap.yaml -f 35-tempo-dep.yaml -f 36-tempo-svc.yaml -f 37-grafana-datasources-configmap.yaml`
+
+Restart Grafana and OTel Collector to load the new datasource and trace exporter:
+
+`kubectl -n monitoring rollout restart deployment/grafana-core deployment/otel-collector`

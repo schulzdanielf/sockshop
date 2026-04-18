@@ -6,8 +6,18 @@ metadata:
 data:
   config.yaml: |
     receivers:
-      prometheusremotewrite:
-        endpoint: 0.0.0.0:19291
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: prometheus-federation
+              honor_labels: true
+              metrics_path: /federate
+              params:
+                'match[]':
+                  - '{__name__=~".+"}'
+              static_configs:
+                - targets:
+                    - prometheus.monitoring.svc.cluster.local:9090
       otlp:
         protocols:
           grpc:
@@ -21,6 +31,12 @@ data:
     exporters:
       debug:
         verbosity: normal
+      prometheusremotewrite:
+        endpoint: http://prometheus-v3.monitoring.svc.cluster.local:9090/api/v1/write
+      otlp/tempo:
+        endpoint: tempo.monitoring.svc.cluster.local:4317
+        tls:
+          insecure: true
 
     extensions:
       health_check:
@@ -30,13 +46,13 @@ data:
       extensions: [health_check]
       pipelines:
         metrics:
-          receivers: [prometheusremotewrite]
+          receivers: [prometheus, otlp]
           processors: [batch]
-          exporters: [debug]
+          exporters: [debug, prometheusremotewrite]
         traces:
           receivers: [otlp]
           processors: [batch]
-          exporters: [debug]
+          exporters: [debug, otlp/tempo]
         logs:
           receivers: [otlp]
           processors: [batch]
