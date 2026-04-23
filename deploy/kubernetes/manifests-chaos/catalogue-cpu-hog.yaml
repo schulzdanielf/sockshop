@@ -1,0 +1,195 @@
+kind: Workflow
+apiVersion: argoproj.io/v1alpha1
+metadata:
+  name: catalogue-cpu
+  namespace: litmus
+  labels:
+    infra_id: f21787ba-08ee-4649-ab66-c880492636dc
+    revision_id: 854ce32a-7145-4d79-b6cd-685db2276c69
+    subject: sock-shop_kube-proxy
+    workflow_id: 1bb7e1a8-0e6a-4284-9b4d-bf152af3001d
+    workflows.argoproj.io/controller-instanceid: f21787ba-08ee-4649-ab66-c880492636dc
+spec:
+  templates:
+    - name: argowf-chaos
+      inputs: {}
+      outputs: {}
+      metadata: {}
+      steps:
+        - - name: install-chaos-faults
+            template: install-chaos-faults
+            arguments: {}
+        - - name: run-chaos
+            template: run-chaos
+            arguments: {}
+        - - name: cleanup-chaos-resources
+            template: cleanup-chaos-resources
+            arguments: {}
+    - name: install-chaos-faults
+      inputs:
+        artifacts:
+          - name: install-chaos-faults
+            path: /tmp/pod-cpu-hog.yaml
+            raw:
+              data: >
+                apiVersion: litmuschaos.io/v1alpha1
+
+                description:
+                  message: |
+                    Injects cpu consumption on pods belonging to an app deployment
+                kind: ChaosExperiment
+
+                metadata:
+                  name: pod-cpu-hog
+                spec:
+                  definition:
+                    scope: Namespaced
+                    permissions:
+                      - apiGroups:
+                          - ""
+                          - "batch"
+                          - "litmuschaos.io"
+                        resources:
+                          - "jobs"
+                          - "pods"
+                          - "pods/log"
+                          - "events"
+                          - "chaosengines"
+                          - "chaosexperiments"
+                          - "chaosresults"
+                        verbs:
+                          - "create"
+                          - "list"
+                          - "get"
+                          - "patch"
+                          - "update"
+                          - "delete"
+                    image: "litmuschaos.docker.scarf.sh/litmuschaos/go-runner:3.28.0"
+                    imagePullPolicy: Always
+                    args:
+                    - -c
+                    - ./experiments -name pod-cpu-hog
+                    command:
+                    - /bin/bash
+                    env:
+                    - name: TOTAL_CHAOS_DURATION
+                      value: '30'
+
+                    - name: CHAOS_INTERVAL
+                      value: '10'
+
+                    ## Number of CPU cores to stress
+                    - name: CPU_CORES
+                      value: '1'
+
+                    ## Percentage of total pods to target
+                    - name: PODS_AFFECTED_PERC
+                      value: ''
+
+                    ## Period to wait before and after injection of chaos in sec
+                    - name: RAMP_TIME
+                      value: ''
+
+                    - name: TARGET_POD
+                      value: ''
+
+                    labels:
+                      name: pod-cpu-hog
+      outputs: {}
+      metadata: {}
+      container:
+        name: ""
+        image: litmuschaos/k8s:latest
+        command:
+          - sh
+          - -c
+        args:
+          - kubectl apply -f /tmp/pod-cpu-hog.yaml -n
+            {{workflow.parameters.adminModeNamespace}}
+        resources: {}
+    - name: run-chaos
+      inputs:
+        artifacts:
+          - name: run-chaos
+            path: /tmp/chaosengine-run-chaos.yaml
+            raw:
+              data: >
+                apiVersion: litmuschaos.io/v1alpha1
+
+                kind: ChaosEngine
+
+                metadata:
+                  namespace: "{{workflow.parameters.adminModeNamespace}}"
+                  labels:
+                    context: sock-shop_kube-proxy
+                    workflow_run_id: "{{ workflow.uid }}"
+                    workflow_name: catalogue-cpu
+                  annotations:
+                    probeRef: '[{"name":"catalogue-delay","mode":"EOT"}]'
+                  generateName: run-chaos
+                spec:
+                  appinfo:
+                    appns: sock-shop
+                    applabel: name=catalogue
+                    appkind: deployment
+                  jobCleanUpPolicy: retain
+                  engineState: active
+                  chaosServiceAccount: litmus-admin
+                  experiments:
+                    - name: pod-cpu-hog
+                      spec:
+                        components:
+                          env:
+                            - name: TARGET_CONTAINER
+                              value: catalogue
+                            - name: CPU_CORES
+                              value: "1"
+                            - name: CONTAINER_RUNTIME
+                              value: docker
+                            - name: SOCKET_PATH
+                              value: /var/run/docker.sock
+                            - name: TOTAL_CHAOS_DURATION
+                              value: "60"
+                            - name: CHAOS_KILL_COMMAND
+                              value: >-
+                                kill -9 $(ps afx | grep "[md5sum] /dev/zero" | awk '{print$1}' |
+                                tr '
+
+                                ' ' ')
+      outputs: {}
+      metadata:
+        labels:
+          weight: "10"
+      container:
+        name: ""
+        image: litmuschaos/litmus-checker:2.11.0
+        args:
+          - -file=/tmp/chaosengine-run-chaos.yaml
+          - -saveName=/tmp/engine-name
+        resources: {}
+    - name: cleanup-chaos-resources
+      inputs: {}
+      outputs: {}
+      metadata: {}
+      container:
+        name: ""
+        image: litmuschaos/k8s:latest
+        command:
+          - sh
+          - -c
+        args:
+          - kubectl delete chaosengine -l workflow_run_id={{workflow.uid}} -n
+            {{workflow.parameters.adminModeNamespace}}
+        resources: {}
+  entrypoint: argowf-chaos
+  arguments:
+    parameters:
+      - name: adminModeNamespace
+        value: litmus
+      - name: appNamespace
+        value: sock-shop
+  serviceAccountName: argo-chaos
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+status: {}

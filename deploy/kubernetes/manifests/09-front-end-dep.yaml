@@ -4,6 +4,8 @@ kind: Deployment
 metadata:
   name: front-end
   namespace: sock-shop
+  labels:
+    name: front-end
 spec:
   replicas: 1
   selector:

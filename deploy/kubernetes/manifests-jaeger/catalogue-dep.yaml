@@ -24,8 +24,8 @@ spec:
            value: http://zipkin.jaeger.svc.cluster.local:9411/api/v1/spans
         resources:
           limits:
-            cpu: 100m
-            memory: 100Mi
+            cpu: 200m
+            memory: 200Mi
           requests:
             cpu: 100m
             memory: 100Mi

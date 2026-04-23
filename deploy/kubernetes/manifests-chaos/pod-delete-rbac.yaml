@@ -1,0 +1,48 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-delete-sa
+  namespace: sock-shop
+  labels:
+    name: pod-delete-sa
+    app.kubernetes.io/part-of: litmus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-delete-sa
+  namespace: sock-shop
+  labels:
+    name: pod-delete-sa
+    app.kubernetes.io/part-of: litmus
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "pods/exec", "events", "replicationcontrollers"]
+  verbs: ["create", "list", "get", "patch", "update", "delete", "deletecollection"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["list", "get"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "list", "get", "delete", "deletecollection"]
+- apiGroups: ["litmuschaos.io"]
+  resources: ["chaosengines", "chaosexperiments", "chaosresults"]
+  verbs: ["create", "list", "get", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-delete-sa
+  namespace: sock-shop
+  labels:
+    name: pod-delete-sa
+    app.kubernetes.io/part-of: litmus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-delete-sa
+subjects:
+- kind: ServiceAccount
+  name: pod-delete-sa
+  namespace: sock-shop

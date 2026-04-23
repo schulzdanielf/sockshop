@@ -1,0 +1,45 @@
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: sock-shop-carts-pod-delete-prom-probe
+  namespace: sock-shop
+  annotations:
+    probeRef: carts-availability-prom-probe
+spec:
+  appinfo:
+    appns: sock-shop
+    applabel: name=carts
+    appkind: deployment
+  annotationCheck: "false"
+  chaosServiceAccount: pod-delete-sa
+  engineState: active
+  jobCleanUpPolicy: retain
+  experiments:
+  - name: pod-delete
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "30"
+        - name: CHAOS_INTERVAL
+          value: "10"
+        - name: FORCE
+          value: "false"
+        - name: SEQUENCE
+          value: serial
+      probe:
+      - name: carts-availability-prom-probe
+        type: promProbe
+        promProbe/inputs:
+          endpoint: http://prometheus.monitoring.svc.cluster.local:9090
+          query: 100 *sum(increase(request_duration_seconds_count{route=\"/cart\",status_code!~\"2..\"}[30s]))/sum(increase(request_duration_seconds_count{route=\"/cart\"}[30s]))
+          comparator:
+            criteria: ">"
+            value: "5"
+        mode: EOT
+        runProperties:
+            probeTimeout: "5s"
+            interval: "5s"
+            retry: 1
+            probePollingInterval: "5s"

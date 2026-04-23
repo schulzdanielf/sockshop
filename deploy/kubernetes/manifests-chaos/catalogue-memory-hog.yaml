@@ -1,0 +1,194 @@
+kind: Workflow
+apiVersion: argoproj.io/v1alpha1
+metadata:
+  name: catalogue-memory-hog
+  namespace: litmus
+  labels:
+    infra_id: f21787ba-08ee-4649-ab66-c880492636dc
+    revision_id: 4e799cbb-c2a5-43ba-8a02-0182c0ab094f
+    subject: sock-shop_kube-proxy
+    workflow_id: 71751ae8-18d2-4169-8cbf-0aa84d0d7dbd
+    workflows.argoproj.io/controller-instanceid: f21787ba-08ee-4649-ab66-c880492636dc
+spec:
+  templates:
+    - name: argowf-chaos
+      inputs: {}
+      outputs: {}
+      metadata: {}
+      steps:
+        - - name: install-chaos-faults
+            template: install-chaos-faults
+            arguments: {}
+        - - name: run-chaos
+            template: run-chaos
+            arguments: {}
+        - - name: cleanup-chaos-resources
+            template: cleanup-chaos-resources
+            arguments: {}
+    - name: install-chaos-faults
+      inputs:
+        artifacts:
+          - name: install-chaos-faults
+            path: /tmp/pod-memory-hog.yaml
+            raw:
+              data: >
+                apiVersion: litmuschaos.io/v1alpha1
+
+                description:
+                  message: |
+                    Injects memory consumption on pods belonging to an app deployment
+                kind: ChaosExperiment
+
+                metadata:
+                  name: pod-memory-hog
+                spec:
+                  definition:
+                    scope: Namespaced
+                    permissions:
+                      - apiGroups:
+                          - ""
+                          - "batch"
+                          - "litmuschaos.io"
+                        resources:
+                          - "jobs"
+                          - "pods"
+                          - "pods/log"
+                          - "events"
+                          - "chaosengines"
+                          - "chaosexperiments"
+                          - "chaosresults"
+                        verbs:
+                          - "create"
+                          - "list"
+                          - "get"
+                          - "patch"
+                          - "update"
+                          - "delete"
+                    image: "litmuschaos.docker.scarf.sh/litmuschaos/go-runner:3.28.0"
+                    args:
+                    - -c
+                    - ./experiments -name pod-memory-hog
+                    command:
+                    - /bin/bash
+                    env:
+                      - name: TOTAL_CHAOS_DURATION
+                        value: '30'
+
+                      - name: CHAOS_INTERVAL
+                        value: '10'
+
+                      ## enter the amount of memory in megabytes to be consumed by the application pod
+                      - name: MEMORY_CONSUMPTION
+                        value: '60'
+
+                      ## percentage of total pods to target
+                      - name: PODS_AFFECTED_PERC
+                        value: ''
+
+                      ## Period to wait before and after injection of chaos in sec
+                      - name: RAMP_TIME
+                        value: ''
+
+                      - name: TARGET_POD
+                        value: ''
+
+                    labels:
+                      name: pod-memory-hog
+      outputs: {}
+      metadata: {}
+      container:
+        name: ""
+        image: litmuschaos/k8s:latest
+        command:
+          - sh
+          - -c
+        args:
+          - kubectl apply -f /tmp/pod-memory-hog.yaml -n
+            {{workflow.parameters.adminModeNamespace}}
+        resources: {}
+    - name: run-chaos
+      inputs:
+        artifacts:
+          - name: run-chaos
+            path: /tmp/chaosengine-run-chaos.yaml
+            raw:
+              data: >
+                apiVersion: litmuschaos.io/v1alpha1
+
+                kind: ChaosEngine
+
+                metadata:
+                  namespace: "{{workflow.parameters.adminModeNamespace}}"
+                  labels:
+                    context: sock-shop_kube-proxy
+                    workflow_run_id: "{{ workflow.uid }}"
+                    workflow_name: catalogue-memory-hog
+                  annotations:
+                    probeRef: '[{"name":"catalogue-delay","mode":"EOT"}]'
+                  generateName: run-chaos
+                spec:
+                  appinfo:
+                    appns: sock-shop
+                    applabel: name=catalogue
+                    appkind: deployment
+                  jobCleanUpPolicy: retain
+                  engineState: active
+                  chaosServiceAccount: litmus-admin
+                  experiments:
+                    - name: pod-memory-hog
+                      spec:
+                        components:
+                          env:
+                            - name: TARGET_CONTAINER
+                              value: catalogue
+                            - name: CONTAINER_RUNTIME
+                              value: docker
+                            - name: SOCKET_PATH
+                              value: /var/run/docker.sock
+                            - name: MEMORY_CONSUMPTION
+                              value: "60"
+                            - name: TOTAL_CHAOS_DURATION
+                              value: "30"
+                            - name: CHAOS_KILL_COMMAND
+                              value: >-
+                                kill -9 $(ps afx | grep "[dd] if /dev/zero" | awk '{print $1}' |
+                                tr '
+
+                                ' ' ')
+      outputs: {}
+      metadata:
+        labels:
+          weight: "10"
+      container:
+        name: ""
+        image: litmuschaos/litmus-checker:2.11.0
+        args:
+          - -file=/tmp/chaosengine-run-chaos.yaml
+          - -saveName=/tmp/engine-name
+        resources: {}
+    - name: cleanup-chaos-resources
+      inputs: {}
+      outputs: {}
+      metadata: {}
+      container:
+        name: ""
+        image: litmuschaos/k8s:latest
+        command:
+          - sh
+          - -c
+        args:
+          - kubectl delete chaosengine -l workflow_run_id={{workflow.uid}} -n
+            {{workflow.parameters.adminModeNamespace}}
+        resources: {}
+  entrypoint: argowf-chaos
+  arguments:
+    parameters:
+      - name: adminModeNamespace
+        value: litmus
+      - name: appNamespace
+        value: sock-shop
+  serviceAccountName: argo-chaos
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+status: {}

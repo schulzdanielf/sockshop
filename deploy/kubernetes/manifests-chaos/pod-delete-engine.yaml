@@ -1,0 +1,28 @@
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: sock-shop-carts-pod-delete
+  namespace: sock-shop
+spec:
+  appinfo:
+    appns: sock-shop
+    applabel: name=carts
+    appkind: deployment
+  annotationCheck: "false"
+  chaosServiceAccount: pod-delete-sa
+  engineState: active
+  jobCleanUpPolicy: delete
+  experiments:
+  - name: pod-delete
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "30"
+        - name: CHAOS_INTERVAL
+          value: "10"
+        - name: FORCE
+          value: "false"
+        - name: SEQUENCE
+          value: serial
