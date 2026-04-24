@@ -3,6 +3,7 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: loadtest
+
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -11,117 +12,259 @@ metadata:
   namespace: loadtest
 data:
   locustfile.py: |
+    # Bibliotecas padrão para codificação, aleatoriedade e geração de IDs únicos
+    import base64
     import random
     from uuid import uuid4
 
+    # Importa as classes e decoradores do Locust para definir o usuário virtual e as tarefas
     from locust import HttpUser, between, task
 
 
+    # Define o usuário virtual que simula um cliente da loja Sock Shop
+    # wait_time: intervalo aleatório de 1 a 3 segundos entre cada requisição
     class SockShopUser(HttpUser):
         wait_time = between(1, 3)
 
+        # Executado uma vez quando o usuário virtual é iniciado
         def on_start(self):
+            # Gera credenciais únicas para este usuário
+            self._new_identity()
+            # Registra o usuário na loja e obtém o customer_id
+            self._register()
+
+            # Se o registro foi bem-sucedido, monta o cabeçalho de autenticação HTTP Basic
+            if self.customer_id:
+                self.auth_header = self._build_auth_header(
+                    self.username,
+                    self.password
+                )
+
+            # Controla se o fluxo de checkout será executado nas tarefas
+            self.enable_checkout = False
+
+        # Gera uma nova identidade aleatória para o usuário (nome, senha, e-mail)
+        def _new_identity(self):
             self.username = f"user_{uuid4().hex[:8]}"
             self.password = "Passw0rd!"
             self.email = f"{self.username}@example.com"
             self.customer_id = None
+            self.auth_header = None
 
-            self._register()
-            self._login()
-            self._resolve_customer_id()
+        # Constrói o cabeçalho de autenticação HTTP Basic codificando as credenciais em Base64
+        def _build_auth_header(self, username, password):
+            token = base64.b64encode(
+                f"{username}:{password}".encode("utf-8")
+            ).decode("ascii")
 
+            return {
+                "Authorization": f"Basic {token}"
+            }
+
+        # Verifica se a resposta da API contém um campo de erro da aplicação (erro de negócio)
+        def _response_has_app_error(self, response):
+            try:
+                data = response.json()
+                return isinstance(data, dict) and bool(data.get("error"))
+            except Exception:
+                return False
+
+        # Registra um novo usuário na loja enviando nome, senha e e-mail
+        # Armazena o customer_id retornado para uso nas demais requisições
         def _register(self):
             payload = {
                 "username": self.username,
                 "password": self.password,
                 "email": self.email,
             }
-            self.client.post("/register", json=payload, name="POST /register")
 
-        def _login(self):
-            payload = {
-                "username": self.username,
-                "password": self.password,
-            }
-            self.client.post("/login", json=payload, name="POST /login")
+            with self.client.post(
+                "/register",
+                json=payload,
+                name="POST /register",
+                catch_response=True
+            ) as resp:
 
-        def _resolve_customer_id(self):
-            with self.client.get("/customer", name="GET /customer", catch_response=True) as resp:
-                if resp.status_code != 200:
-                    resp.failure(f"customer lookup failed: {resp.status_code}")
+                if resp.status_code not in (200, 201):
+                    resp.failure(
+                        f"register failed: {resp.status_code}"
+                    )
                     return
 
                 try:
                     data = resp.json()
-                    self.customer_id = data.get("id")
-                    if not self.customer_id:
-                        resp.failure("customer id not found in /customer response")
-                except Exception as exc:
-                    resp.failure(f"invalid /customer json: {exc}")
+                    self.customer_id = data.get("id") or data.get("_id")
 
-        def _pick_catalogue_item(self):
-            with self.client.get("/catalogue?size=9", name="GET /catalogue", catch_response=True) as resp:
+                    if not self.customer_id:
+                        resp.failure(
+                            "register response without customer id"
+                        )
+
+                except Exception as exc:
+                    resp.failure(
+                        f"invalid register json: {exc}"
+                    )
+
+        # Verifica se a sessão do usuário ainda está ativa fazendo um GET no endpoint de login
+        def _check_login_state(self):
+            with self.client.get(
+                "/login",
+                headers=self.auth_header,
+                name="GET /login",
+                catch_response=True
+            ) as resp:
+
                 if resp.status_code != 200:
-                    resp.failure(f"catalogue failed: {resp.status_code}")
+                    resp.failure(
+                        f"unexpected login status: {resp.status_code}"
+                    )
+
+        # Busca até 9 produtos do catálogo e retorna o ID de um produto escolhido aleatoriamente
+        def _pick_catalogue_item(self):
+            with self.client.get(
+                "/catalogue?size=9",
+                name="GET /catalogue",
+                catch_response=True
+            ) as resp:
+
+                if resp.status_code != 200:
+                    resp.failure(
+                        f"catalogue failed: {resp.status_code}"
+                    )
                     return None
 
                 try:
                     items = resp.json()
+
                     if isinstance(items, list) and items:
-                        return random.choice(items).get("id")
-                    resp.failure("catalogue returned empty list")
+                        item = random.choice(items)
+                        return item.get("id")
+
+                    resp.failure("catalogue empty")
                     return None
+
                 except Exception as exc:
-                    resp.failure(f"invalid catalogue json: {exc}")
+                    resp.failure(
+                        f"invalid catalogue json: {exc}"
+                    )
                     return None
 
+        # Adiciona um produto ao carrinho do usuário autenticado
         def _add_to_cart(self, item_id):
-            payload = {"id": item_id, "quantity": 1}
-            with self.client.post("/cart", json=payload, name="POST /cart", catch_response=True) as resp:
-                if resp.status_code not in (200, 201, 202):
-                    resp.failure(f"add to cart failed: {resp.status_code}")
-
-        def _create_address(self):
-            number = random.randint(10, 9999)
             payload = {
-                "number": str(number),
-                "street": "Rua de Teste",
+                "id": item_id,
+                "quantity": 1
+            }
+
+            with self.client.post(
+                "/cart",
+                json=payload,
+                headers=self.auth_header,
+                name="POST /cart",
+                catch_response=True
+            ) as resp:
+
+                if resp.status_code not in (200, 201, 202):
+                    resp.failure(
+                        f"add to cart failed: {resp.status_code}"
+                    )
+
+        # Remove todos os itens do carrinho do usuário (limpa o carrinho antes de adicionar novo produto)
+        def _clear_cart(self):
+            with self.client.delete(
+                "/cart",
+                headers=self.auth_header,
+                name="DELETE /cart",
+                catch_response=True
+            ) as resp:
+
+                if resp.status_code not in (200, 202):
+                    resp.failure(
+                        f"clear cart failed: {resp.status_code}"
+                    )
+
+        # Cadastra um endereço de entrega aleatório para o usuário e retorna o ID do endereço
+        def _create_address(self):
+            payload = {
+                "number": str(random.randint(10, 9999)),
+                "street": "Rua Teste",
                 "city": "Sao Paulo",
                 "postcode": "01001-000",
                 "country": "Brazil",
             }
-            with self.client.post("/addresses", json=payload, name="POST /addresses", catch_response=True) as resp:
+
+            with self.client.post(
+                "/addresses",
+                json=payload,
+                headers=self.auth_header,
+                name="POST /addresses",
+                catch_response=True
+            ) as resp:
+
                 if resp.status_code not in (200, 201):
-                    resp.failure(f"create address failed: {resp.status_code}")
+                    resp.failure(
+                        f"create address failed: {resp.status_code}"
+                    )
+                    return None
+
+                if self._response_has_app_error(resp):
+                    resp.failure("application error address")
                     return None
 
                 try:
-                    data = resp.json()
-                    return data.get("id")
+                    return resp.json().get("id")
+
                 except Exception as exc:
-                    resp.failure(f"invalid address json: {exc}")
+                    resp.failure(
+                        f"invalid address json: {exc}"
+                    )
                     return None
 
+        # Cadastra um cartão de crédito fictício para o usuário e retorna o ID do cartão
         def _create_card(self):
             payload = {
                 "longNum": "5555555555554444",
                 "expires": "12/30",
                 "ccv": "123",
             }
-            with self.client.post("/cards", json=payload, name="POST /cards", catch_response=True) as resp:
+
+            with self.client.post(
+                "/cards",
+                json=payload,
+                headers=self.auth_header,
+                name="POST /cards",
+                catch_response=True
+            ) as resp:
+
                 if resp.status_code not in (200, 201):
-                    resp.failure(f"create card failed: {resp.status_code}")
+                    resp.failure(
+                        f"create card failed: {resp.status_code}"
+                    )
+                    return None
+
+                if self._response_has_app_error(resp):
+                    resp.failure("application error card")
                     return None
 
                 try:
-                    data = resp.json()
-                    return data.get("id")
+                    return resp.json().get("id")
+
                 except Exception as exc:
-                    resp.failure(f"invalid card json: {exc}")
+                    resp.failure(
+                        f"invalid card json: {exc}"
+                    )
                     return None
 
+        # Finaliza a compra criando um pedido com o endereço e cartão informados
+        # Só executa se todos os dados necessários estiverem disponíveis
         def _checkout(self, address_id, card_id):
-            if not (self.customer_id and address_id and card_id):
+            if not self.customer_id:
+                return
+
+            if not address_id:
+                return
+
+            if not card_id:
                 return
 
             payload = {
@@ -129,32 +272,79 @@ data:
                 "address": address_id,
                 "card": card_id,
             }
-            with self.client.post("/orders", json=payload, name="POST /orders", catch_response=True) as resp:
-                if resp.status_code not in (200, 201, 202):
-                    resp.failure(f"checkout failed: {resp.status_code}")
 
-        @task
+            with self.client.post(
+                "/orders",
+                json=payload,
+                headers=self.auth_header,
+                name="POST /orders",
+                catch_response=True
+            ) as resp:
+
+                if resp.status_code not in (200, 201, 202):
+                    resp.failure(
+                        f"checkout failed: {resp.status_code}"
+                    )
+                    return
+
+                if self._response_has_app_error(resp):
+                    resp.failure(
+                        "checkout application error"
+                    )
+
+        # Tarefa com peso 1: registra um novo usuário (ocorre com menor frequência)
+        @task(1)
+        def register_new_user(self):
+            self._new_identity()
+            self._register()
+
+            if self.customer_id:
+                self.auth_header = self._build_auth_header(
+                    self.username,
+                    self.password
+                )
+
+        # Tarefa com peso 4: simula a jornada completa do cliente (ocorre 4x mais que o registro)
+        # Fluxo: página inicial → categoria → login → catálogo → carrinho → (checkout opcional) → pedidos
+        @task(4)
         def realistic_journey(self):
+            if not self.auth_header:
+                return
+
             self.client.get("/", name="GET /")
-            self.client.get("/category.html", name="GET /category.html")
+            self.client.get(
+                "/category.html",
+                name="GET /category.html"
+            )
+
+            # Ensure user context/session is established before cart actions.
+            self._check_login_state()
 
             item_id = self._pick_catalogue_item()
+
             if item_id:
+                self._clear_cart()
                 self._add_to_cart(item_id)
 
-            self.client.get("/cart.html", name="GET /cart.html")
-            self.client.get("/login", name="GET /login")
+            self.client.get(
+                "/basket.html",
+                name="GET /basket.html"
+            )
 
-            # Re-login occasionally to mimic realistic session churn.
-            if random.random() < 0.2:
-                self._login()
-                self._resolve_customer_id()
+            if self.enable_checkout:
+                address_id = self._create_address()
+                card_id = self._create_card()
 
-            address_id = self._create_address()
-            card_id = self._create_card()
-            self._checkout(address_id, card_id)
+                self._checkout(
+                    address_id,
+                    card_id
+                )
 
-            self.client.get("/customer-orders.html", name="GET /customer-orders.html")
+            self.client.get(
+                "/customer-orders.html",
+                name="GET /customer-orders.html"
+            )
+
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -173,11 +363,15 @@ spec:
       labels:
         app: locust-web
     spec:
+      nodeSelector:
+        kubernetes.io/os: linux
       containers:
       - name: locust
         image: locustio/locust:2.27.0
         imagePullPolicy: IfNotPresent
-        command: ["/bin/sh", "-c"]
+        command:
+        - /bin/sh
+        - -c
         args:
         - |
           exec locust \
@@ -191,8 +385,15 @@ spec:
         - name: LOCUST_WEB_PORT
           value: "8089"
         ports:
-        - containerPort: 8089
-          name: web
+        - name: web
+          containerPort: 8089
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
         volumeMounts:
         - name: locust-script
           mountPath: /mnt/locust
@@ -200,8 +401,7 @@ spec:
       - name: locust-script
         configMap:
           name: locust-script
-      nodeSelector:
-        kubernetes.io/os: linux
+
 ---
 apiVersion: v1
 kind: Service
@@ -209,6 +409,7 @@ metadata:
   name: locust-web
   namespace: loadtest
 spec:
+  type: ClusterIP
   selector:
     app: locust-web
   ports:

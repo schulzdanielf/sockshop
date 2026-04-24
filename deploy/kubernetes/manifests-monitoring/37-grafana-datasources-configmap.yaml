@@ -18,3 +18,8 @@ data:
         access: proxy
         url: http://tempo.monitoring.svc.cluster.local:3200
         editable: true
+      - name: loki
+        type: loki
+        access: proxy
+        url: http://loki.monitoring.svc.cluster.local:3100
+        editable: true

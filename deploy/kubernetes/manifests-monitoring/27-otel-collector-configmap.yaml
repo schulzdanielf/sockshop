@@ -6,6 +6,16 @@ metadata:
 data:
   config.yaml: |
     receivers:
+      filelog:
+        include:
+          - /var/log/containers/*.log
+        start_at: end
+        include_file_path: true
+        operators:
+          - type: container
+          - type: regex_parser
+            parse_from: attributes["log.file.path"]
+            regex: '^.*/(?P<pod>[^_]+)_(?P<namespace>[^_]+)_(?P<container>.+)-[^-]+\.log$'
       prometheus:
         config:
           scrape_configs:
@@ -26,11 +36,18 @@ data:
             endpoint: 0.0.0.0:4318
 
     processors:
+      attributes/loki_labels:
+        actions:
+          - action: upsert
+            key: loki.attribute.labels
+            value: namespace,pod,container
       batch: {}
 
     exporters:
       debug:
         verbosity: normal
+      loki:
+        endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
       prometheusremotewrite:
         endpoint: http://prometheus-v3.monitoring.svc.cluster.local:9090/api/v1/write
       otlp/tempo:
@@ -54,6 +71,6 @@ data:
           processors: [batch]
           exporters: [debug, otlp/tempo]
         logs:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [debug]
+          receivers: [otlp, filelog]
+          processors: [attributes/loki_labels, batch]
+          exporters: [debug, loki]
