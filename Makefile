@@ -193,3 +193,8 @@ cluster-up: app-up observability-up loadtest-up
 
 .PHONY: cluster-restart
 cluster-restart: cluster-down cluster-up port-forward
+
+.PHONY: git
+git:
+	git add .
+	git status

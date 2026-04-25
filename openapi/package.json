@@ -3,7 +3,8 @@
     "nicename": "Microservices demo API test",
     "version": "0.0.1",
     "private": true,
-    "description": "Verify microservices API endpoints against the specification",
+    "description": "Verify API endpoints for the adapted Sock Shop project",
+    "author": "schulzdanielf",
     
     "engines": {
         "node": "6",

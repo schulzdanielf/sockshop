@@ -4,6 +4,10 @@
 
 The application is the user-facing part of an online shop that sells socks. It is intended to aid the demonstration and testing of microservice and cloud native technologies.
 
+This repository is an adapted copy of the original Sock Shop project created by Weaveworks, extended here with custom experiments, deployment adjustments, observability changes, and load-test updates.
+
+Current development and maintenance are handled by a single developer: `schulzdanielf`.
+
 It is built using [Spring Boot](http://projects.spring.io/spring-boot/), [Go kit](http://gokit.io) and [Node.js](https://nodejs.org/) and is packaged in Docker containers.
 
 You can read more about the [application design](./internal-docs/design.md).
@@ -16,7 +20,7 @@ Please let us know if there is a platform that you would like to see supported.
 
 ## Bugs, Feature Requests and Contributing
 
-We'd love to see community contributions. We like to keep it simple and use Github issues to track bugs and feature requests and pull requests to manage contributions. See the [contribution information](.github/CONTRIBUTING.md) for more information.
+This adapted repository is currently maintained by a single developer. Issues and pull requests can still be used to track bugs, improvements, and proposed changes. See the [contribution information](.github/CONTRIBUTING.md) for more information.
 
 ## Screenshot
 
