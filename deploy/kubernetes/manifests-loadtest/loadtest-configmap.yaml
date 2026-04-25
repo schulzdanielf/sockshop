@@ -12,8 +12,10 @@ metadata:
   namespace: loadtest
 data:
   locustfile.py: |
-    # Bibliotecas padrão para codificação, aleatoriedade e geração de IDs únicos
     import base64
+    import re
+
+    # Bibliotecas padrão para aleatoriedade e geração de IDs únicos
     import random
     from uuid import uuid4
 
@@ -30,18 +32,13 @@ data:
         def on_start(self):
             # Gera credenciais únicas para este usuário
             self._new_identity()
-            # Registra o usuário na loja e obtém o customer_id
+            # Registra o usuário na loja
             self._register()
+            # Autentica explicitamente no front-end para fixar customerId na sessão
+            self._login()
 
-            # Se o registro foi bem-sucedido, monta o cabeçalho de autenticação HTTP Basic
-            if self.customer_id:
-                self.auth_header = self._build_auth_header(
-                    self.username,
-                    self.password
-                )
-
-            # Controla se o fluxo de checkout será executado nas tarefas
-            self.enable_checkout = False
+            # Apenas uma fração dos usuários tenta concluir compra.
+            self.enable_checkout = random.random() < 0.3
 
         # Gera uma nova identidade aleatória para o usuário (nome, senha, e-mail)
         def _new_identity(self):
@@ -49,17 +46,6 @@ data:
             self.password = "Passw0rd!"
             self.email = f"{self.username}@example.com"
             self.customer_id = None
-            self.auth_header = None
-
-        # Constrói o cabeçalho de autenticação HTTP Basic codificando as credenciais em Base64
-        def _build_auth_header(self, username, password):
-            token = base64.b64encode(
-                f"{username}:{password}".encode("utf-8")
-            ).decode("ascii")
-
-            return {
-                "Authorization": f"Basic {token}"
-            }
 
         # Verifica se a resposta da API contém um campo de erro da aplicação (erro de negócio)
         def _response_has_app_error(self, response):
@@ -69,8 +55,13 @@ data:
             except Exception:
                 return False
 
-        # Registra um novo usuário na loja enviando nome, senha e e-mail
-        # Armazena o customer_id retornado para uso nas demais requisições
+        # Valida o formato de ObjectId usado pelos servicos Mongo do Sock Shop.
+        def _is_valid_object_id(self, value):
+            return isinstance(value, str) and bool(re.fullmatch(r"[a-fA-F0-9]{24}", value))
+
+        # Registra um novo usuário na loja enviando nome, senha e e-mail.
+        # O id retornado pelo backend nao sera usado no fluxo de compra; a sessao
+        # passa a ser estabelecida pelo login com username e password.
         def _register(self):
             payload = {
                 "username": self.username,
@@ -93,31 +84,69 @@ data:
 
                 try:
                     data = resp.json()
-                    self.customer_id = data.get("id") or data.get("_id")
 
-                    if not self.customer_id:
+                    created_id = data.get("id") or data.get("_id")
+
+                    if not created_id:
                         resp.failure(
                             "register response without customer id"
                         )
+                        return
+
+                    # Guarda apenas ids no formato esperado pelos servicos de pedido.
+                    if self._is_valid_object_id(created_id):
+                        self.customer_id = created_id
 
                 except Exception as exc:
                     resp.failure(
                         f"invalid register json: {exc}"
                     )
 
-        # Verifica se a sessão do usuário ainda está ativa fazendo um GET no endpoint de login
-        def _check_login_state(self):
+        # Faz login com o usuario e senha criados para que o front-end grave o
+        # customerId correto na sessao HTTP usada pelo restante da jornada.
+        def _login(self):
+            auth = base64.b64encode(
+                f"{self.username}:{self.password}".encode("utf-8")
+            ).decode("ascii")
+
             with self.client.get(
                 "/login",
-                headers=self.auth_header,
+                headers={
+                    "Authorization": f"Basic {auth}",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
                 name="GET /login",
                 catch_response=True
             ) as resp:
 
                 if resp.status_code != 200:
                     resp.failure(
-                        f"unexpected login status: {resp.status_code}"
+                        f"login failed: {resp.status_code}"
                     )
+                    self.customer_id = None
+                    return
+
+                try:
+                    data = resp.json()
+
+                    # Prioriza id explicito no payload de login.
+                    login_id = data.get("id") or data.get("_id")
+
+                    # Em algumas respostas, o id vem no _links.customer.href.
+                    if (not login_id) and isinstance(data.get("_links"), dict):
+                        customer = data["_links"].get("customer")
+
+                        if isinstance(customer, dict):
+                            href = customer.get("href")
+                            if isinstance(href, str) and href:
+                                login_id = href.rstrip("/").split("/")[-1]
+
+                    if self._is_valid_object_id(login_id):
+                        self.customer_id = login_id
+
+                except Exception:
+                    # Se o corpo nao for JSON, mantemos o id obtido no cadastro.
+                    pass
 
         # Busca até 9 produtos do catálogo e retorna o ID de um produto escolhido aleatoriamente
         def _pick_catalogue_item(self):
@@ -159,7 +188,6 @@ data:
             with self.client.post(
                 "/cart",
                 json=payload,
-                headers=self.auth_header,
                 name="POST /cart",
                 catch_response=True
             ) as resp:
@@ -173,7 +201,6 @@ data:
         def _clear_cart(self):
             with self.client.delete(
                 "/cart",
-                headers=self.auth_header,
                 name="DELETE /cart",
                 catch_response=True
             ) as resp:
@@ -196,7 +223,6 @@ data:
             with self.client.post(
                 "/addresses",
                 json=payload,
-                headers=self.auth_header,
                 name="POST /addresses",
                 catch_response=True
             ) as resp:
@@ -212,7 +238,8 @@ data:
                     return None
 
                 try:
-                    return resp.json().get("id")
+                    data = resp.json()
+                    return data.get("id") or data.get("_id")
 
                 except Exception as exc:
                     resp.failure(
@@ -231,7 +258,6 @@ data:
             with self.client.post(
                 "/cards",
                 json=payload,
-                headers=self.auth_header,
                 name="POST /cards",
                 catch_response=True
             ) as resp:
@@ -247,7 +273,8 @@ data:
                     return None
 
                 try:
-                    return resp.json().get("id")
+                    data = resp.json()
+                    return data.get("id") or data.get("_id")
 
                 except Exception as exc:
                     resp.failure(
@@ -255,28 +282,51 @@ data:
                     )
                     return None
 
-        # Finaliza a compra criando um pedido com o endereço e cartão informados
-        # Só executa se todos os dados necessários estiverem disponíveis
-        def _checkout(self, address_id, card_id):
-            if not self.customer_id:
-                return
+        # Lê o endereço padrão, como a tela do carrinho faz antes do checkout.
+        def _get_default_address(self):
+            with self.client.get(
+                "/address",
+                name="GET /address",
+                catch_response=True
+            ) as resp:
 
-            if not address_id:
-                return
+                if resp.status_code != 200:
+                    resp.failure(
+                        f"get address failed: {resp.status_code}"
+                    )
 
-            if not card_id:
+        # Lê o cartão padrão, como a tela do carrinho faz antes do checkout.
+        def _get_default_card(self):
+            with self.client.get(
+                "/card",
+                name="GET /card",
+                catch_response=True
+            ) as resp:
+
+                if resp.status_code != 200:
+                    resp.failure(
+                        f"get card failed: {resp.status_code}"
+                    )
+
+        # Finaliza a compra usando a sessão já criada pelo front-end.
+        # O endpoint do front monta o pedido a partir do customerId, endereço e cartão da sessão.
+        def _checkout(self, address_id=None, card_id=None):
+            if not self._is_valid_object_id(self.customer_id):
                 return
 
             payload = {
                 "customerId": self.customer_id,
-                "address": address_id,
-                "card": card_id,
             }
+
+            if address_id:
+                payload["address"] = address_id
+
+            if card_id:
+                payload["card"] = card_id
 
             with self.client.post(
                 "/orders",
                 json=payload,
-                headers=self.auth_header,
                 name="POST /orders",
                 catch_response=True
             ) as resp:
@@ -297,18 +347,13 @@ data:
         def register_new_user(self):
             self._new_identity()
             self._register()
-
-            if self.customer_id:
-                self.auth_header = self._build_auth_header(
-                    self.username,
-                    self.password
-                )
+            self._login()
 
         # Tarefa com peso 4: simula a jornada completa do cliente (ocorre 4x mais que o registro)
         # Fluxo: página inicial → categoria → login → catálogo → carrinho → (checkout opcional) → pedidos
         @task(4)
         def realistic_journey(self):
-            if not self.auth_header:
+            if not self.customer_id:
                 return
 
             self.client.get("/", name="GET /")
@@ -316,9 +361,6 @@ data:
                 "/category.html",
                 name="GET /category.html"
             )
-
-            # Ensure user context/session is established before cart actions.
-            self._check_login_state()
 
             item_id = self._pick_catalogue_item()
 
@@ -335,10 +377,10 @@ data:
                 address_id = self._create_address()
                 card_id = self._create_card()
 
-                self._checkout(
-                    address_id,
-                    card_id
-                )
+                if address_id and card_id:
+                    self._get_default_address()
+                    self._get_default_card()
+                    self._checkout(address_id, card_id)
 
             self.client.get(
                 "/customer-orders.html",
