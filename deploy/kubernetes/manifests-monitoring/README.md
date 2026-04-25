@@ -31,6 +31,12 @@ Deploy the OpenTelemetry Collector manifests from 27 to 29:
 
 `kubectl apply -f 27-otel-collector-configmap.yaml -f 28-otel-collector-dep.yaml -f 29-otel-collector-svc.yaml`
 
+Logs pipeline (single path):
+
+- Use OpenTelemetry Collector as the only log shipper to Loki.
+- Promtail manifests (41-43) should not be applied together with OTel logs pipeline to avoid duplicated ingestion.
+- The filelog receiver is scoped to `sock-shop` container logs.
+
 Install the OpenTelemetry Operator (required for Node.js auto-instrumentation):
 
 `kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml`

@@ -8,14 +8,35 @@ data:
     receivers:
       filelog:
         include:
-          - /var/log/containers/*.log
-        start_at: end
+          - /var/log/containers/*_sock-shop_*.log
+        start_at: beginning
         include_file_path: true
+        include_file_name: true
         operators:
-          - type: container
+          - type: json_parser
+            parse_from: body
+            parse_to: attributes
+            on_error: send
+          - type: time_parser
+            parse_from: attributes.time
+            layout_type: gotime
+            layout: '2006-01-02T15:04:05.999999999Z07:00'
+            if: attributes.time != nil
+          - type: move
+            from: attributes.log
+            to: body
+            if: attributes.log != nil
+          - type: remove
+            field: attributes.time
+            if: attributes.time != nil
+          - type: remove
+            field: attributes.stream
+            if: attributes.stream != nil
           - type: regex_parser
             parse_from: attributes["log.file.path"]
-            regex: '^.*/(?P<pod>[^_]+)_(?P<namespace>[^_]+)_(?P<container>.+)-[^-]+\.log$'
+            regex: '^.*/(?P<pod>[^_]+)_(?P<namespace>[^_]+)_(?P<container>.+)-[a-f0-9]{64}\.log$'
+            parse_to: attributes
+            on_error: send
       prometheus:
         config:
           scrape_configs:
@@ -36,16 +57,26 @@ data:
             endpoint: 0.0.0.0:4318
 
     processors:
+      attributes/log_source:
+        actions:
+          - action: upsert
+            key: log_source
+            value: otel_filelog
+      attributes/loki_format:
+        actions:
+          - action: upsert
+            key: loki.format
+            value: raw
       attributes/loki_labels:
         actions:
           - action: upsert
             key: loki.attribute.labels
-            value: namespace,pod,container
+            value: log_source,namespace,pod,container
       batch: {}
 
     exporters:
-      debug:
-        verbosity: normal
+      debug/logs:
+        verbosity: detailed
       loki:
         endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
       prometheusremotewrite:
@@ -65,12 +96,12 @@ data:
         metrics:
           receivers: [prometheus, otlp]
           processors: [batch]
-          exporters: [debug, prometheusremotewrite]
+          exporters: [prometheusremotewrite]
         traces:
           receivers: [otlp]
           processors: [batch]
-          exporters: [debug, otlp/tempo]
+          exporters: [otlp/tempo]
         logs:
           receivers: [otlp, filelog]
-          processors: [attributes/loki_labels, batch]
-          exporters: [debug, loki]
+          processors: [attributes/log_source, attributes/loki_format, attributes/loki_labels, batch]
+          exporters: [debug/logs, loki]

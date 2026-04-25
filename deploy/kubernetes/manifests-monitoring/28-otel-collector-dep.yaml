@@ -1,12 +1,11 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: otel-collector
   namespace: monitoring
   labels:
     app: otel-collector
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: otel-collector
