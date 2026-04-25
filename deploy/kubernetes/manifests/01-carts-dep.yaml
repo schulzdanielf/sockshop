@@ -21,7 +21,13 @@ spec:
         image: weaveworksdemos/carts:0.4.8
         env:
          - name: JAVA_OPTS
-           value: -Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=false
+           value: -Xms64m -Xmx128m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom
+         - name: SPRING_ZIPKIN_ENABLED
+           value: "true"
+         - name: SPRING_ZIPKIN_BASE_URL
+           value: http://otel-collector.monitoring.svc.cluster.local:9411/
+         - name: SPRING_SLEUTH_SAMPLER_PROBABILITY
+           value: "1.0"
         resources:
           limits:
             cpu: 300m

@@ -29,6 +29,10 @@ spec:
           containerPort: 4318
         - name: health
           containerPort: 13133
+        - name: zipkin
+          containerPort: 9411
+        - name: metrics
+          containerPort: 8888
         livenessProbe:
           httpGet:
             path: /

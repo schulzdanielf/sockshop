@@ -18,3 +18,9 @@ spec:
   - name: health
     port: 13133
     targetPort: 13133
+  - name: zipkin
+    port: 9411
+    targetPort: 9411
+  - name: metrics
+    port: 8888
+    targetPort: 8888
