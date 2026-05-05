@@ -162,6 +162,8 @@ port-forward:
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_FRONTEND_SERVICE) $(LITMUS_CHAOS_CENTER_FRONTEND_PORT):9091 >/tmp/pf-chaos-center.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE) $(LITMUS_CHAOS_CENTER_SERVER_PORT):9002 >/tmp/pf-chaos-center-server.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE) $(LITMUS_CHAOS_CENTER_SERVER_WS_PORT):8000 >/tmp/pf-chaos-center-server-ws.log 2>&1 &
+	nohup kubectl port-forward --address 0.0.0.0 -n mcp-server svc/mcp-observability 18080:8000 >/tmp/pf-mcp-observability.log 2>&1 &
+	nohup kubectl port-forward --address 0.0.0.0 -n loki svc/loki 3100:3100 >/tmp/pf-loki.log 2>&1 &
 
 .PHONY: port-forward-stop
 port-forward-stop:
@@ -173,6 +175,8 @@ port-forward-stop:
 	pkill -f "^kubectl port-forward .* -n loadtest svc/locust-web" || true
 	pkill -f "^kubectl port-forward .* -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_FRONTEND_SERVICE)" || true
 	pkill -f "^kubectl port-forward .* -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE)" || true
+	pkill -f "^kubectl port-forward .* -n mcp-server svc/mcp-observability" || true
+	pkill -f "^kubectl port-forward .* -n loki svc/loki" || true
 
 .PHONY: port-forward-check
 port-forward-check:
@@ -183,7 +187,11 @@ port-forward-check:
 		echo; \
 	done
 
-
+.PHONY: apply-loadtest
+apply-loadtest:
+	kubectl apply -f deploy/kubernetes/manifests-loadtest/loadtest-configmap.yaml
+	kubectl rollout restart deployment/locust-web -n loadtest
+	kubectl rollout status deployment/locust-web -n loadtest
 
 .PHONY: cluster-down
 cluster-down: observability-stop-port-forward loadtest-down observability-down app-down

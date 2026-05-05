@@ -36,9 +36,8 @@ data:
             self._register()
             # Autentica explicitamente no front-end para fixar customerId na sessão
             self._login()
-
-            # Apenas uma fração dos usuários tenta concluir compra.
-            self.enable_checkout = random.random() < 0.3
+            # Checkout desativado por padrao para evitar derrubar o front-end.
+            self.enable_checkout = False
 
         # Gera uma nova identidade aleatória para o usuário (nome, senha, e-mail)
         def _new_identity(self):
@@ -58,6 +57,32 @@ data:
         # Valida o formato de ObjectId usado pelos servicos Mongo do Sock Shop.
         def _is_valid_object_id(self, value):
             return isinstance(value, str) and bool(re.fullmatch(r"[a-fA-F0-9]{24}", value))
+
+        # Extrai um ObjectId de respostas que podem vir como id explicito ou em links HAL.
+        def _extract_object_id(self, data, link_rel=None):
+            if not isinstance(data, dict):
+                return None
+
+            candidate = data.get("id") or data.get("_id")
+
+            if self._is_valid_object_id(candidate):
+                return candidate
+
+            links = data.get("_links")
+
+            if isinstance(links, dict) and link_rel:
+                rel = links.get(link_rel)
+
+                if isinstance(rel, dict):
+                    href = rel.get("href")
+
+                    if isinstance(href, str) and href:
+                        maybe_id = href.rstrip("/").split("/")[-1]
+
+                        if self._is_valid_object_id(maybe_id):
+                            return maybe_id
+
+            return None
 
         # Registra um novo usuário na loja enviando nome, senha e e-mail.
         # O id retornado pelo backend nao sera usado no fluxo de compra; a sessao
@@ -124,7 +149,12 @@ data:
                         f"login failed: {resp.status_code}"
                     )
                     self.customer_id = None
-                    return
+                    return False
+
+                if self._response_has_app_error(resp):
+                    resp.failure("login application error")
+                    self.customer_id = None
+                    return False
 
                 try:
                     data = resp.json()
@@ -143,10 +173,26 @@ data:
 
                     if self._is_valid_object_id(login_id):
                         self.customer_id = login_id
+                        return True
+
+                    # Algumas respostas de login nao retornam id, mas ainda
+                    # estabelecem a sessao HTTP corretamente.
+                    if self._is_valid_object_id(self.customer_id):
+                        return True
+
+                    resp.failure("login without valid customer id")
+                    self.customer_id = None
+                    return False
 
                 except Exception:
-                    # Se o corpo nao for JSON, mantemos o id obtido no cadastro.
-                    pass
+                    # O front-end pode responder sem JSON no login; mantemos
+                    # o id ja conhecido quando valido para preservar a jornada.
+                    if self._is_valid_object_id(self.customer_id):
+                        return True
+
+                    resp.failure("invalid login json")
+                    self.customer_id = None
+                    return False
 
         # Busca até 9 produtos do catálogo e retorna o ID de um produto escolhido aleatoriamente
         def _pick_catalogue_item(self):
@@ -239,13 +285,48 @@ data:
 
                 try:
                     data = resp.json()
-                    return data.get("id") or data.get("_id")
+
+                    address_id = self._extract_object_id(
+                        data,
+                        link_rel="address"
+                    )
+
+                    if not address_id:
+                        resp.failure("address id missing or invalid")
+                        return None
+
+                    return address_id
 
                 except Exception as exc:
                     resp.failure(
                         f"invalid address json: {exc}"
                     )
                     return None
+
+        # Confere se um recurso existe por ID antes de usa-lo no checkout.
+        def _resource_exists(self, base_path, resource_id, name):
+            if not self._is_valid_object_id(resource_id):
+                return False
+
+            with self.client.get(
+                f"{base_path}/{resource_id}",
+                name=name,
+                catch_response=True
+            ) as resp:
+
+                if resp.status_code != 200:
+                    resp.failure(
+                        f"resource check failed {base_path}: {resp.status_code}"
+                    )
+                    return False
+
+                if self._response_has_app_error(resp):
+                    resp.failure(
+                        f"resource check application error {base_path}"
+                    )
+                    return False
+
+                return True
 
         # Cadastra um cartão de crédito fictício para o usuário e retorna o ID do cartão
         def _create_card(self):
@@ -274,7 +355,17 @@ data:
 
                 try:
                     data = resp.json()
-                    return data.get("id") or data.get("_id")
+
+                    card_id = self._extract_object_id(
+                        data,
+                        link_rel="card"
+                    )
+
+                    if not card_id:
+                        resp.failure("card id missing or invalid")
+                        return None
+
+                    return card_id
 
                 except Exception as exc:
                     resp.failure(
@@ -294,6 +385,9 @@ data:
                     resp.failure(
                         f"get address failed: {resp.status_code}"
                     )
+                    return False
+
+                return True
 
         # Lê o cartão padrão, como a tela do carrinho faz antes do checkout.
         def _get_default_card(self):
@@ -307,26 +401,18 @@ data:
                     resp.failure(
                         f"get card failed: {resp.status_code}"
                     )
+                    return False
 
-        # Finaliza a compra usando a sessão já criada pelo front-end.
-        # O endpoint do front monta o pedido a partir do customerId, endereço e cartão da sessão.
-        def _checkout(self, address_id=None, card_id=None):
-            if not self._is_valid_object_id(self.customer_id):
-                return
+                return True
 
-            payload = {
-                "customerId": self.customer_id,
-            }
-
-            if address_id:
-                payload["address"] = address_id
-
-            if card_id:
-                payload["card"] = card_id
+        # Finaliza a compra usando apenas os dados da sessão do front-end.
+        # Evita enviar IDs no body para nao propagar payload inconsistente ao orders.
+        def _checkout(self):
+            if not self.enable_checkout:
+                return False
 
             with self.client.post(
                 "/orders",
-                json=payload,
                 name="POST /orders",
                 catch_response=True
             ) as resp:
@@ -335,12 +421,15 @@ data:
                     resp.failure(
                         f"checkout failed: {resp.status_code}"
                     )
-                    return
+                    return False
 
                 if self._response_has_app_error(resp):
                     resp.failure(
                         "checkout application error"
                     )
+                    return False
+
+                return True
 
         # Tarefa com peso 1: registra um novo usuário (ocorre com menor frequência)
         @task(1)
@@ -350,11 +439,25 @@ data:
             self._login()
 
         # Tarefa com peso 4: simula a jornada completa do cliente (ocorre 4x mais que o registro)
-        # Fluxo: página inicial → categoria → login → catálogo → carrinho → (checkout opcional) → pedidos
+        # Fluxo: página inicial -> categoria -> catalogo -> carrinho -> endereco/cartao -> checkout -> pedidos
         @task(4)
         def realistic_journey(self):
             if not self.customer_id:
                 return
+
+            # Faz refresh de sessao de forma ocasional para reduzir pressao no
+            # endpoint /login e manter a jornada fluida mesmo com instabilidade.
+            if random.random() < 0.25:
+                if not self._login():
+                    # Recria o usuario quando a sessao fica inconsistente para evitar
+                    # chamadas do front-end ao user service com customerId indefinido.
+                    self._new_identity()
+                    self._register()
+
+                    if not self._login():
+                        return
+
+            checkout_done = False
 
             self.client.get("/", name="GET /")
             self.client.get(
@@ -373,19 +476,26 @@ data:
                 name="GET /basket.html"
             )
 
-            if self.enable_checkout:
+            # Checkout opcional e protegido por flag para testes controlados.
+            if item_id and self.enable_checkout:
                 address_id = self._create_address()
                 card_id = self._create_card()
 
                 if address_id and card_id:
-                    self._get_default_address()
-                    self._get_default_card()
-                    self._checkout(address_id, card_id)
+                    has_default_address = self._get_default_address()
+                    has_default_card = self._get_default_card()
 
-            self.client.get(
-                "/customer-orders.html",
-                name="GET /customer-orders.html"
-            )
+                    if (
+                        has_default_address and
+                        has_default_card
+                    ):
+                        checkout_done = self._checkout()
+
+            if checkout_done:
+                self.client.get(
+                    "/customer-orders.html",
+                    name="GET /customer-orders.html"
+                )
 
 ---
 apiVersion: apps/v1

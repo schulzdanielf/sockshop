@@ -21,9 +21,16 @@ spec:
       containers:
       - name: session-db
         image: redis:alpine
+        command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
         ports:
         - name: redis
           containerPort: 6379
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: config
+          mountPath: /usr/local/etc/redis
+          readOnly: true
         securityContext:
           capabilities:
             drop:
@@ -33,5 +40,11 @@ spec:
               - SETGID
               - SETUID
           readOnlyRootFilesystem: true
+      volumes:
+      - name: data
+        emptyDir: {}
+      - name: config
+        configMap:
+          name: session-db-config
       nodeSelector:
         beta.kubernetes.io/os: linux

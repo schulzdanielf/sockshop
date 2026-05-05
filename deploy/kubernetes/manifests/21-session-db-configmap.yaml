@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: session-db-config
+  namespace: sock-shop
+data:
+  redis.conf: |
+    # Disable RDB snapshots entirely
+    save ""
+    # Disable AOF persistence
+    appendonly no
+    # Allow writes even if background save fails (belt-and-suspenders)
+    stop-writes-on-bgsave-error no

@@ -17,6 +17,16 @@ data:
 
     ingester:
       max_block_duration: 5m
+      lifecycler:
+        ring:
+          replication_factor: 1
+      trace_idle_period: 10s
+      flush_check_period: 10s
+      max_block_bytes: 1_000_000
+
+    overrides:
+      max_traces_per_user: 50000
+      max_global_traces_per_user: 0
 
     compactor:
       compaction:

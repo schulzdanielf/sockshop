@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-observability-config
+  namespace: mcp-server
+data:
+  # Prometheus configuration (use DNS name for in-cluster discovery)
+  PROMETHEUS_URL: "http://prometheus.monitoring.svc.cluster.local:9090"
+  PROMETHEUS_TIMEOUT: "30"
+  
+  # Loki configuration (use DNS name for in-cluster discovery)
+  LOKI_URL: "http://loki.monitoring.svc.cluster.local:3100"
+  LOKI_TIMEOUT: "30"
+  
+  # Server configuration
+  HOST: "0.0.0.0"
+  PORT: "8000"

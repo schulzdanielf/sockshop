@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  mcp-observability:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-observability-server
+    ports:
+      - "8000:8000"
+    environment:
+      - PROMETHEUS_URL=http://prometheus:9090
+      - PROMETHEUS_TIMEOUT=30
+      - LOKI_URL=http://loki:3100
+      - LOKI_TIMEOUT=30
+      - HOST=0.0.0.0
+      - PORT=8000
+    networks:
+      - observability
+    restart: unless-stopped
+
+networks:
+  observability:
+    driver: bridge

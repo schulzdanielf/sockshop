@@ -31,12 +31,16 @@ spec:
         env:
         - name: SESSION_REDIS
           value: "true"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         - name: HTTP_PROXY
           value: http://127.0.0.1:15001
         - name: HTTPS_PROXY
           value: http://127.0.0.1:15001
         - name: NO_PROXY
-          value: 127.0.0.1,localhost
+          value: 127.0.0.1,localhost,$(POD_IP),front-end,front-end.sock-shop.svc,front-end.sock-shop.svc.cluster.local,.svc,.cluster.local
         securityContext:
           runAsNonRoot: true
           runAsUser: 10001

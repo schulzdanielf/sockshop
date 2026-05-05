@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-observability-ingress
+  namespace: mcp-server
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod  # Opcional, se usar cert-manager
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"  # Mude para true se usar HTTPS
+spec:
+  rules:
+  - host: mcp-observability.local  # Mude para seu domínio
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: mcp-observability
+            port:
+              number: 8000
+  # Descomente para usar HTTPS com cert-manager
+  # tls:
+  # - hosts:
+  #   - mcp-observability.local
+  #     secretName: mcp-observability-tls

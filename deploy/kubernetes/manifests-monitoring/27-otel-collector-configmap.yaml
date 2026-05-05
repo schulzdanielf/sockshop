@@ -64,6 +64,28 @@ data:
           - action: upsert
             key: log_source
             value: otel_filelog
+      transform/log_enrichment:
+        log_statements:
+          - context: log
+            statements:
+              - set(attributes["service"], resource.attributes["service.name"]) where resource.attributes["service.name"] != nil
+              - set(attributes["service"], attributes["container"]) where attributes["service"] == nil and attributes["container"] != nil
+              - replace_pattern(body, "\\x1b\\[[0-9;]*m", "")
+              - set(attributes["level"], "error") where IsMatch(body, "(status[_-]?code?|result|HTTP/[0-9.]+)[ =:\"]+5[0-9]{2}[^0-9]|\\s5[0-9]{2}\\s")
+              - set(attributes["level"], "warn") where attributes["level"] == nil and IsMatch(body, "(status[_-]?code?|result|HTTP/[0-9.]+)[ =:\"]+4[0-9]{2}[^0-9]|\\s4[0-9]{2}\\s")
+              - set(attributes["level"], "error") where attributes["level"] == nil and IsMatch(body, "(?i)(error|exception|fatal)")
+              - set(attributes["level"], "warn") where attributes["level"] == nil and IsMatch(body, "(?i)warn(ing)?")
+              - set(attributes["level"], "info") where attributes["level"] == nil
+              - set(attributes["msg"], body)
+              - set(attributes["msg"], ExtractPatterns(body, "^[^#]*#\\s*(?P<clean>.*)$")["clean"]) where IsMatch(body, "^[^#]*#\\s*.+")
+              - set(attributes["error_type"], "exception") where IsMatch(body, "(?i)exception")
+              - set(attributes["error_type"], "fatal") where attributes["error_type"] == nil and IsMatch(body, "(?i)fatal")
+              - set(attributes["error_type"], "error") where attributes["error_type"] == nil and IsMatch(body, "(?i)error")
+              - set(attributes["error_fingerprint"], "redis_background_save_error") where IsMatch(body, "(?i)background saving error")
+              - set(attributes["error_fingerprint"], "connection_refused") where attributes["error_fingerprint"] == nil and IsMatch(body, "(?i)connection refused")
+              - set(attributes["error_fingerprint"], "timeout_error") where attributes["error_fingerprint"] == nil and IsMatch(body, "(?i)timeout")
+              - set(attributes["error_fingerprint"], "generic_exception") where attributes["error_fingerprint"] == nil and IsMatch(body, "(?i)exception")
+              - set(attributes["error_fingerprint"], "generic_error") where attributes["error_fingerprint"] == nil and IsMatch(body, "(?i)error")
       attributes/loki_format:
         actions:
           - action: upsert
@@ -73,7 +95,7 @@ data:
         actions:
           - action: upsert
             key: loki.attribute.labels
-            value: log_source,namespace,pod,container
+            value: log_source,namespace,pod,container,service,level,error_type,error_fingerprint
       batch: {}
 
     exporters:
@@ -105,5 +127,5 @@ data:
           exporters: [otlp/tempo]
         logs:
           receivers: [otlp, filelog]
-          processors: [attributes/log_source, attributes/loki_format, attributes/loki_labels, batch]
+          processors: [attributes/log_source, transform/log_enrichment, attributes/loki_format, attributes/loki_labels, batch]
           exporters: [debug/logs, loki]
