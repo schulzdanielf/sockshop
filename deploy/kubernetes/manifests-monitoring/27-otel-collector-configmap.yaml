@@ -96,6 +96,12 @@ data:
           - action: upsert
             key: loki.attribute.labels
             value: log_source,namespace,pod,container,service,level,error_type,error_fingerprint
+      transform/db_peer_service:
+        trace_statements:
+          - context: span
+            statements:
+              - set(attributes["peer.service"], attributes["net.peer.name"]) where attributes["db.system"] != nil and attributes["net.peer.name"] != nil
+              - set(attributes["db.name"], attributes["net.peer.name"]) where attributes["db.system"] != nil and attributes["net.peer.name"] != nil
       batch: {}
 
     exporters:
@@ -123,7 +129,7 @@ data:
           exporters: [prometheusremotewrite]
         traces:
           receivers: [otlp, zipkin]
-          processors: [batch]
+          processors: [transform/db_peer_service, batch]
           exporters: [otlp/tempo]
         logs:
           receivers: [otlp, filelog]

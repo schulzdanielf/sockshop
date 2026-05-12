@@ -15,6 +15,10 @@ spec:
     metadata:
       labels:
         name: user-db
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/path: /metrics
+        prometheus.io/port: '9216'
     spec:
       containers:
       - name: user-db
@@ -35,6 +39,13 @@ spec:
         volumeMounts:
         - mountPath: /tmp
           name: tmp-volume
+      - name: mongodb-exporter
+        image: percona/mongodb_exporter:0.20.9
+        args:
+        - --mongodb.uri=mongodb://127.0.0.1:27017
+        ports:
+        - name: mongo-metrics
+          containerPort: 9216
       volumes:
         - name: tmp-volume
           emptyDir:

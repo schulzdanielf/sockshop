@@ -9,6 +9,7 @@ data:
     datasources:
       - name: prometheus
         type: prometheus
+        uid: prometheus
         access: proxy
         url: http://prometheus-v3.monitoring.svc.cluster.local:9090
         isDefault: true
@@ -18,8 +19,16 @@ data:
         access: proxy
         url: http://tempo.monitoring.svc.cluster.local:3200
         editable: true
+        jsonData:
+          serviceMap:
+            datasourceUid: prometheus
+          nodeGraph:
+            enabled: true
+          lokiSearch:
+            datasourceUid: loki
       - name: loki
         type: loki
+        uid: loki
         access: proxy
         url: http://loki.monitoring.svc.cluster.local:3100
         editable: true

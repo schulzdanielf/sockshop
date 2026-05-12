@@ -15,10 +15,12 @@ spec:
     metadata:
       labels:
         name: front-end
+      annotations:
+        instrumentation.opentelemetry.io/inject-nodejs: "frontend-nodejs"
     spec:
       containers:
       - name: front-end
-        image: weaveworksdemos/front-end:0.3.12
+        image: weaveworksdemos/front-end:node18-otel
         resources:
           limits:
             cpu: 300m
@@ -35,12 +37,9 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
-        - name: HTTP_PROXY
-          value: http://127.0.0.1:15001
-        - name: HTTPS_PROXY
-          value: http://127.0.0.1:15001
-        - name: NO_PROXY
-          value: 127.0.0.1,localhost,$(POD_IP),front-end,front-end.sock-shop.svc,front-end.sock-shop.svc.cluster.local,.svc,.cluster.local
+        # HTTP_PROXY/HTTPS_PROXY removidos: com OTel SDK ativo o 'request' lib via proxy
+        # mascararia os destinos reais (spans mostrariam 127.0.0.1:15001 em vez de carts, catalogue...)
+        # O exporter OTel usa http nativo que ignora HTTP_PROXY por padrão.
         securityContext:
           runAsNonRoot: true
           runAsUser: 10001

@@ -18,6 +18,20 @@ LITMUS_CHAOS_CENTER_SERVER_WS_PORT ?= 8000
 PORT_FORWARD_CHECK_HOST ?= $(shell tailscale ip -4 2>/dev/null | head -n1 || ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $$7; exit}')
 PORT_FORWARD_CHECK_PORTS ?= 8080 3000 9090 16686 8089 9091
 
+FRONT_END_IMAGE ?= weaveworksdemos/front-end:node18-otel
+
+.PHONY: front-end-build
+front-end-build:
+	docker build -t $(FRONT_END_IMAGE) deploy/kubernetes/front-end/
+
+.PHONY: front-end-load
+front-end-load: front-end-build
+	# Carrega a imagem no cluster (Docker Desktop / kind)
+	docker save $(FRONT_END_IMAGE) | \
+	  kubectl debug -n sock-shop -it --image=alpine --target=front-end -- sh -c "cat > /dev/null" 2>/dev/null || true
+	@echo "Se estiver usando kind: kind load docker-image $(FRONT_END_IMAGE)"
+	@echo "Se estiver usando Docker Desktop: a imagem já está disponível no cluster."
+
 gen-complete-demo:
 	make -C deploy/kubernetes docker-gen-complete-demo
 
@@ -153,7 +167,7 @@ chaos-center-up: chaos-center-install chaos-center-port-forward
 
 .PHONY: port-forward
 port-forward:
-	nohup kubectl port-forward --address 0.0.0.0 -n sock-shop svc/front-end 8080:80 >/tmp/pf-front-end.log 2>&1 &
+	nohup kubectl port-forward --address 0.0.0.0 -n sock-shop svc/front-end 8082:80 >/tmp/pf-front-end.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/grafana 3000:80 >/tmp/pf-grafana.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/prometheus 9090:9090 >/tmp/pf-prometheus.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n jaeger svc/jaeger-query 16686:80 >/tmp/pf-jaeger.log 2>&1 &
@@ -163,7 +177,7 @@ port-forward:
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE) $(LITMUS_CHAOS_CENTER_SERVER_PORT):9002 >/tmp/pf-chaos-center-server.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE) $(LITMUS_CHAOS_CENTER_SERVER_WS_PORT):8000 >/tmp/pf-chaos-center-server-ws.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n mcp-server svc/mcp-observability 18080:8000 >/tmp/pf-mcp-observability.log 2>&1 &
-	nohup kubectl port-forward --address 0.0.0.0 -n loki svc/loki 3100:3100 >/tmp/pf-loki.log 2>&1 &
+	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/loki 3100:3100 >/tmp/pf-loki.log 2>&1 &
 
 .PHONY: port-forward-stop
 port-forward-stop:

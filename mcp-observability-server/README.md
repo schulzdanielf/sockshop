@@ -1,6 +1,6 @@
 # MCP Observability Server
 
-Um servidor MCP (Model Context Protocol) com FastMCP para consultas em Prometheus e Loki.
+Um servidor MCP (Model Context Protocol) com FastMCP para consultas em Prometheus, Loki e Tempo.
 
 ## Funcionalidades
 
@@ -16,21 +16,25 @@ Um servidor MCP (Model Context Protocol) com FastMCP para consultas em Prometheu
 - `loki_get_labels` - Listar labels disponíveis
 - `loki_get_label_values` - Valores de labels específicos
 
+### Tempo Tools
+- `tempo_search_traces` - Buscar traces no Tempo
+- `tempo_get_trace` - Obter trace completo por trace ID
+
 ### Golden Metrics (RED Method)
 - `get_golden_metrics` - Listar métricas de ouro
 - `query_golden_metric` - Consultar uma métrica de ouro
 
-**Métricas incluídas:** Request Rate, Error Rate, Latency P95/P99, CPU Usage, Memory Usage
+**Métricas incluídas:** Request Rate, Error Rate, Latency P95/P99, CPU Usage, Memory Usage, Disk Write Throughput, MySQL Query Rate, MongoDB Ops Rate, MongoDB Avg Op Latency, Redis Commands Rate
 
 ### KPIs
 - `get_kpis` - Listar KPIs da aplicação
 - `query_kpi` - Consultar um KPI específico
 - `query_all_kpis` - Todos os KPIs
 
-**KPIs incluídos:** Service Availability, MTTR, Error Budget, Cache Hit Rate, Queue Depth, DB Connection Pool
+**KPIs incluídos:** Service Availability, MTTR, Error Budget, Cache Hit Rate, Queue Depth, DB Connection Pool, Concurrency
 
 ### Utilitários
-- `health_check` - Status de Prometheus e Loki
+- `health_check` - Status de Prometheus, Loki e Tempo
 
 ## Quick Start
 
@@ -67,6 +71,8 @@ PROMETHEUS_URL=http://localhost:9090
 PROMETHEUS_TIMEOUT=30
 LOKI_URL=http://localhost:3100
 LOKI_TIMEOUT=30
+TEMPO_URL=http://localhost:3200
+TEMPO_TIMEOUT=30
 HOST=0.0.0.0
 PORT=8000
 ```

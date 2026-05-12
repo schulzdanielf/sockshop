@@ -11,6 +11,10 @@ data:
   # Loki configuration (use DNS name for in-cluster discovery)
   LOKI_URL: "http://loki.monitoring.svc.cluster.local:3100"
   LOKI_TIMEOUT: "30"
+
+  # Tempo configuration (use DNS name for in-cluster discovery)
+  TEMPO_URL: "http://tempo.monitoring.svc.cluster.local:3200"
+  TEMPO_TIMEOUT: "30"
   
   # Server configuration
   HOST: "0.0.0.0"

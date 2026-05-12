@@ -50,7 +50,8 @@ spec:
           mountPath: /etc/grafana/provisioning/datasources
       volumes:
       - name: grafana-persistent-storage
-        emptyDir: {}
+        persistentVolumeClaim:
+          claimName: grafana-pvc
       - name: grafana-datasources
         configMap:
           name: grafana-datasources

@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # Loki settings
     loki_url: str = "http://localhost:3100"
     loki_timeout: int = 30
+
+    # Tempo settings
+    tempo_url: str = "http://localhost:3200"
+    tempo_timeout: int = 30
     
     # Server settings
     host: str = "0.0.0.0"

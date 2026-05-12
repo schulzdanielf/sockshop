@@ -25,6 +25,9 @@ data:
       max_block_bytes: 1_000_000
 
     overrides:
+      metrics_generator_processors:
+        - service-graphs
+        - span-metrics
       max_traces_per_user: 50000
       max_global_traces_per_user: 0
 
@@ -43,6 +46,30 @@ data:
     querier:
       frontend_worker:
         frontend_address: 127.0.0.1:9095
+
+    metrics_generator:
+      registry:
+        external_labels:
+          source: tempo
+          cluster: k8s
+      storage:
+        path: /tmp/tempo/generator/wal
+        remote_write:
+          - url: http://prometheus-v3.monitoring.svc.cluster.local:9090/api/v1/write
+            send_exemplars: true
+      processor:
+        service_graphs:
+          dimensions:
+            - db.system
+          peer_attributes:
+            - db.system
+            - net.peer.name
+            - messaging.system
+          enable_messaging_system_latency_histogram: true
+        span_metrics:
+          dimensions:
+            - db.system
+            - db.operation
 
     query_frontend:
       search:

@@ -4,6 +4,7 @@ from typing import Any
 from fastmcp import FastMCP
 from prometheus_client import PrometheusClient
 from loki_client import LokiClient
+from tempo_client import TempoClient
 from metrics import get_golden_metrics_dict, get_kpis_dict
 from config import settings
 
@@ -13,13 +14,15 @@ mcp = FastMCP("observability-server")
 # Initialize clients
 prometheus = None
 loki = None
+tempo = None
 
 
 def init_clients():
-    """Initialize Prometheus and Loki clients."""
-    global prometheus, loki
+    """Initialize Prometheus, Loki and Tempo clients."""
+    global prometheus, loki, tempo
     prometheus = PrometheusClient()
     loki = LokiClient()
+    tempo = TempoClient()
 
 
 # ============================================================================
@@ -170,6 +173,64 @@ def loki_get_label_values(label: str) -> str:
 
 
 # ============================================================================
+# TEMPO TOOLS
+# ============================================================================
+
+@mcp.tool()
+def tempo_search_traces(
+    query: str = None,
+    start: str = None,
+    end: str = None,
+    limit: int = 20,
+    min_duration_ms: int = None,
+    max_duration_ms: int = None,
+    service_name: str = None,
+) -> str:
+    """Search traces in Tempo.
+
+    Args:
+        query: Optional TraceQL query (e.g., '{ status = error }').
+        start: Start time in RFC3339 format. Defaults to 1 hour ago.
+        end: End time in RFC3339 format. Defaults to now.
+        limit: Maximum number of traces to return (default: 20).
+        min_duration_ms: Optional minimum trace duration in milliseconds.
+        max_duration_ms: Optional maximum trace duration in milliseconds.
+        service_name: Optional service name filter.
+
+    Returns:
+        JSON string with Tempo trace search results.
+    """
+    if not tempo:
+        init_clients()
+    result = tempo.search_traces(
+        query=query,
+        start=start,
+        end=end,
+        limit=limit,
+        min_duration_ms=min_duration_ms,
+        max_duration_ms=max_duration_ms,
+        service_name=service_name,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def tempo_get_trace(trace_id: str) -> str:
+    """Get a full trace from Tempo by trace ID.
+
+    Args:
+        trace_id: Trace ID to fetch.
+
+    Returns:
+        JSON string with full trace data.
+    """
+    if not tempo:
+        init_clients()
+    result = tempo.get_trace(trace_id)
+    return json.dumps(result, indent=2)
+
+
+# ============================================================================
 # GOLDEN METRICS TOOLS
 # ============================================================================
 
@@ -182,6 +243,8 @@ def get_golden_metrics() -> str:
     - Error Rate: Proportion of requests that result in error
     - Latency P95 and P99: Percentiles of request duration
     - CPU and Memory Usage: Resource consumption
+    - Disk Write Throughput: Filesystem write rate per pod
+    - MySQL/MongoDB/Redis: Database throughput and latency indicators
     
     Returns:
         JSON string with golden metrics definitions
@@ -195,7 +258,7 @@ def query_golden_metric(metric_name: str) -> str:
     """Query a specific golden metric from Prometheus.
     
     Args:
-        metric_name: Name of the golden metric (e.g., 'Request Rate', 'Error Rate', 'Latency P95')
+        metric_name: Name of the golden metric (e.g., 'Request Rate', 'Latency P95', 'MySQL Query Rate', 'MongoDB Ops Rate')
     
     Returns:
         JSON string with metric values
@@ -238,6 +301,7 @@ def get_kpis() -> str:
     - Cache Hit Rate
     - Queue Depth
     - Database Connection Pool Utilization
+    - Concurrency
     
     Returns:
         JSON string with KPI definitions
@@ -251,7 +315,7 @@ def query_kpi(kpi_name: str) -> str:
     """Query a specific KPI from Prometheus.
     
     Args:
-        kpi_name: Name of the KPI (e.g., 'Service Availability', 'Cache Hit Rate')
+        kpi_name: Name of the KPI (e.g., 'Service Availability', 'Cache Hit Rate', 'Concurrency')
     
     Returns:
         JSON string with KPI values
@@ -312,7 +376,7 @@ def query_all_kpis() -> str:
 
 @mcp.tool()
 def health_check() -> str:
-    """Check health status of Prometheus and Loki services.
+    """Check health status of Prometheus, Loki and Tempo services.
     
     Returns:
         JSON string with health status
@@ -320,6 +384,8 @@ def health_check() -> str:
     if not prometheus:
         init_clients()
     if not loki:
+        init_clients()
+    if not tempo:
         init_clients()
     
     health_status = {
@@ -340,6 +406,13 @@ def health_check() -> str:
         health_status["services"]["loki"] = "ok" if result.get("status") == "success" else "error"
     except Exception as e:
         health_status["services"]["loki"] = f"error: {str(e)}"
+
+    # Check Tempo
+    try:
+        result = tempo.search_traces(limit=1)
+        health_status["services"]["tempo"] = "ok" if result.get("status") != "error" else "error"
+    except Exception as e:
+        health_status["services"]["tempo"] = f"error: {str(e)}"
     
     return json.dumps(health_status, indent=2)
 

@@ -16,7 +16,9 @@ spec:
       labels:
         name: session-db
       annotations:
-        prometheus.io.scrape: "false"
+        prometheus.io/scrape: 'true'
+        prometheus.io/path: /metrics
+        prometheus.io/port: '9121'
     spec:
       containers:
       - name: session-db
@@ -40,6 +42,13 @@ spec:
               - SETGID
               - SETUID
           readOnlyRootFilesystem: true
+      - name: redis-exporter
+        image: oliver006/redis_exporter:v1.62.0
+        args:
+        - --redis.addr=redis://127.0.0.1:6379
+        ports:
+        - name: redis-metrics
+          containerPort: 9121
       volumes:
       - name: data
         emptyDir: {}
