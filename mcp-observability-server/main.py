@@ -5,6 +5,8 @@ from fastmcp import FastMCP
 from prometheus_client import PrometheusClient
 from loki_client import LokiClient
 from tempo_client import TempoClient
+from trace_analyzer import extract_features
+from trace_summarizer import summarize_trace
 from metrics import get_golden_metrics_dict, get_kpis_dict
 from config import settings
 
@@ -228,6 +230,127 @@ def tempo_get_trace(trace_id: str) -> str:
         init_clients()
     result = tempo.get_trace(trace_id)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def tempo_analyze_trace(trace_id: str) -> str:
+    """Analyze a trace and extract observability features.
+
+    Extracts from the raw OTLP trace:
+    - trace_duration_ms : total trace wall-clock duration
+    - span_count        : total number of spans
+    - critical_path     : dominant execution path (highest accumulated latency)
+    - hot_spans         : top-10 spans ranked by individual duration
+    - error_spans       : spans with error status and their messages
+    - fanout            : spans with the most direct children (parallelism hotspots)
+    - dependency_map    : unique service-to-service call edges
+    - service_latency   : per-service total / avg / max duration aggregation
+
+    Args:
+        trace_id: Trace ID to fetch and analyze.
+
+    Returns:
+        JSON string with extracted features.
+    """
+    if not tempo:
+        init_clients()
+    trace_data = tempo.get_trace(trace_id)
+    if trace_data.get("status") == "error":
+        return json.dumps(trace_data, indent=2)
+    features = extract_features(trace_data)
+    return json.dumps(features, indent=2)
+
+
+@mcp.tool()
+def tempo_summarize_trace(trace_id: str, use_llm: bool = True, max_new_tokens: int = 512) -> str:
+    """Fetch a trace, extract features, and produce a compact human-readable summary.
+
+    When use_llm=True the summary is also sent to the local Qwen model which returns
+    a root-cause analysis and prioritised improvement recommendations.
+
+    The summary format is:
+        TRACE SUMMARY
+        Trace duration: Xs
+        Critical path: service.span → ...
+        Top bottlenecks: ...
+        Errors: ...
+        Fanout detection: ...
+        Dependency graph: ...
+        Service latency aggregation: ...
+
+    Args:
+        trace_id: Trace ID to summarize.
+        use_llm: Whether to call the local LLM for analysis (default: True).
+        max_new_tokens: Max tokens for LLM response (default: 512).
+
+    Returns:
+        JSON string with keys 'summary' (compact text) and 'llm_analysis' (LLM output or null).
+    """
+    if not tempo:
+        init_clients()
+    trace_data = tempo.get_trace(trace_id)
+    if trace_data.get("status") == "error":
+        return json.dumps(trace_data, indent=2)
+    features = extract_features(trace_data)
+    result = summarize_trace(features, use_llm=use_llm, max_new_tokens=max_new_tokens)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def tempo_search_and_analyze(
+    query: str = None,
+    service_name: str = None,
+    start: str = None,
+    end: str = None,
+    limit: int = 5,
+    min_duration_ms: int = None,
+    max_duration_ms: int = None,
+) -> str:
+    """Search traces and return extracted features for each result.
+
+    Combines tempo_search_traces + tempo_analyze_trace in a single call.
+    Useful for comparing multiple traces or quickly spotting anomalies.
+
+    Args:
+        query: TraceQL query (e.g., '{ status = error }').
+        service_name: Filter by service name.
+        start: Start time in RFC3339 format.
+        end: End time in RFC3339 format.
+        limit: Maximum number of traces to analyze (default: 5).
+        min_duration_ms: Minimum trace duration filter in ms.
+        max_duration_ms: Maximum trace duration filter in ms.
+
+    Returns:
+        JSON string with list of {trace_id, features} objects.
+    """
+    if not tempo:
+        init_clients()
+
+    search_result = tempo.search_traces(
+        query=query,
+        service_name=service_name,
+        start=start,
+        end=end,
+        limit=limit,
+        min_duration_ms=min_duration_ms,
+        max_duration_ms=max_duration_ms,
+    )
+
+    if search_result.get("status") == "error":
+        return json.dumps(search_result, indent=2)
+
+    traces = search_result.get("traces", [])
+    analyzed = []
+
+    for t in traces:
+        trace_id = t.get("traceID") or t.get("traceId", "")
+        if not trace_id:
+            continue
+        trace_data = tempo.get_trace(trace_id)
+        features = extract_features(trace_data) if trace_data.get("status") != "error" else {"error": trace_data.get("error")}
+        analyzed.append({"trace_id": trace_id, "features": features})
+
+    return json.dumps(analyzed, indent=2)
 
 
 # ============================================================================

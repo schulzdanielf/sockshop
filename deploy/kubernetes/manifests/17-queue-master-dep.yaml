@@ -39,5 +39,13 @@ spec:
             memory: 300Mi
         ports:
         - containerPort: 80
+        volumeMounts:
+        - mountPath: /var/run/docker.sock
+          name: docker-socket
+      volumes:
+      - name: docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
       nodeSelector:
         beta.kubernetes.io/os: linux

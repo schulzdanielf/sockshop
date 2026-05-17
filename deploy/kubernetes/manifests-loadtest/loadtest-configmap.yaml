@@ -36,8 +36,8 @@ data:
             self._register()
             # Autentica explicitamente no front-end para fixar customerId na sessão
             self._login()
-            # Checkout desativado por padrao para evitar derrubar o front-end.
-            self.enable_checkout = False
+            # Checkout ativado: orders-db rodando MongoDB 4.4 compativel com o driver Java legado.
+            self.enable_checkout = True
 
         # Gera uma nova identidade aleatória para o usuário (nome, senha, e-mail)
         def _new_identity(self):

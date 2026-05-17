@@ -11,7 +11,7 @@ LITMUS_K8S_CHAOS_NAMESPACE ?= sock-shop
 LITMUS_CHAOS_CENTER_RELEASE ?= chaos-center
 LITMUS_CHAOS_CENTER_NAMESPACE ?= litmus
 LITMUS_CHAOS_CENTER_FRONTEND_SERVICE ?= $(LITMUS_CHAOS_CENTER_RELEASE)-litmus-frontend-service
-LITMUS_CHAOS_CENTER_FRONTEND_PORT ?= 9091
+LITMUS_CHAOS_CENTER_FRONTEND_PORT ?= 9092
 LITMUS_CHAOS_CENTER_SERVER_SERVICE ?= $(LITMUS_CHAOS_CENTER_RELEASE)-litmus-server-service
 LITMUS_CHAOS_CENTER_SERVER_PORT ?= 9002
 LITMUS_CHAOS_CENTER_SERVER_WS_PORT ?= 8000
@@ -170,6 +170,7 @@ port-forward:
 	nohup kubectl port-forward --address 0.0.0.0 -n sock-shop svc/front-end 8082:80 >/tmp/pf-front-end.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/grafana 3000:80 >/tmp/pf-grafana.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/prometheus 9090:9090 >/tmp/pf-prometheus.log 2>&1 &
+	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/prometheus-v3 9091:9090 >/tmp/pf-prometheus-v3.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n jaeger svc/jaeger-query 16686:80 >/tmp/pf-jaeger.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n kube-system svc/kibana 5602:5601 >/tmp/pf-kibana.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n loadtest svc/locust-web 8089:8089 >/tmp/pf-locust.log 2>&1 &
@@ -178,7 +179,7 @@ port-forward:
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE) $(LITMUS_CHAOS_CENTER_SERVER_WS_PORT):8000 >/tmp/pf-chaos-center-server-ws.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n mcp-server svc/mcp-observability 18080:8000 >/tmp/pf-mcp-observability.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/loki 3100:3100 >/tmp/pf-loki.log 2>&1 &
-
+	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/tempo 3200:3200 >/tmp/pf-tempo.log 2>&1 &
 .PHONY: port-forward-stop
 port-forward-stop:
 	pkill -f "^kubectl port-forward .* -n sock-shop svc/front-end" || true
@@ -215,6 +216,10 @@ cluster-up: app-up observability-up loadtest-up
 
 .PHONY: cluster-restart
 cluster-restart: cluster-down cluster-up port-forward
+
+.PHONY: model-serve
+model-serve:
+	uvicorn model.server:app --host 0.0.0.0 --port 8001
 
 .PHONY: git
 git:

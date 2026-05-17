@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     tempo_url: str = "http://localhost:3200"
     tempo_timeout: int = 30
     
+    # LLM settings (local Qwen API)
+    llm_url: str = "http://localhost:8001/generate"
+
     # Server settings
     host: str = "0.0.0.0"
     port: int = 8000
