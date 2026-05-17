@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 
 from exllamav2 import (
     ExLlamaV2,
@@ -8,24 +9,28 @@ from exllamav2 import (
     ExLlamaV2Cache_Q8,
 )
 from exllamav2.generator import ExLlamaV2BaseGenerator, ExLlamaV2Sampler
-from exllamav2.attn import ExLlamaV2Attention
-from exllamav2.mlp import ExLlamaV2MLP
 
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/home/daniel/models/qwen14b-exl2-v2")
-MAX_SEQ_LEN = 8192
+MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "8192"))
 
 
 class Qwen14BEngine:
     def __init__(self):
-        import os, threading
-        print(f"[DEBUG] Qwen14BEngine.__init__ start  pid={os.getpid()} tid={threading.get_ident()}", flush=True)
+        print(
+            f"[DEBUG] Qwen14BEngine.__init__ start "
+            f"pid={os.getpid()} tid={threading.get_ident()}",
+            flush=True,
+        )
         print("Loading Qwen 14B...")
+        print(
+            f"[DEBUG] startup model_dir={MODEL_DIR} max_seq_len={MAX_SEQ_LEN}",
+            flush=True,
+        )
 
         config = ExLlamaV2Config()
         config.model_dir = MODEL_DIR
         config.max_seq_len = MAX_SEQ_LEN
-        config.no_flash_attn = True  # disable flash-attn (incompatible GPU/driver)
         print(f"[DEBUG] ExLlamaV2Config prepared, calling prepare()", flush=True)
         config.prepare()
 
@@ -38,11 +43,6 @@ class Qwen14BEngine:
         self.cache = ExLlamaV2Cache_Q8(self.model, max_seq_len=MAX_SEQ_LEN)
         print(f"[DEBUG] load_autosplit start", flush=True)
         self.model.load_autosplit(self.cache)
-        # Workaround: q_attn_forward_1 CUDA kernel crashes on this GPU/driver.
-        # Setting q_handle=None forces fallback to PyTorch attention path.
-        for module in self.model.modules:
-            if isinstance(module, (ExLlamaV2Attention, ExLlamaV2MLP)):
-                module.q_handle = None
         print(f"[DEBUG] load_autosplit done", flush=True)
 
         # BaseGenerator

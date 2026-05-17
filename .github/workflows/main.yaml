@@ -1,11 +1,7 @@
 name: ci
 
 on:
-  push:
-    branches:
-    - "*"  # run for branches
-    tags:
-    - "*"  # run for tags
+  workflow_dispatch: # disabled automatic triggers - run manually if needed
 
 jobs:
   #
