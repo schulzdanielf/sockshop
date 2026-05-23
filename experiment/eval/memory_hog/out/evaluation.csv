@@ -1,0 +1,13 @@
+run_id,chaos_target,strategy,predicted_rca,correct,confidence,fault_category,prompt_tokens,neighbours_used,rag_mode,system_card_id,raw_error
+run-1cbbd915817f,user,S0_no_rag,,False,,,,,embedding,sock-shop,
+run-1cbbd915817f,user,S1_rag_tags,user,True,0.85,memory-exhaustion,,,tags,sock-shop,
+run-1cbbd915817f,user,S2_rag_embeddings,user,True,0.85,memory-exhaustion,,,embedding,sock-shop,
+run-1cbbd915817f,user,S3_rag_hybrid,user,True,0.85,memory-exhaustion,,,hybrid,sock-shop,
+run-1cbbd915817f,user,S4_rag_embeddings_no_card,,False,,,,,embedding,,
+run-1cbbd915817f,user,S5_rag_short_budget,user,True,0.95,memory-exhaustion,,,embedding,sock-shop,
+run-a7fbbf2fced2,user,S0_no_rag,,False,,,,,embedding,sock-shop,
+run-a7fbbf2fced2,user,S1_rag_tags,,False,,,,,tags,sock-shop,
+run-a7fbbf2fced2,user,S2_rag_embeddings,user,True,0.95,memory-exhaustion,,,embedding,sock-shop,
+run-a7fbbf2fced2,user,S3_rag_hybrid,user,True,0.95,memory-exhaustion,,,hybrid,sock-shop,
+run-a7fbbf2fced2,user,S4_rag_embeddings_no_card,,False,,,,,embedding,,
+run-a7fbbf2fced2,user,S5_rag_short_budget,user,True,0.95,memory-exhaustion,,,embedding,sock-shop,

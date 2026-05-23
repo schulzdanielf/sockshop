@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microservices-demo.local/contracts/plugins.v1.schema.json",
+  "title": "Plugin Contracts v1",
+  "type": "object",
+  "required": ["chaos", "load", "metrics", "traces"],
+  "properties": {
+    "chaos": {
+      "type": "object",
+      "required": ["validate", "prepare", "inject", "stop", "status", "collect_artifacts"],
+      "properties": {
+        "validate": { "const": "validate(config)" },
+        "prepare": { "const": "prepare(context, config)" },
+        "inject": { "const": "inject(context, config)" },
+        "stop": { "const": "stop(context, handle)" },
+        "status": { "const": "status(context, handle)" },
+        "collect_artifacts": { "const": "collect_artifacts(context, handle)" }
+      }
+    },
+    "load": {
+      "type": "object",
+      "required": ["start_load", "stop_load", "status", "collect_summary"],
+      "properties": {
+        "start_load": { "const": "start_load(context, config)" },
+        "stop_load": { "const": "stop_load(context, handle)" },
+        "status": { "const": "status(context, handle)" },
+        "collect_summary": { "const": "collect_summary(context, handle)" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["collect_window", "summarize"],
+      "properties": {
+        "collect_window": { "const": "collect_window(context, config, start_iso, end_iso, step_seconds)" },
+        "summarize": { "const": "summarize(raw)" }
+      }
+    },
+    "traces": {
+      "type": "object",
+      "required": ["collect_window", "summarize"],
+      "properties": {
+        "collect_window": { "const": "collect_window(context, config, start_iso, end_iso)" },
+        "summarize": { "const": "summarize(raw)" }
+      }
+    }
+  }
+}

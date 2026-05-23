@@ -1,0 +1,172 @@
+# System card: Sock Shop
+# Purpose: persistent topology + role context injected into the LLM system
+# prompt for chaos-engineering verdicts. Static per system, versioned.
+# Token budget target: <= 1200 tokens (~4800 chars including YAML overhead).
+
+system_id: sock-shop
+version: "2026-05-23"
+description: >
+  Polyglot e-commerce demo (Weaveworks Sock Shop) running on Kubernetes.
+  Synchronous HTTP between services, MongoDB/MySQL persistence,
+  RabbitMQ for asynchronous order shipping notifications.
+
+platform:
+  orchestrator: kubernetes
+  namespace: sock-shop
+  ingress: front-end NodePort / Ingress
+  service_mesh: none
+
+services:
+
+  front-end:
+    role: "Public-facing UI and API gateway. Renders the storefront and
+           proxies all client traffic to the backend services."
+    stack: node.js/express
+    type: stateless
+    upstream: [client]
+    downstream: [catalogue, carts, orders, user, payment]
+    storage: []
+    notes:
+      - "Single entry point; pod-delete here drops global RPS by design."
+      - "5xx responses here usually reflect a failed downstream call,
+         not a bug in front-end itself."
+
+  catalogue:
+    role: "Read-only product catalogue API (list/search/fetch socks)."
+    stack: go
+    type: stateless
+    upstream: [front-end]
+    downstream: [catalogue-db]
+    storage: [catalogue-db]
+
+  catalogue-db:
+    role: "MySQL instance backing the product catalogue."
+    stack: mysql
+    type: stateful
+    upstream: [catalogue]
+    downstream: []
+    storage: [persistent-volume]
+
+  carts:
+    role: "Shopping cart CRUD service. One cart per logged-in user."
+    stack: java/spring-boot
+    type: stateful
+    upstream: [front-end, orders]
+    downstream: [carts-db]
+    storage: [carts-db]
+    notes:
+      - "Java service: OOM presents as long GC pauses then OOMKilled."
+
+  carts-db:
+    role: "MongoDB instance backing the cart service."
+    stack: mongodb
+    type: stateful
+    upstream: [carts]
+    downstream: []
+    storage: [persistent-volume]
+
+  orders:
+    role: "Order orchestration. On checkout, fans out to payment,
+           shipping and user, then persists the order."
+    stack: java/spring-boot
+    type: stateful
+    upstream: [front-end]
+    downstream: [carts, payment, shipping, user, orders-db]
+    storage: [orders-db]
+    notes:
+      - "Highest fan-out service in the system; failures here cascade
+         to multiple downstream services and produce broad symptoms."
+
+  orders-db:
+    role: "MongoDB instance backing the orders service."
+    stack: mongodb
+    type: stateful
+    upstream: [orders]
+    downstream: []
+    storage: [persistent-volume]
+
+  payment:
+    role: "Simulated payment authorization. Synchronous, in-memory only;
+           no external gateway."
+    stack: go
+    type: stateless
+    upstream: [orders]
+    downstream: []
+    storage: []
+    notes:
+      - "No persistence and no external dependency; CPU/memory faults
+         here usually appear as latency on the orders endpoint."
+
+  shipping:
+    role: "Publishes shipping requests onto RabbitMQ for queue-master
+           to consume asynchronously."
+    stack: java/spring-boot
+    type: stateless
+    upstream: [orders]
+    downstream: [rabbitmq]
+    storage: []
+    notes:
+      - "Producer side of an async pipeline; problems here mostly
+         surface as growing queue depth, not immediate user errors."
+
+  queue-master:
+    role: "Background worker that consumes shipping requests from
+           RabbitMQ and finalises shipment records."
+    stack: java/spring-boot
+    type: worker
+    upstream: [rabbitmq]
+    downstream: []
+    storage: []
+    notes:
+      - "Asynchronous consumer; slowness backpressures shipping via
+         queue depth but does not directly impact user-facing latency."
+
+  rabbitmq:
+    role: "Message broker between shipping and queue-master."
+    stack: rabbitmq
+    type: stateful
+    upstream: [shipping]
+    downstream: [queue-master]
+    storage: [persistent-volume]
+
+  user:
+    role: "User accounts, addresses and login service."
+    stack: go
+    type: stateful
+    upstream: [front-end, orders]
+    downstream: [user-db]
+    storage: [user-db]
+
+  user-db:
+    role: "MongoDB instance backing the user service."
+    stack: mongodb
+    type: stateful
+    upstream: [user]
+    downstream: []
+    storage: [persistent-volume]
+
+# Controlled vocabulary the LLM verdict must respect.
+allowed_rca_targets:
+  - front-end
+  - catalogue
+  - catalogue-db
+  - carts
+  - carts-db
+  - orders
+  - orders-db
+  - payment
+  - shipping
+  - queue-master
+  - rabbitmq
+  - user
+  - user-db
+  - unknown
+
+allowed_fault_categories:
+  - cpu-exhaustion
+  - memory-exhaustion
+  - pod-failure
+  - network-latency
+  - dependency-failure
+  - deploy-related
+  - unknown

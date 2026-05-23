@@ -1,0 +1,125 @@
+# ────────────────────────────────────────────────────────────────────────────
+# Memory-hog evaluation harness — declarative matrix
+# ────────────────────────────────────────────────────────────────────────────
+# Loaded by experiment/eval/memory_hog/runner.py and
+# experiment/eval/memory_hog/generate_chaos_manifests.py.
+#
+# Goal: inject `pod-memory-hog` chaos in some services to build up the RAG
+# corpus, then in others to evaluate multiple LLM analysis strategies on the
+# same set of held-out runs.
+
+# ── Platform / cluster wiring ───────────────────────────────────────────────
+platform:
+  api_base: "http://127.0.0.1:8010"
+  user_role: "chaos_engineer"
+  initiated_by: "memory-hog-harness"
+  # Per-run polling
+  poll_interval_seconds: 15
+  run_timeout_seconds: 1800     # 30 min hard cap per run
+
+cluster:
+  app_namespace: "sock-shop"
+  litmus_namespace: "litmus"
+  argo_controller_instanceid: "f21787ba-08ee-4649-ab66-c880492636dc"
+
+# ── Chaos parameters (applied to every service) ────────────────────────────
+chaos:
+  memory_consumption_mb: 500          # MEMORY_CONSUMPTION env var
+  total_chaos_duration_seconds: 60    # TOTAL_CHAOS_DURATION env var
+  chaos_interval_seconds: 10
+  # Resulting Argo Workflow template name pattern: "<service>-memory-hog"
+
+# ── Experiment timeline (passed into experiment spec → engine) ─────────────
+timeline:
+  baseline_seconds: 30
+  warmup_seconds: 30
+  fault_duration_seconds: 90          # > total_chaos_duration to capture tail
+  post_recovery_observation_seconds: 180
+  sampling_interval_seconds: 5
+
+# ── Load profile (locust) ───────────────────────────────────────────────────
+# Uses the in-cluster `locust-web` deployment in the `loadtest` namespace
+# (already running). The plugin shells into the pod via kubectl exec.
+load_profile:
+  provider: "locust"
+  command: "kubectl -n loadtest exec deploy/locust-web -- locust"
+  locust_file: "/mnt/locust/locustfile.py"
+  host: "http://front-end.sock-shop.svc.cluster.local"
+  users: 30
+  spawn_rate: 5
+  grace_seconds: 30
+
+# ── SLO thresholds (used by engine for resilient/degraded label) ───────────
+slo:
+  error_rate_threshold: 0.05
+  latency_p95_threshold_ms: 800
+  recovery_tolerance_pct: 0.20
+  max_recovery_seconds: 600
+
+# ── Train / Test split ─────────────────────────────────────────────────────
+# Train services seed the RAG corpus; their runs are also evaluated but the
+# evaluation focus is on the held-out test services.
+#
+# DBs and rabbitmq are intentionally excluded: memory-hog on a DB pod drops
+# every consumer, which makes the ground truth ambiguous (the LLM may name
+# the symptomatic service rather than the injected one).
+train_services:
+  - catalogue
+  - carts
+  - orders
+  - payment
+
+test_services:
+  - user
+  - shipping
+  - queue-master
+  - front-end
+
+replicas: 2                            # repetitions per service
+
+# ── Evaluation strategies (held-out runs × every strategy) ─────────────────
+# All call POST /api/runs/{run_id}/llm-analysis?force=true with these params.
+# Special system_id "__none__" forces the system-card fallback path.
+strategies:
+  - name: "S0_no_rag"
+    mode: "embedding"
+    limit: 0
+    system_id: "sock-shop"
+    budget_tokens: 3200
+
+  - name: "S1_rag_tags"
+    mode: "tags"
+    limit: 3
+    system_id: "sock-shop"
+    budget_tokens: 3200
+
+  - name: "S2_rag_embeddings"
+    mode: "embedding"
+    limit: 3
+    system_id: "sock-shop"
+    budget_tokens: 3200
+
+  - name: "S3_rag_hybrid"
+    mode: "hybrid"
+    limit: 3
+    system_id: "sock-shop"
+    budget_tokens: 3200
+
+  - name: "S4_rag_embeddings_no_card"
+    mode: "embedding"
+    limit: 3
+    system_id: "__none__"
+    budget_tokens: 3200
+
+  - name: "S5_rag_short_budget"
+    mode: "embedding"
+    limit: 3
+    system_id: "sock-shop"
+    budget_tokens: 1600
+
+# ── Output ─────────────────────────────────────────────────────────────────
+output:
+  results_dir: "experiment/eval/memory_hog/out"
+  runs_csv: "runs.csv"                # one row per (service, replica)
+  evaluation_csv: "evaluation.csv"    # one row per (run_id, strategy)
+  manifests_dir: "manifests"          # generated Argo workflow YAMLs

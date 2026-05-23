@@ -131,3 +131,7 @@ output-virtualbox-iso
 # Ignore grafanalib output
 /graphs/__pycache__/
 /graphs/*.json
+
+# Experiment runtime data (artifacts + sqlite) — keep system_cards/ tracked
+experiment/platform/data/*
+!experiment/platform/data/system_cards/

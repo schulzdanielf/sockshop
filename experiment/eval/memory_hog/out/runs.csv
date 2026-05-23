@@ -1,0 +1,8 @@
+phase,service,replica_idx,chaos_target,experiment_id,run_id,status,started_at,ended_at,notes
+train,catalogue,0,catalogue,memhog-catalogue-r0-20260523-132025,run-84b547d10001,completed,2026-05-23T13:20:25.745929+00:00,2026-05-23T13:25:57.337396+00:00,
+train,catalogue,1,catalogue,memhog-catalogue-r1-20260523-132611,run-f0af306916c6,completed,2026-05-23T13:26:11.254583+00:00,2026-05-23T13:31:42.676041+00:00,
+train,carts,0,carts,memhog-carts-r0-20260523-133156,run-989b74821754,completed,2026-05-23T13:31:56.748015+00:00,2026-05-23T13:37:27.984200+00:00,
+train,carts,1,carts,memhog-carts-r1-20260523-133742,run-ff221a8621a6,completed,2026-05-23T13:37:42.225879+00:00,2026-05-23T13:43:13.467991+00:00,
+train,orders,0,orders,memhog-orders-r0-20260523-165950,run-b5f73d386227,failed,2026-05-23T16:59:50.988061+00:00,2026-05-23T17:00:51.657774+00:00,
+train,orders,1,orders,memhog-orders-r1-20260523-170106,run-f89aaacec81f,failed,2026-05-23T17:01:06.188402+00:00,2026-05-23T17:02:06.742392+00:00,
+train,payment,0,payment,memhog-payment-r0-20260523-170221,run-1f2170fa1534,failed,2026-05-23T17:02:21.396963+00:00,2026-05-23T17:03:21.906258+00:00,

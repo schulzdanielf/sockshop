@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chaos Platform</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <h1>Chaos Engineering Platform</h1>
+      <p>Design, execute, compare and document resilience experiments.</p>
+    </header>
+
+    <main class="layout">
+      <section class="panel wizard">
+        <h2>Experiment Wizard</h2>
+        <div id="stepIndicator" class="step-indicator">Step 1 of 6</div>
+
+        <div class="step" data-step="1">
+          <label>Experiment ID <input id="expId" placeholder="exp-catalogue-pod-delete-001" /></label>
+          <label>Name <input id="expName" placeholder="Catalogue Pod Deletion" /></label>
+          <label>Description (manual, required) <textarea id="expDescription"></textarea></label>
+          <label>Hypothesis <textarea id="expHypothesis"></textarea></label>
+          <label>Initiated by <input id="initiatedBy" value="operator" /></label>
+          <label>Role
+            <select id="userRole">
+              <option value="viewer">viewer</option>
+              <option value="operator">operator</option>
+              <option value="chaos_engineer" selected>chaos_engineer</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="step" data-step="2">
+          <label>Load Provider
+            <select id="loadProvider"><option value="locust">locust</option></select>
+          </label>
+          <label>Locust command <input id="loadCommand" value="kubectl -n loadtest exec deploy/locust-web -- locust" /></label>
+          <label>Locust file <input id="loadFile" value="/mnt/locust/locustfile.py" /></label>
+          <label>Host <input id="loadHost" value="http://front-end.sock-shop.svc.cluster.local" /></label>
+          <label>Users <input id="loadUsers" type="number" value="20" /></label>
+          <label>Spawn rate <input id="loadSpawn" type="number" step="0.1" value="5" /></label>
+        </div>
+
+        <div class="step" data-step="3">
+          <label>Chaos Provider
+            <select id="chaosProvider"><option value="litmus">litmus</option></select>
+          </label>
+
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+            <span style="font-weight:600;font-size:0.85rem;">Experimentos disponíveis no cluster</span>
+            <button type="button" id="loadCatalogBtn" class="btn-sm">⟳ Sincronizar</button>
+            <span id="catalogStatus" style="font-size:0.78rem;color:#888;"></span>
+          </div>
+          <div id="catalogList" style="max-height:220px;overflow-y:auto;border:1px solid #2a2a3a;border-radius:6px;padding:6px;background:#0f0f1a;margin-bottom:10px;">
+            <span style="color:#555;font-size:0.82rem;">Clique em "Sincronizar" para buscar os engines do cluster.</span>
+          </div>
+
+          <label>Namespace alvo <input id="chaosNamespace" value="sock-shop" /></label>
+          <label>Manifest path (opcional) <input id="chaosManifest" placeholder="deploy/kubernetes/manifests-chaos/pod-delete-engine.yaml" /></label>
+          <label>ChaosEngine / Workflow template <input id="chaosEngine" placeholder="delete-user" title="Nome do template Litmus (workflow_name), ex: delete-user, carts-cpu" /></label>
+          <label>ChaosResult name (opcional, apenas manifesto local) <input id="chaosResult" placeholder="" /></label>
+        </div>
+
+        <div class="step" data-step="4">
+          <label>Baseline seconds <input id="tBaseline" type="number" value="60" /></label>
+          <label>Warmup seconds <input id="tWarmup" type="number" value="120" /></label>
+          <label>Fault duration seconds <input id="tFault" type="number" value="120" /></label>
+          <label>Post-observation seconds <input id="tPost" type="number" value="180" /></label>
+          <label>Sampling interval seconds <input id="tSample" type="number" value="15" /></label>
+        </div>
+
+        <div class="step" data-step="5">
+          <label>SLO error rate threshold <input id="sloErrorRate" type="number" step="0.01" value="0.05" /></label>
+          <label>SLO p95 threshold (ms) <input id="sloP95" type="number" value="800" /></label>
+          <label>Requires approval
+            <select id="requiresApproval"><option value="false">false</option><option value="true">true</option></select>
+          </label>
+          <label>Risk level
+            <select id="riskLevel"><option value="low">low</option><option value="medium" selected>medium</option><option value="high">high</option></select>
+          </label>
+        </div>
+
+        <div class="step" data-step="6">
+          <label>Experiment JSON (review/version)
+            <textarea id="specPreview" class="json-preview" readonly></textarea>
+          </label>
+          <div class="actions-row">
+            <button id="saveExperimentBtn">Save Experiment</button>
+            <button id="startRunBtn">Start Run</button>
+          </div>
+        </div>
+
+        <div class="wizard-nav">
+          <button id="prevStepBtn">Previous</button>
+          <button id="nextStepBtn">Next</button>
+        </div>
+      </section>
+
+      <section class="panel monitor">
+        <h2>Run Console</h2>
+        <div class="controls-inline">
+          <input id="runIdInput" placeholder="run id" />
+          <button id="loadRunBtn">Load Run</button>
+          <button id="stopRunBtn">Stop Run</button>
+        </div>
+        <div id="runStatus" class="status-box">No run loaded.</div>
+        <h3>Timeline Events (real-time polling)</h3>
+        <pre id="eventsBox" class="events-box"></pre>
+      </section>
+
+      <section class="panel history">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:0.6rem;flex-wrap:wrap;">
+          <h2 style="margin:0;">Histórico de Runs</h2>
+          <button id="refreshHistoryBtn" class="btn-sm">⟳ Atualizar</button>
+          <label style="font-size:0.85rem;color:var(--muted);margin-left:auto;">
+            <input type="checkbox" id="historyDisagreementOnly" /> só divergências
+          </label>
+        </div>
+        <div id="historyList"><span style="color:var(--muted);font-size:0.85rem;">Carregando…</span></div>
+      </section>
+
+      <section class="panel results">
+        <h2>Results & Compare</h2>
+        <div class="controls-inline">
+          <input id="compareA" placeholder="Run A" />
+          <input id="compareB" placeholder="Run B" />
+          <button id="compareBtn">Compare</button>
+        </div>
+        <pre id="compareBox" class="events-box"></pre>
+        <label>Manual conclusion for current run
+          <textarea id="manualConclusion"></textarea>
+        </label>
+        <button id="saveConclusionBtn">Save Conclusion</button>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

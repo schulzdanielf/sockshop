@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microservices-demo.local/contracts/experiment.v1.schema.json",
+  "title": "Experiment Contract v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "experiment",
+    "timeline",
+    "load_profile",
+    "chaos_profile",
+    "observability"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "experiment": {
+      "type": "object",
+      "required": ["id", "name", "description_manual"],
+      "properties": {
+        "id": { "type": "string", "minLength": 3 },
+        "name": { "type": "string", "minLength": 3 },
+        "description_manual": { "type": "string", "minLength": 10 },
+        "hypothesis": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "timeline": {
+      "type": "object",
+      "required": ["warmup_seconds", "fault_duration_seconds", "post_recovery_observation_seconds", "sampling_interval_seconds"],
+      "properties": {
+        "baseline_seconds": { "type": "integer", "minimum": 0 },
+        "warmup_seconds": { "type": "integer", "minimum": 0 },
+        "fault_duration_seconds": { "type": "integer", "minimum": 1 },
+        "post_recovery_observation_seconds": { "type": "integer", "minimum": 0 },
+        "sampling_interval_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "load_profile": {
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "type": "string" }
+      }
+    },
+    "chaos_profile": {
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "type": "string" }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "required": ["metrics", "traces"],
+      "properties": {
+        "metrics": { "type": "object" },
+        "traces": { "type": "object" }
+      }
+    }
+  }
+}
