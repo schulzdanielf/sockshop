@@ -1,0 +1,132 @@
+# ────────────────────────────────────────────────────────────────────────────
+# MINI config — smoke-test / fast validation run
+# Estimativa: ~35–45 min total
+#   • 3 train runs × ~7 min  ≈ 21 min  (um por chaos type)
+#   • 2 test  runs × ~7 min  ≈ 14 min
+#   • 4 LLM calls (2 test × 2 estratégias) ≈ 5–8 min
+#
+# Uso:
+#   python -m experiment.eval.memory_hog.runner \
+#       --config experiment/eval/memory_hog/config-mini.yaml
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── Platform / cluster wiring ───────────────────────────────────────────────
+platform:
+  api_base: "http://127.0.0.1:8010"
+  user_role: "chaos_engineer"
+  initiated_by: "multi-chaos-harness-mini"
+  poll_interval_seconds: 15
+  run_timeout_seconds: 900      # 15 min — suficiente para timeline reduzida
+  inter_run_cooldown_seconds: 60 # espera pods se recuperarem antes do próximo run
+
+cluster:
+  app_namespace: "sock-shop"
+  litmus_namespace: "litmus"
+  argo_controller_instanceid: "f21787ba-08ee-4649-ab66-c880492636dc"
+
+# ── Chaos types (idênticos ao config principal) ─────────────────────────────
+chaos_types:
+  - name: memory-hog
+    template_suffix: memory-hog
+    short: memhog
+    fault_category: memory-exhaustion
+    env:
+      memory_consumption_mb: 150    # ≤ 80% do menor limite (user: 200Mi) — evita OOM kill
+      total_chaos_duration_seconds: 60
+      chaos_interval_seconds: 10
+
+  - name: cpu-hog
+    template_suffix: cpu-hog
+    short: cpuhog
+    fault_category: cpu-exhaustion
+    env:
+      cpu_cores: 1
+      total_chaos_duration_seconds: 60
+      chaos_interval_seconds: 10
+
+  - name: pod-delete
+    template_suffix: pod-delete
+    short: poddel
+    fault_category: pod-failure
+    env:
+      total_chaos_duration_seconds: 30
+      chaos_interval_seconds: 10
+      force: false
+
+# ── Experiment timeline (reduzida para acelerar) ───────────────────────────
+# Original: baseline=30 warmup=30 fault=90 post_recovery=180 → 330s/run
+# Mini:     baseline=30 warmup=30 fault=90 post_recovery=90  → 240s/run
+# Nota: fault_duration mantido em 90s (> total_chaos_duration=60s) para
+# capturar a cauda do caos. Só post_recovery foi reduzido.
+timeline:
+  baseline_seconds: 30
+  warmup_seconds: 30
+  fault_duration_seconds: 90
+  post_recovery_observation_seconds: 90   # reduzido de 180 → 90
+  sampling_interval_seconds: 5
+
+# ── Load profile ─────────────────────────────────────────────────────────────
+load_profile:
+  provider: "locust"
+  command: "kubectl -n loadtest exec deploy/locust-web -- locust"
+  locust_file: "/mnt/locust/locustfile.py"
+  host: "http://front-end.sock-shop.svc.cluster.local"
+  users: 30
+  spawn_rate: 5
+  grace_seconds: 30
+
+# ── SLO thresholds ────────────────────────────────────────────────────────────
+slo:
+  error_rate_threshold: 0.05
+  latency_p95_threshold_ms: 800
+  recovery_tolerance_pct: 0.20
+  max_recovery_seconds: 600
+
+# ── Train / Test split ────────────────────────────────────────────────────────
+# Critério de escolha:
+#   Train: um serviço por chaos type (cobre os 3 tipos no corpus)
+#   Test:  serviços DIFERENTES dos de treino, mesmos chaos types relevantes
+#          (memory-hog e pod-delete — os mais distintos entre si)
+#
+# catalogue → memory-hog (treino)
+# orders    → cpu-hog    (treino)   ← cpu-hog tem sinal fraco; validar coleta
+# carts     → pod-delete (treino)
+#
+# user      → memory-hog (teste)   ← mesma categoria do corpus, serviço novo
+# shipping  → pod-delete (teste)   ← mesma categoria do corpus, serviço novo
+train_experiments:
+  - {service: catalogue, chaos_type: memory-hog}
+  - {service: orders,    chaos_type: cpu-hog}
+  - {service: carts,     chaos_type: pod-delete}
+
+test_experiments:
+  - {service: user,     chaos_type: memory-hog}
+  - {service: shipping, chaos_type: pod-delete}
+
+replicas: 1
+
+# ── Estratégias (reduzido de 6 → 2) ─────────────────────────────────────────
+# S0: zero-shot sem RAG  — baseline de referência
+# S2: RAG por embeddings — estratégia principal a validar
+# Adicione S1/S3 aqui quando quiser validar os demais modos sem rodar o completo.
+strategies:
+  - name: "S0_no_rag"
+    mode: "embedding"
+    limit: 0
+    system_id: "sock-shop"
+    budget_tokens: 3200
+    max_new_tokens: 1024
+
+  - name: "S2_rag_embeddings"
+    mode: "embedding"
+    limit: 3
+    system_id: "sock-shop"
+    budget_tokens: 3200
+    max_new_tokens: 1024
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output:
+  results_dir: "experiment/eval/memory_hog/out-mini"
+  runs_csv: "runs.csv"
+  evaluation_csv: "evaluation.csv"
+  manifests_dir: "manifests"

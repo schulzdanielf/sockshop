@@ -3,6 +3,9 @@ logs
 *.log
 npm-debug.log*
 
+# Secrets / local env overrides
+.env
+
 # Dependency directories
 node_modules
 jspm_packages

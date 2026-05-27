@@ -1,8 +1,6 @@
-phase,service,replica_idx,chaos_target,experiment_id,run_id,status,started_at,ended_at,notes
-train,catalogue,0,catalogue,memhog-catalogue-r0-20260523-132025,run-84b547d10001,completed,2026-05-23T13:20:25.745929+00:00,2026-05-23T13:25:57.337396+00:00,
-train,catalogue,1,catalogue,memhog-catalogue-r1-20260523-132611,run-f0af306916c6,completed,2026-05-23T13:26:11.254583+00:00,2026-05-23T13:31:42.676041+00:00,
-train,carts,0,carts,memhog-carts-r0-20260523-133156,run-989b74821754,completed,2026-05-23T13:31:56.748015+00:00,2026-05-23T13:37:27.984200+00:00,
-train,carts,1,carts,memhog-carts-r1-20260523-133742,run-ff221a8621a6,completed,2026-05-23T13:37:42.225879+00:00,2026-05-23T13:43:13.467991+00:00,
-train,orders,0,orders,memhog-orders-r0-20260523-165950,run-b5f73d386227,failed,2026-05-23T16:59:50.988061+00:00,2026-05-23T17:00:51.657774+00:00,
-train,orders,1,orders,memhog-orders-r1-20260523-170106,run-f89aaacec81f,failed,2026-05-23T17:01:06.188402+00:00,2026-05-23T17:02:06.742392+00:00,
-train,payment,0,payment,memhog-payment-r0-20260523-170221,run-1f2170fa1534,failed,2026-05-23T17:02:21.396963+00:00,2026-05-23T17:03:21.906258+00:00,
+phase,chaos_type,service,replica_idx,chaos_target,experiment_id,run_id,status,started_at,ended_at,notes
+train,memory-hog,catalogue,0,catalogue,memhog-catalogue-r0-20260523-132025,run-84b547d10001,completed,2026-05-23T13:20:25.745929+00:00,2026-05-23T13:25:57.337396+00:00,
+train,pod-delete,carts,0,carts,poddel-carts-r0-20260523-193214,run-5b55810a15e7,completed,2026-05-23T19:32:14.668702+00:00,2026-05-23T19:37:46.175390+00:00,
+train,cpu-hog,orders,0,orders,cpuhog-orders-r0-20260523-194346,run-f76202fae30c,completed,2026-05-23T19:43:46.431422+00:00,2026-05-23T19:49:17.945560+00:00,
+train,memory-hog,payment,0,payment,memhog-payment-r0-20260523-172632,run-209d0c521ee4,completed,2026-05-23T17:26:32.216126+00:00,2026-05-23T17:32:03.967489+00:00,
+train,cpu-hog,payment,0,payment,cpuhog-payment-r0-20260523-200650,run-c21c06f5de68,completed,2026-05-23T20:06:50.441052+00:00,2026-05-23T20:12:21.938503+00:00,

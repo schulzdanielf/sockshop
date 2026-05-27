@@ -25,6 +25,56 @@ import numpy as np
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:@/-]+")
 
 
+def anonymize_services(text: str, services: Sequence[str]) -> str:
+    """Replace concrete service names with positional placeholders.
+
+    The mapping is built from the **order of first appearance** in *text*
+    (with *services* as a hint set of known service identifiers). This
+    keeps embeddings structural: a "memory pressure on the first hop"
+    pattern produces a similar vector regardless of whether the first
+    hop is ``user`` or ``orders``.
+
+    Used to remove ground-truth leakage from the embedding input — the
+    raw ``summary_text`` (with real names) is still kept for prompt
+    assembly and human inspection.
+
+    Substitutions are whole-word, case-insensitive. Service identifiers
+    are matched literally (including ``-`` and ``_``).
+    """
+    if not text or not services:
+        return text or ""
+
+    # Deduplicate while preserving the original order of the hint list.
+    seen: set[str] = set()
+    candidates: List[str] = []
+    for svc in services:
+        if not svc:
+            continue
+        key = svc.strip()
+        if not key or key.lower() in seen:
+            continue
+        seen.add(key.lower())
+        candidates.append(key)
+
+    # Re-order by first appearance in the text so the mapping is stable
+    # across runs that mention the same services in the same role.
+    def _first_pos(svc: str) -> int:
+        m = re.search(rf"\b{re.escape(svc)}\b", text, flags=re.IGNORECASE)
+        return m.start() if m else 10**9
+    candidates.sort(key=_first_pos)
+
+    out = text
+    for idx, svc in enumerate(candidates):
+        placeholder = f"<svc_{idx}>"
+        out = re.sub(
+            rf"\b{re.escape(svc)}\b",
+            placeholder,
+            out,
+            flags=re.IGNORECASE,
+        )
+    return out
+
+
 class EmbeddingProvider(Protocol):
     name: str
     dim: int

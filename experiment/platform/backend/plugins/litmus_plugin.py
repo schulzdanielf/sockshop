@@ -68,13 +68,23 @@ class LitmusChaosPlugin:
         pattern = re.compile(rf"^{re.escape(workflow_template)}-(\d{{13}})$")
         latest_item: Optional[Dict[str, Any]] = None
         latest_ts = 0
+        base_item: Optional[Dict[str, Any]] = None
         for item in data.get("items", []):
-            m = pattern.match(item["metadata"].get("name", ""))
+            name = item["metadata"].get("name", "")
+            m = pattern.match(name)
             if m:
                 ts = int(m.group(1))
                 if ts > latest_ts:
                     latest_ts = ts
                     latest_item = item
+            elif name == workflow_template:
+                # Fallback: bare template workflow (no timestamp suffix), e.g.
+                # one created directly via `kubectl apply` rather than a UI
+                # resubmit. Use its spec only if no timestamped instance exists.
+                base_item = item
+
+        if latest_item is None:
+            latest_item = base_item
 
         if latest_item is None:
             raise RuntimeError(

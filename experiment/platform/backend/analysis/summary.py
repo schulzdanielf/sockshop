@@ -41,6 +41,45 @@ def _phase_line(metric_id: str, phase_stats: Dict[str, Any]) -> str:
     return f"- {metric_id}: " + " | ".join(parts)
 
 
+def _render_hotspot_lines(
+    hotspots: Dict[str, Any],
+    metric_ids: Tuple[str, ...],
+) -> List[str]:
+    """Render top-N hotspots for the given metric ids, in declared order.
+
+    Skips metrics that produced no useful per-label data (single global
+    series, query failed, all rows have zero deviation).
+    """
+    out: List[str] = []
+    for metric_id in metric_ids:
+        entry = hotspots.get(metric_id)
+        if not isinstance(entry, dict):
+            continue
+        rows = entry.get("top") or []
+        if not rows:
+            continue
+        # Drop rows where there is no signal at all (fault==baseline==0).
+        meaningful = [
+            r for r in rows
+            if isinstance(r, dict)
+            and (abs(r.get("delta_abs", 0.0)) > 1e-6
+                 or r.get("fault_mean", 0.0) > 1e-6)
+        ]
+        if not meaningful:
+            continue
+        for row in meaningful:
+            label = row.get("label", "?")
+            fault = _fmt_num(row.get("fault_mean"))
+            base = _fmt_num(row.get("baseline_mean"))
+            delta = _fmt_num(row.get("delta_abs"))
+            sign = "+" if (row.get("delta_abs") or 0) >= 0 else ""
+            out.append(
+                f"- {label:<14} {metric_id:<22} "
+                f"fault={fault} baseline={base} Δ={sign}{delta}"
+            )
+    return out
+
+
 def build_summary_tags(features: Dict[str, Any]) -> List[str]:
     """Short controlled-vocabulary tags used for retrieval and filtering."""
     tags: List[str] = []
@@ -159,6 +198,36 @@ def build_run_summary_l2(
         for metric_id, phase_stats in list(phase_metrics.items())[:8]:
             if isinstance(phase_stats, dict):
                 lines.append(_phase_line(metric_id, phase_stats))
+
+    # ── Service hotspots — per-label localisation signal ─────────────────
+    # Two subsections separating SYMPTOM metrics (RED — cascading effects
+    # the operator observes) from CAUSAL metrics (resource saturation that
+    # points at the resource-exhausted pod). Labels are pre-normalised to
+    # the parent service name in ``per_label_hotspots`` so the same pod
+    # group is aggregated across replicas.
+    hotspots = features.get("metric_hotspots") or {}
+    if hotspots:
+        _SYMPTOM_METRICS = ("error_rate", "latency_p95", "latency_p99", "traffic")
+        _CAUSAL_METRICS = (
+            "memory_saturation_pct", "cpu_saturation_pct", "cpu_throttled",
+            "pod_restarts", "memory_working_set_bytes", "cpu_usage_cores",
+        )
+        symptom_lines = _render_hotspot_lines(hotspots, _SYMPTOM_METRICS)
+        causal_lines = _render_hotspot_lines(hotspots, _CAUSAL_METRICS)
+        if symptom_lines or causal_lines:
+            lines.append("\n## Service hotspots")
+            lines.append(
+                "Per-service deviation during the fault phase (fault_mean − "
+                "baseline_mean). Symptom hotspots show where errors/latency "
+                "manifest (often downstream); causal hotspots show resource "
+                "exhaustion (often the root cause)."
+            )
+            if symptom_lines:
+                lines.append("\n### Symptom hotspots (RED — request/error/latency)")
+                lines.extend(symptom_lines)
+            if causal_lines:
+                lines.append("\n### Resource saturation hotspots")
+                lines.extend(causal_lines)
 
     # Traces
     lines.append("\n## Traces")

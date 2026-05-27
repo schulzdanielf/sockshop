@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -73,7 +74,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
     @app.get("/api/health")
     def health() -> dict:
         return {"status": "ok"}
@@ -125,6 +125,7 @@ def create_app() -> FastAPI:
                 initiated_by=req.initiated_by,
                 idempotency_key=req.idempotency_key,
                 approved_by=req.approved_by,
+                is_training=req.is_training,
             )
             return {
                 "run_id": run.run_id,
@@ -386,7 +387,9 @@ def create_app() -> FastAPI:
                 target_vec = blob_to_vector(target_emb["blob"], target_emb["dim"])
                 rows = storage.iter_run_embeddings(
                     provider=target_emb["provider"],
-                    chaos_type=target.get("chaos_type"),
+                    # NOTE: do NOT filter by chaos_type — that would act as an
+                    # oracle, only returning neighbours of the same fault type
+                    # as the target and trivialising the classification task.
                     limit=1000,
                     include_features=True,
                 )
@@ -437,7 +440,7 @@ def create_app() -> FastAPI:
             target_vec = blob_to_vector(target_emb["blob"], target_emb["dim"])
             rows = storage.iter_run_embeddings(
                 provider=target_emb["provider"],
-                chaos_type=target.get("chaos_type"),
+                # NOTE: do NOT filter by chaos_type — see hybrid branch above.
                 limit=1000,
             )
             candidates = []
@@ -453,7 +456,8 @@ def create_app() -> FastAPI:
             used_mode = "embedding"
         else:
             cand = storage.list_run_summaries(
-                chaos_type=target.get("chaos_type"), limit=500
+                # NOTE: do NOT filter by chaos_type — see hybrid branch above.
+                limit=500,
             )
             ranked = rank_similar_runs(
                 target.get("tags") or [],
@@ -562,18 +566,23 @@ def create_app() -> FastAPI:
             max_neighbours=limit,
             system_id=system_id,
         )
+
+        t_call_start = time.time()
         try:
             raw = call_llm(prompt, max_new_tokens=max_new_tokens)
         except LLMClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
+        llm_latency_ms = int((time.time() - t_call_start) * 1000)
         parsed = parse_verdict_response(raw)
+
         target = rag.get("target") or {}
         analysis = {
             **parsed,
             "rag_mode": rag.get("mode"),
             "prompt_meta": meta,
             "max_new_tokens": max_new_tokens,
+            "llm_latency_ms": llm_latency_ms,
         }
         storage.upsert_llm_analysis(run_id, analysis)
         return {

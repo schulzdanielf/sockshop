@@ -3,5 +3,8 @@ uvicorn>=0.30,<1
 pydantic>=2.8,<3
 mcp>=1.0.0
 numpy>=1.26,<3
+# Optional: LLM observability via Langfuse self-hosted (deploy/docker-compose/docker-compose.langfuse.yml)
+# Activated only when LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are set.
+langfuse>=2.50,<3
 # Optional: enable RAG_EMBEDDING_PROVIDER=sentence-transformers
 # sentence-transformers>=2.7

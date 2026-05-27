@@ -167,3 +167,117 @@ class MCPPrometheusMetricsPlugin:
             else:
                 streak = 0
         return None
+
+    @staticmethod
+    def _pod_to_service(pod_name: str) -> str:
+        """Strip the ReplicaSet+Pod hash suffix from a k8s pod name.
+
+        Example: 'user-77c77cd7d8-nf5wq' → 'user'
+                 'front-end-6489c74749-9jdrg' → 'front-end'
+        Hashes are 5-10 chars of [a-z0-9]; the deployment name may itself
+        contain hyphens (e.g. 'front-end'), so we strip the LAST TWO
+        hyphen-segments rather than splitting on '-'.
+        """
+        if not pod_name or "-" not in pod_name:
+            return pod_name
+        parts = pod_name.rsplit("-", 2)
+        # Strip suffix only if it really looks like a deployment hash
+        # (5-10 lowercase alnum chars). Otherwise return as-is so labels
+        # like 'mongodb-exporter' aren't truncated.
+        if len(parts) == 3 and len(parts[1]) >= 5 and len(parts[2]) >= 4:
+            return parts[0]
+        return pod_name
+
+    def per_label_hotspots(
+        self,
+        raw: Dict[str, Any],
+        phases: List[Tuple[str, str, str]],
+        *,
+        top_k: int = 3,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Compute per-label fault-vs-baseline deltas for each metric.
+
+        For each metric in *raw*:
+          1. Auto-detect the discriminating label key (``name`` for RED
+             metrics, ``pod`` for container/saturation metrics).
+          2. Bucket points by (label_value, phase).
+          3. Compute baseline_mean / fault_mean / fault_p95 per label.
+          4. Rank labels by ``fault_mean - baseline_mean`` (descending);
+             keep ``top_k``.
+
+        Pod labels are normalised to the parent deployment name so that
+        the same logical service is grouped together across replicas.
+
+        Returns
+        -------
+        ``{metric_id: {"label_kind": "service"|"pod"|"raw",
+                       "top": [{label, baseline_mean, fault_mean,
+                                fault_p95, delta_abs}, ...]}}``
+        """
+        data = raw.get("data", {})
+        phase_bounds: List[Tuple[str, float, float]] = [
+            (name, _parse_iso(s), _parse_iso(e)) for name, s, e in phases
+        ]
+        # We only care about baseline vs fault here; warmup/post are noise
+        # for the localisation signal.
+        baseline_window = next(
+            ((lo, hi) for n, lo, hi in phase_bounds if n == "baseline"), None
+        )
+        fault_window = next(
+            ((lo, hi) for n, lo, hi in phase_bounds if n == "fault"), None
+        )
+        if baseline_window is None or fault_window is None:
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for metric_id, payload in data.items():
+            # Group points by (chosen_label, phase) where chosen_label is
+            # auto-detected per series from its label set.
+            per_label_baseline: Dict[str, List[float]] = {}
+            per_label_fault: Dict[str, List[float]] = {}
+            label_kind = "raw"
+
+            for ts, val, labels in self._iter_points(payload):
+                # Pick the discriminating label: prefer 'name' (RED metrics)
+                # then 'pod' (container/saturation). If neither, skip — the
+                # metric is already a single global series with nothing to
+                # localise.
+                if "name" in labels and labels["name"]:
+                    key = str(labels["name"])
+                    label_kind = "service"
+                elif "pod" in labels and labels["pod"]:
+                    key = self._pod_to_service(str(labels["pod"]))
+                    label_kind = "pod"
+                else:
+                    continue
+
+                if baseline_window[0] <= ts <= baseline_window[1]:
+                    per_label_baseline.setdefault(key, []).append(val)
+                elif fault_window[0] <= ts <= fault_window[1]:
+                    per_label_fault.setdefault(key, []).append(val)
+
+            if not per_label_fault:
+                continue
+
+            rows: List[Dict[str, Any]] = []
+            for label, fault_vals in per_label_fault.items():
+                base_vals = per_label_baseline.get(label, [])
+                fault_mean = statistics.fmean(fault_vals)
+                base_mean = statistics.fmean(base_vals) if base_vals else 0.0
+                fault_p95 = sorted(fault_vals)[int(0.95 * (len(fault_vals) - 1))]
+                rows.append({
+                    "label": label,
+                    "baseline_mean": round(base_mean, 4),
+                    "fault_mean": round(fault_mean, 4),
+                    "fault_p95": round(fault_p95, 4),
+                    "delta_abs": round(fault_mean - base_mean, 4),
+                })
+            # Rank by absolute fault-vs-baseline deviation (descending) and
+            # truncate. Negative deltas (metric DROPPED during fault, e.g.
+            # traffic collapse) are still meaningful — keep them by magnitude.
+            rows.sort(key=lambda r: abs(r["delta_abs"]), reverse=True)
+            out[str(metric_id)] = {
+                "label_kind": label_kind,
+                "top": rows[:top_k],
+            }
+        return out

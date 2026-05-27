@@ -17,9 +17,62 @@ safely under the 4k context window with headroom for ``max_new_tokens``.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .system_card import render_system_card
+
+
+# Regex that matches " | chaos_type: `<value>`" in the L2 summary second line.
+# We strip this segment from the TARGET summary before sending to the LLM so
+# the model must infer the fault category from metrics/traces alone.
+_CHAOS_TYPE_RE = re.compile(r'\s*\|\s*chaos_type:\s*`[^`]*`')
+
+# Regex that strips "(experiment <experiment_id>)" from the H1 line of the
+# summary.  The experiment_id encodes both the fault short-name
+# (memhog / cpuhog / poddel) and the target service, so it must be removed
+# from the TARGET block to prevent direct ground-truth leakage.
+# Example: "# Run run-abc123 (experiment cpuhog-orders-r0-20260523-194346)"
+#       →  "# Run run-abc123"
+_EXPERIMENT_ID_RE = re.compile(r'\s*\(experiment\s+[^)]+\)')
+
+# Regex that strips ", affected_services=[...]" from the Traces line.
+# The list almost always starts with the chaos-injected service, giving the
+# LLM the answer to RCA. We keep the trace/error counts intact.
+_AFFECTED_SERVICES_RE = re.compile(r',\s*affected_services=\[[^\]]*\]')
+
+# Regex that removes whole H2 sections that name services directly:
+#   - "## Top failure signatures" — each line cites the affected service.
+#   - "## Propagation graph"      — cascade order + edges expose RCA.
+# Matches from the H2 header to (but not including) the next H2 or EOF.
+_SERVICE_SECTIONS_RE = re.compile(
+    r'\n## (?:Top failure signatures|Propagation graph)\n[\s\S]*?(?=\n## |\Z)'
+)
+
+
+def _mask_target_summary(text: str) -> str:
+    """Remove ground-truth signals from the L2 summary shown to the LLM.
+
+    Several leakage vectors are neutralised in the TARGET block only.
+    Neighbour summaries keep all fields intact — they are the reference
+    corpus the LLM cites.
+
+    1. ``chaos_type: `...``` on the Verdict header line — directly names
+       the injected fault category.
+    2. ``(experiment <id>)`` on the H1 title line — encodes fault short-name
+       and target service (e.g. ``cpuhog-orders-r0-...``).
+    3. ``affected_services=[...]`` on the Traces line — list usually begins
+       with the chaos-injected service.
+    4. ``## Top failure signatures`` section — each bullet cites the
+       affected service by name.
+    5. ``## Propagation graph`` section — cascade order + edges expose the
+       epicentre service and full topology.
+    """
+    text = _CHAOS_TYPE_RE.sub('', text)
+    text = _EXPERIMENT_ID_RE.sub('', text)
+    text = _AFFECTED_SERVICES_RE.sub('', text)
+    text = _SERVICE_SECTIONS_RE.sub('', text)
+    return text
 
 
 SYSTEM_PROMPT = (
@@ -90,6 +143,7 @@ def assemble_prompt(
     system_card_text = render_system_card(system_id) if system_id else ""
 
     target_text = target.get("summary_text") or ""
+    target_text = _mask_target_summary(target_text)
     target_budget = int(budget_tokens * target_share)
     target_text = _truncate_to_tokens(target_text, target_budget)
 
@@ -113,7 +167,15 @@ def assemble_prompt(
             "verdict": n.get("verdict"),
         })
 
-    tags = ", ".join(target.get("tags") or [])
+    # Strip tags that would leak the injected fault or target service to the
+    # LLM — those are ground-truth labels and must not appear in the target
+    # block. Neighbours keep their full tags (they are the reference corpus).
+    _LEAKAGE_PREFIXES = ("chaos:", "svc:", "fault_category:")
+    tags_visible = [
+        t for t in (target.get("tags") or [])
+        if not any(t.startswith(p) for p in _LEAKAGE_PREFIXES)
+    ]
+    tags = ", ".join(tags_visible)
     target_block = (
         f"## Target run\n"
         f"run_id: {target.get('run_id')}\n"
@@ -123,7 +185,27 @@ def assemble_prompt(
 
     body_parts: List[str] = [target_block]
     if neighbour_blocks:
-        body_parts.append("\n## Retrieved past runs\n" + "\n\n".join(neighbour_blocks))
+        body_parts.append(
+            "\n## Retrieved past runs\n" + "\n\n".join(neighbour_blocks)
+        )
+        task_instruction = (
+            "Classify the target run and explain the call. "
+            "Reference past runs by their citation id (e.g. [n1])."
+        )
+    else:
+        # No historical runs were retrieved (e.g. S0_no_rag baseline or empty
+        # corpus). Without an explicit placeholder the model tends to invent
+        # a fake ``## Previous runs`` block instead of producing the JSON
+        # answer. Make the absence explicit and remove the citation request.
+        body_parts.append(
+            "\n## Retrieved past runs\n"
+            "(none — no historical runs are provided for this analysis)"
+        )
+        task_instruction = (
+            "Classify the target run based ONLY on the target summary and "
+            "system card above. No past runs are available, so do not cite "
+            "any and leave the ``citations`` list empty."
+        )
     body = "\n\n".join(body_parts)
 
     prompt = (
@@ -131,8 +213,7 @@ def assemble_prompt(
         + (f"<system_card>\n{system_card_text}\n</system_card>\n\n"
            if system_card_text else "")
         + f"<context>\n{body}\n</context>\n\n"
-        + f"<task>\nClassify the target run and explain the call. "
-          f"Reference past runs by their citation id (e.g. [n1]).\n"
+        + f"<task>\n{task_instruction}\n"
           f"Respond ONLY with a JSON object following this schema:\n"
           f"{ANSWER_SCHEMA}\n</task>"
     )

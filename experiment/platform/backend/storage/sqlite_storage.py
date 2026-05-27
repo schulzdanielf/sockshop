@@ -163,6 +163,19 @@ class SqliteStorage:
                     conn.execute(
                         f"ALTER TABLE run_features ADD COLUMN {col} {ddl}"
                     )
+            # is_training flag splits the corpus: only is_training=1 rows are
+            # eligible as RAG neighbours. Test rows (is_training=0) stay
+            # queryable as targets but never leak into retrieval results.
+            # Default 1 preserves backward compatibility for pre-existing runs;
+            # the backfill script flips bootstrap test rows to 0.
+            if "is_training" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE run_features ADD COLUMN is_training INTEGER NOT NULL DEFAULT 1"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_run_features_is_training "
+                    "ON run_features(is_training)"
+                )
             conn.commit()
 
     def create_experiment(self, created_by: str, spec: Dict[str, Any]) -> ExperimentVersion:
@@ -444,10 +457,16 @@ class SqliteStorage:
         ]
 
     def upsert_run_features(self, run_id: str, experiment_id: str, features: Dict[str, Any]) -> None:
-        """Persist L1 features for a run. Idempotent."""
+        """Persist L1 features for a run. Idempotent.
+
+        ``features['is_training']`` (bool) controls whether this row is
+        eligible as a RAG neighbour. Defaults to True when unset, matching
+        legacy behaviour.
+        """
         affected = features.get("affected_services", []) or []
         summary_text = features.get("summary_text")
         tags = features.get("tags") or []
+        is_training = 1 if features.get("is_training", True) else 0
         with self._conn() as conn:
             conn.execute(
                 """
@@ -455,8 +474,8 @@ class SqliteStorage:
                     run_id, experiment_id, chaos_type, verdict,
                     slo_violation_count, recovery_time_seconds,
                     affected_services_json, features_json,
-                    summary_text, tags_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    summary_text, tags_json, is_training, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     chaos_type=excluded.chaos_type,
                     verdict=excluded.verdict,
@@ -465,7 +484,8 @@ class SqliteStorage:
                     affected_services_json=excluded.affected_services_json,
                     features_json=excluded.features_json,
                     summary_text=excluded.summary_text,
-                    tags_json=excluded.tags_json
+                    tags_json=excluded.tags_json,
+                    is_training=excluded.is_training
                 """,
                 (
                     run_id,
@@ -478,6 +498,7 @@ class SqliteStorage:
                     json.dumps(features),
                     summary_text,
                     json.dumps(tags),
+                    is_training,
                     utc_now_iso(),
                 ),
             )
@@ -520,9 +541,15 @@ class SqliteStorage:
         experiment_id: Optional[str] = None,
         verdict: Optional[str] = None,
         chaos_type: Optional[str] = None,
+        is_training_only: bool = True,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
-        """Return lightweight summary records (tags + summary_text)."""
+        """Return lightweight summary records (tags + summary_text).
+
+        ``is_training_only`` (default True) restricts the result set to rows
+        marked as training corpus. Callers that genuinely need test rows
+        (e.g. evaluation tooling) must opt out explicitly.
+        """
         where: List[str] = ["summary_text IS NOT NULL"]
         params: List[Any] = []
         if experiment_id:
@@ -534,6 +561,8 @@ class SqliteStorage:
         if chaos_type:
             where.append("chaos_type = ?")
             params.append(chaos_type)
+        if is_training_only:
+            where.append("is_training = 1")
         clause = "WHERE " + " AND ".join(where)
         params.append(int(limit))
         with self._conn() as conn:
@@ -646,6 +675,7 @@ class SqliteStorage:
         *,
         provider: Optional[str] = None,
         chaos_type: Optional[str] = None,
+        is_training_only: bool = True,
         limit: int = 1000,
         include_features: bool = False,
     ) -> List[Dict[str, Any]]:
@@ -654,6 +684,10 @@ class SqliteStorage:
         ``include_features`` adds the full ``features_json`` payload so
         callers (e.g. the hybrid trace-aware ranker in Phase F1) can
         retrieve the propagation graph without a second query.
+
+        ``is_training_only`` (default True) restricts the result set to
+        rows flagged as training corpus, preventing test-set self-leakage
+        through embedding similarity.
         """
         where: List[str] = ["embedding_blob IS NOT NULL"]
         params: List[Any] = []
@@ -663,6 +697,8 @@ class SqliteStorage:
         if chaos_type:
             where.append("chaos_type = ?")
             params.append(chaos_type)
+        if is_training_only:
+            where.append("is_training = 1")
         clause = "WHERE " + " AND ".join(where)
         params.append(int(limit))
         extra_cols = ", features_json" if include_features else ""

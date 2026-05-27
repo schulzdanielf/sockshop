@@ -13,6 +13,7 @@ from .analysis import (
     compute_temporal_features,
     get_embedding_provider,
     vector_to_blob,
+    anonymize_services,
 )
 from .ports import (
     ChaosProviderPort,
@@ -60,6 +61,7 @@ class OrchestratorEngine:
         initiated_by: str,
         idempotency_key: Optional[str] = None,
         approved_by: Optional[str] = None,
+        is_training: bool = True,
     ) -> RunRecord:
         gov = exp.spec.get("governance", {})
         requires_approval = bool(gov.get("requires_approval", False))
@@ -73,6 +75,9 @@ class OrchestratorEngine:
             initiated_by=initiated_by,
             started_at=utc_now_iso(),
         )
+        # Stash on summary so it survives across the run lifecycle without
+        # adding a new column to the runs table.
+        run.summary["is_training"] = bool(is_training)
         run = self.storage.create_run(run, idempotency_key=idempotency_key)
 
         self._event(run.run_id, "run_created", {"status": run.status.value, "initiated_by": initiated_by})
@@ -269,6 +274,37 @@ class OrchestratorEngine:
             except Exception as exc:  # pragma: no cover - summary best-effort
                 self._event(run_id, "run_summary_l2_failed", {"error": str(exc)})
 
+            # Propagate the train/test flag from RunRecord.summary into the
+            # features dict so the storage layer can persist it.
+            current_run = self.storage.get_run(run_id)
+            features["is_training"] = bool(
+                current_run.summary.get("is_training", True)
+            )
+
+            # ── Ground-truth auto-labelling ─────────────────────────────────
+            # Experiments submitted by the eval harness carry their ground
+            # truth in the experiment-level tags as ``target:<service>`` and
+            # ``fault_category:<category>``. Extract them here so every
+            # persisted run row has a stable label that doesn't depend on the
+            # eval harness keeping a static chaos_type → fault_category map.
+            # Future fault families (config-error, network-degradation, etc.)
+            # just need to ship the right tag on the experiment spec.
+            exp_meta = exp.spec.get("experiment", {}) if isinstance(exp.spec, dict) else {}
+            spec_tags = exp_meta.get("tags") or []
+            gt_service: Optional[str] = None
+            gt_fault: Optional[str] = None
+            for tag in spec_tags:
+                if not isinstance(tag, str):
+                    continue
+                if tag.startswith("target:") and gt_service is None:
+                    gt_service = tag.split(":", 1)[1].strip() or None
+                elif tag.startswith("fault_category:") and gt_fault is None:
+                    gt_fault = tag.split(":", 1)[1].strip() or None
+            if gt_service:
+                features["ground_truth_service"] = gt_service
+            if gt_fault:
+                features["ground_truth_fault_category"] = gt_fault
+
             try:
                 self.storage.upsert_run_features(run_id, exp.experiment_id, features)
             except Exception as exc:  # pragma: no cover - storage best-effort
@@ -278,8 +314,24 @@ class OrchestratorEngine:
             summary_text = features.get("summary_text")
             if summary_text:
                 try:
+                    # Anonymize service names before embedding so retrieval
+                    # measures the *shape* of the incident (cascade, hotspots,
+                    # p95 dynamics) rather than the lexical overlap of the
+                    # service names. The raw summary_text is still kept for
+                    # prompt assembly and human inspection.
+                    known_services = list(features.get("affected_services") or [])
+                    # Augment with services seen in the dependency map / tags
+                    # so even "innocent bystanders" get masked consistently.
+                    dep_map = features.get("dependency_map") or {}
+                    if isinstance(dep_map, dict):
+                        for node in dep_map.get("nodes") or []:
+                            if isinstance(node, str):
+                                known_services.append(node)
+                            elif isinstance(node, dict) and node.get("service"):
+                                known_services.append(node["service"])
+                    anonymized = anonymize_services(summary_text, known_services)
                     provider = get_embedding_provider()
-                    vec = provider.embed(summary_text)
+                    vec = provider.embed(anonymized)
                     self.storage.upsert_run_embedding(
                         run_id, provider.name, provider.dim, vector_to_blob(vec)
                     )
@@ -381,10 +433,27 @@ class OrchestratorEngine:
             "max_recovery_seconds": float(slo.get("max_recovery_seconds", 600)),
         }
 
+    # Known fault-type suffixes in descending specificity order so that the
+    # most precise match wins (e.g. "pod-delete" before a hypothetical "delete").
+    _KNOWN_FAULT_TYPES = ("memory-hog", "cpu-hog", "pod-delete")
+
     @staticmethod
     def _chaos_type(spec: Dict[str, Any]) -> Optional[str]:
+        """Return the fault *type* only, not the full engine name.
+
+        ``chaos_engine`` is the Argo Workflow template name and encodes both
+        the target service and the fault type (e.g. ``user-memory-hog``).
+        Storing the raw engine name as ``chaos_type`` leaks the injected
+        service into the RAG tags, biasing LLM evaluation. We strip the
+        service prefix so only the fault type is stored.
+        """
         chaos = spec.get("chaos_profile", {}) or {}
-        return chaos.get("chaos_engine") or chaos.get("manifest_path")
+        engine = chaos.get("chaos_engine") or ""
+        for fault in OrchestratorEngine._KNOWN_FAULT_TYPES:
+            if engine.endswith(fault):
+                return fault
+        # Fallback: return whatever is available (manifest_path for non-Litmus)
+        return engine or chaos.get("manifest_path") or None
 
     def _build_run_features(
         self,
@@ -404,6 +473,22 @@ class OrchestratorEngine:
                 per_phase = per_phase_method(metrics_raw, phases)
             except Exception:
                 per_phase = {}
+
+        # ── Per-label hotspots (localisation signal) ────────────────────────
+        # ``summarize_per_phase`` discards series labels — the LLM ends up
+        # seeing only a namespace-wide aggregate per metric, with no way to
+        # tell which service is the actual hotspot. ``per_label_hotspots``
+        # preserves the discriminating label (``name`` for RED metrics,
+        # ``pod`` for container saturation) and ranks services by
+        # fault-vs-baseline deviation, giving the LLM the same view a real
+        # SRE has in Grafana.
+        hotspots: Dict[str, Any] = {}
+        hotspots_method = getattr(self.metrics, "per_label_hotspots", None)
+        if callable(hotspots_method):
+            try:
+                hotspots = hotspots_method(metrics_raw, phases, top_k=3) or {}
+            except Exception:
+                hotspots = {}
 
         # ── SLO violations per phase ────────────────────────────────────────
         # Convention: queries with id 'error_rate' and 'latency_p95' map to SLOs.
@@ -505,6 +590,7 @@ class OrchestratorEngine:
             "chaos_type": self._chaos_type(spec),
             "slo_thresholds": slo,
             "phase_metrics": per_phase,
+            "metric_hotspots": hotspots,
             "slo_violations": slo_violations,
             "recovery_time_seconds": recovery_time,
             "recovery_reference_metric": recovery_metric,

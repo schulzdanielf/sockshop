@@ -16,6 +16,7 @@ from .embeddings import (
     reset_embedding_provider,
     vector_to_blob,
     blob_to_vector,
+    anonymize_services,
 )
 from .prompt import assemble_prompt, estimate_tokens
 from .llm_client import call_llm, parse_verdict_response, llm_health, LLMClientError

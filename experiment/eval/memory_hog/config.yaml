@@ -1,18 +1,18 @@
 # ────────────────────────────────────────────────────────────────────────────
-# Memory-hog evaluation harness — declarative matrix
+# Multi-chaos evaluation harness — declarative matrix
 # ────────────────────────────────────────────────────────────────────────────
 # Loaded by experiment/eval/memory_hog/runner.py and
 # experiment/eval/memory_hog/generate_chaos_manifests.py.
 #
-# Goal: inject `pod-memory-hog` chaos in some services to build up the RAG
-# corpus, then in others to evaluate multiple LLM analysis strategies on the
-# same set of held-out runs.
+# Goal: inject several chaos types (memory-hog, cpu-hog, pod-delete) in a mix
+# of services to build up the RAG corpus (train phase) and then evaluate
+# multiple LLM analysis strategies on a held-out, also-mixed test set.
 
 # ── Platform / cluster wiring ───────────────────────────────────────────────
 platform:
   api_base: "http://127.0.0.1:8010"
   user_role: "chaos_engineer"
-  initiated_by: "memory-hog-harness"
+  initiated_by: "multi-chaos-harness"
   # Per-run polling
   poll_interval_seconds: 15
   run_timeout_seconds: 1800     # 30 min hard cap per run
@@ -22,12 +22,43 @@ cluster:
   litmus_namespace: "litmus"
   argo_controller_instanceid: "f21787ba-08ee-4649-ab66-c880492636dc"
 
-# ── Chaos parameters (applied to every service) ────────────────────────────
-chaos:
-  memory_consumption_mb: 500          # MEMORY_CONSUMPTION env var
-  total_chaos_duration_seconds: 60    # TOTAL_CHAOS_DURATION env var
-  chaos_interval_seconds: 10
-  # Resulting Argo Workflow template name pattern: "<service>-memory-hog"
+# ── Chaos types (one entry per fault injected by the harness) ──────────────
+# Each entry maps to a generated Argo Workflow template named
+# "<service>-<template_suffix>" (e.g. ``carts-cpu-hog``).
+#
+# `short` is used as a stable prefix in the per-run experiment_id
+# (memhog / cpuhog / poddel) so CSV rows are easy to grep.
+#
+# `fault_category` is the value the harness writes into experiment metadata
+# as the ground-truth fault label; it must be one of
+# ``allowed_fault_categories`` declared in the sock-shop system card.
+chaos_types:
+  - name: memory-hog
+    template_suffix: memory-hog
+    short: memhog
+    fault_category: memory-exhaustion
+    env:
+      memory_consumption_mb: 500        # → MEMORY_CONSUMPTION
+      total_chaos_duration_seconds: 60  # → TOTAL_CHAOS_DURATION
+      chaos_interval_seconds: 10        # → CHAOS_INTERVAL
+
+  - name: cpu-hog
+    template_suffix: cpu-hog
+    short: cpuhog
+    fault_category: cpu-exhaustion
+    env:
+      cpu_cores: 1                      # → CPU_CORES
+      total_chaos_duration_seconds: 60  # → TOTAL_CHAOS_DURATION
+      chaos_interval_seconds: 10        # → CHAOS_INTERVAL
+
+  - name: pod-delete
+    template_suffix: pod-delete
+    short: poddel
+    fault_category: pod-failure
+    env:
+      total_chaos_duration_seconds: 30  # → TOTAL_CHAOS_DURATION
+      chaos_interval_seconds: 10        # → CHAOS_INTERVAL
+      force: false                      # → FORCE
 
 # ── Experiment timeline (passed into experiment spec → engine) ─────────────
 timeline:
@@ -56,26 +87,43 @@ slo:
   recovery_tolerance_pct: 0.20
   max_recovery_seconds: 600
 
-# ── Train / Test split ─────────────────────────────────────────────────────
-# Train services seed the RAG corpus; their runs are also evaluated but the
-# evaluation focus is on the held-out test services.
+# ── Train / Test split — mixed chaos cells ─────────────────────────────────
+# Each cell is a (service, chaos_type) pair. Train cells seed the RAG corpus;
+# their runs are also evaluated, but the evaluation focus is the held-out
+# test cells. Both phases purposely mix all three chaos types.
 #
-# DBs and rabbitmq are intentionally excluded: memory-hog on a DB pod drops
+# `chaos_type` must match one of the `chaos_types[].name` entries above.
+#
+# IMPORTANT: every (service, chaos_type) listed under `test_experiments`
+# MUST also appear under `train_experiments`. The harness reserves `replicas`
+# runs for training and the SAME `replicas` for testing — the two replica
+# groups share the cell but are partitioned by `is_training`. Without an
+# in-distribution training cell the RAG corpus has nothing similar to
+# retrieve, collapsing the eval to a zero-shot transfer measurement.
+#
+# DBs and rabbitmq are intentionally excluded: chaos on a stateful pod drops
 # every consumer, which makes the ground truth ambiguous (the LLM may name
 # the symptomatic service rather than the injected one).
-train_services:
-  - catalogue
-  - carts
-  - orders
-  - payment
+train_experiments:
+  - {service: catalogue, chaos_type: memory-hog}
+  - {service: carts,     chaos_type: pod-delete}
+  - {service: orders,    chaos_type: cpu-hog}
+  - {service: payment,   chaos_type: memory-hog}
+  - {service: payment,   chaos_type: cpu-hog}
+  - {service: user,      chaos_type: pod-delete}
+  - {service: shipping,  chaos_type: pod-delete}
+  - {service: queue-master, chaos_type: memory-hog}
+  - {service: front-end,   chaos_type: cpu-hog}
 
-test_services:
-  - user
-  - shipping
-  - queue-master
-  - front-end
+test_experiments:
+  - {service: user,         chaos_type: memory-hog}
+  - {service: user,         chaos_type: cpu-hog}
+  - {service: shipping,     chaos_type: pod-delete}
+  - {service: queue-master, chaos_type: cpu-hog}
+  - {service: front-end,    chaos_type: pod-delete}
+  - {service: orders,       chaos_type: memory-hog}
 
-replicas: 2                            # repetitions per service
+replicas: 1                            # repetitions per (service, chaos_type)
 
 # ── Evaluation strategies (held-out runs × every strategy) ─────────────────
 # All call POST /api/runs/{run_id}/llm-analysis?force=true with these params.
@@ -86,36 +134,42 @@ strategies:
     limit: 0
     system_id: "sock-shop"
     budget_tokens: 3200
+    max_new_tokens: 1024
 
   - name: "S1_rag_tags"
     mode: "tags"
     limit: 3
     system_id: "sock-shop"
     budget_tokens: 3200
+    max_new_tokens: 1024
 
   - name: "S2_rag_embeddings"
     mode: "embedding"
     limit: 3
     system_id: "sock-shop"
     budget_tokens: 3200
+    max_new_tokens: 1024
 
   - name: "S3_rag_hybrid"
     mode: "hybrid"
     limit: 3
     system_id: "sock-shop"
     budget_tokens: 3200
+    max_new_tokens: 1024
 
   - name: "S4_rag_embeddings_no_card"
     mode: "embedding"
     limit: 3
     system_id: "__none__"
     budget_tokens: 3200
+    max_new_tokens: 1024
 
   - name: "S5_rag_short_budget"
     mode: "embedding"
     limit: 3
     system_id: "sock-shop"
     budget_tokens: 1600
+    max_new_tokens: 1024
 
 # ── Output ─────────────────────────────────────────────────────────────────
 output:

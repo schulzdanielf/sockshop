@@ -1,0 +1,5 @@
+run_id,chaos_target,expected_fault_category,strategy,predicted_rca,fault_category,correct,correct_target,correct_fault,correct_full,confidence,prompt_tokens,neighbours_used,rag_mode,system_card_id,raw_error
+run-78bb2b56d58c,user,memory-exhaustion,S0_no_rag,user,memory-exhaustion,True,True,True,True,0.8,2234,,embedding,sock-shop,
+run-78bb2b56d58c,user,memory-exhaustion,S2_rag_embeddings,user,memory-exhaustion,True,True,True,True,0.95,4598,,embedding,sock-shop,
+run-d3f8758be89d,shipping,pod-failure,S0_no_rag,carts,memory-exhaustion,False,False,False,False,0.95,2271,,embedding,sock-shop,
+run-d3f8758be89d,shipping,pod-failure,S2_rag_embeddings,carts,memory-exhaustion,False,False,False,False,0.95,4596,,embedding,sock-shop,

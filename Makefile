@@ -1,3 +1,7 @@
+# Load .env file if present (never committed — see .env.example)
+-include .env
+export
+
 .PHONY: gen-complete-demo
 TOOLS_BIN ?= $(CURDIR)/.tools/bin
 HELM ?= $(TOOLS_BIN)/helm
@@ -19,6 +23,16 @@ PORT_FORWARD_CHECK_HOST ?= $(shell tailscale ip -4 2>/dev/null | head -n1 || ip 
 PORT_FORWARD_CHECK_PORTS ?= 8080 3000 9090 16686 8089 9091
 
 FRONT_END_IMAGE ?= weaveworksdemos/front-end:node18-otel
+
+# ── LLM model server ──────────────────────────────────────────────────────────
+# Node IP for the otel-collector NodePort (port 30318).
+# Override on the command line: make model-serve NODE_IP=<your-node-ip>
+NODE_IP         ?= $(shell kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)
+OTEL_ENDPOINT   ?= http://localhost:4318
+DEPLOYMENT_ENV  ?= local
+MODEL_HOST      ?= 0.0.0.0
+MODEL_PORT      ?= 8001
+
 
 .PHONY: front-end-build
 front-end-build:
@@ -180,6 +194,7 @@ port-forward:
 	nohup kubectl port-forward --address 0.0.0.0 -n mcp-server svc/mcp-observability 18080:8000 >/tmp/pf-mcp-observability.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/loki 3100:3100 >/tmp/pf-loki.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/tempo 3200:3200 >/tmp/pf-tempo.log 2>&1 &
+	nohup kubectl port-forward --address 127.0.0.1 -n monitoring svc/otel-collector 4318:4318 >/tmp/pf-otel-collector.log 2>&1 &
 .PHONY: port-forward-stop
 port-forward-stop:
 	pkill -f "^kubectl port-forward .* -n sock-shop svc/front-end" || true
@@ -191,7 +206,8 @@ port-forward-stop:
 	pkill -f "^kubectl port-forward .* -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_FRONTEND_SERVICE)" || true
 	pkill -f "^kubectl port-forward .* -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE)" || true
 	pkill -f "^kubectl port-forward .* -n mcp-server svc/mcp-observability" || true
-	pkill -f "^kubectl port-forward .* -n loki svc/loki" || true
+	pkill -f "^kubectl port-forward .* -n monitoring svc/loki" || true
+	pkill -f "^kubectl port-forward .* -n monitoring svc/otel-collector" || true
 
 .PHONY: port-forward-check
 port-forward-check:
@@ -218,8 +234,20 @@ cluster-up: app-up observability-up loadtest-up
 cluster-restart: cluster-down cluster-up port-forward
 
 .PHONY: model-serve
+## Start the LLM server with OpenTelemetry traces → otel-collector NodePort.
+## Requires the cluster to be running and 29-otel-collector-svc.yaml applied.
 model-serve:
-	uvicorn model.server:app --host 0.0.0.0 --port 8001
+	OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) \
+	DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
+	.venv/bin/python -m uvicorn model.server:app \
+		--host $(MODEL_HOST) --port $(MODEL_PORT)
+
+
+.PHONY: experiment-platform-up
+## Start the experiment platform (FastAPI backend + GUI) on http://localhost:8010
+experiment-platform-up:
+	.venv/bin/python -m uvicorn experiment.platform.backend.main:app \
+		--host 0.0.0.0 --port 8010 --reload
 
 .PHONY: git
 git:

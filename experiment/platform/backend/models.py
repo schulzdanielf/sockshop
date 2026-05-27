@@ -16,6 +16,10 @@ class StartRunRequest(BaseModel):
     initiated_by: str = Field(..., min_length=1)
     idempotency_key: Optional[str] = None
     approved_by: Optional[str] = None
+    # Whether this run is part of the training corpus (eligible as RAG
+    # neighbour) or a held-out test instance. Defaults to True for
+    # backward compatibility with non-experiment callers.
+    is_training: bool = True
 
 
 class StopRunRequest(BaseModel):

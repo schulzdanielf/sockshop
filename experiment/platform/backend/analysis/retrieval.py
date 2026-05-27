@@ -17,14 +17,38 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 
+def _strip_identity_tags(tags: Iterable[str]) -> List[str]:
+    """Drop tags whose value carries the identity of a specific service.
+
+    ``svc:<name>``, ``cascade:<s1>-><s2>`` and similar tags would leak
+    ground-truth into the retrieval score when the target is a held-out
+    test run: a Jaccard match on ``svc:user`` immediately pulls every
+    training run that touched ``user`` to the top, regardless of whether
+    the underlying phenomenon is similar.
+
+    We therefore exclude identity-carrying tags from similarity scoring.
+    Phenomenon-describing tags (``chaos:*``, ``verdict:*``, ``recovery:*``,
+    ``shape:*``, ``violation:*``, ``edges:*``) are kept.
+    """
+    out: List[str] = []
+    for t in tags or []:
+        if not isinstance(t, str):
+            continue
+        prefix = t.split(":", 1)[0]
+        if prefix in {"svc", "cascade"}:
+            continue
+        out.append(t)
+    return out
+
+
 def score_similarity(
     query_tags: Iterable[str],
     candidate_tags: Iterable[str],
     *,
     verdict_bonus: float = 0.1,
 ) -> float:
-    q = set(query_tags or [])
-    c = set(candidate_tags or [])
+    q = set(_strip_identity_tags(query_tags))
+    c = set(_strip_identity_tags(candidate_tags))
     if not q or not c:
         return 0.0
     inter = q & c
