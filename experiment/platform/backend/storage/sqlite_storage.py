@@ -1,3 +1,10 @@
+"""SQLite-backed implementation of the storage port.
+
+``SqliteStorage`` persists experiments, versions, run records and domain
+events to a local SQLite database. It is the outbound persistence adapter
+fulfilling :class:`ports.StoragePort`.
+"""
+
 from __future__ import annotations
 
 import json
@@ -134,9 +141,7 @@ class SqliteStorage:
                     "ALTER TABLE run_features ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
                 )
             if "embedding_blob" not in existing_cols:
-                conn.execute(
-                    "ALTER TABLE run_features ADD COLUMN embedding_blob BLOB"
-                )
+                conn.execute("ALTER TABLE run_features ADD COLUMN embedding_blob BLOB")
             if "embedding_provider" not in existing_cols:
                 conn.execute(
                     "ALTER TABLE run_features ADD COLUMN embedding_provider TEXT"
@@ -150,9 +155,7 @@ class SqliteStorage:
                     "ALTER TABLE run_features ADD COLUMN llm_analysis_json TEXT"
                 )
             if "llm_analysis_at" not in existing_cols:
-                conn.execute(
-                    "ALTER TABLE run_features ADD COLUMN llm_analysis_at TEXT"
-                )
+                conn.execute("ALTER TABLE run_features ADD COLUMN llm_analysis_at TEXT")
             for col, ddl in (
                 ("operator_label", "TEXT"),
                 ("operator_label_at", "TEXT"),
@@ -160,9 +163,7 @@ class SqliteStorage:
                 ("operator_note", "TEXT"),
             ):
                 if col not in existing_cols:
-                    conn.execute(
-                        f"ALTER TABLE run_features ADD COLUMN {col} {ddl}"
-                    )
+                    conn.execute(f"ALTER TABLE run_features ADD COLUMN {col} {ddl}")
             # is_training flag splits the corpus: only is_training=1 rows are
             # eligible as RAG neighbours. Test rows (is_training=0) stay
             # queryable as targets but never leak into retrieval results.
@@ -178,7 +179,9 @@ class SqliteStorage:
                 )
             conn.commit()
 
-    def create_experiment(self, created_by: str, spec: Dict[str, Any]) -> ExperimentVersion:
+    def create_experiment(
+        self, created_by: str, spec: Dict[str, Any]
+    ) -> ExperimentVersion:
         experiment = spec.get("experiment", {})
         experiment_id = experiment.get("id")
         if not isinstance(experiment_id, str) or not experiment_id:
@@ -198,7 +201,14 @@ class SqliteStorage:
                 INSERT INTO experiments (experiment_id, version, schema_version, created_at, created_by, spec_json)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (experiment_id, version, schema_version, created_at, created_by, json.dumps(spec)),
+                (
+                    experiment_id,
+                    version,
+                    schema_version,
+                    created_at,
+                    created_by,
+                    json.dumps(spec),
+                ),
             )
 
         return ExperimentVersion(
@@ -227,7 +237,9 @@ class SqliteStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_experiment(self, experiment_id: str, version: Optional[int] = None) -> ExperimentVersion:
+    def get_experiment(
+        self, experiment_id: str, version: Optional[int] = None
+    ) -> ExperimentVersion:
         with self._conn() as conn:
             if version is None:
                 row = conn.execute(
@@ -246,7 +258,9 @@ class SqliteStorage:
                 ).fetchone()
 
         if not row:
-            raise KeyError(f"Experiment not found: {experiment_id} v{version or 'latest'}")
+            raise KeyError(
+                f"Experiment not found: {experiment_id} v{version or 'latest'}"
+            )
 
         return ExperimentVersion(
             experiment_id=row["experiment_id"],
@@ -257,7 +271,9 @@ class SqliteStorage:
             spec=json.loads(row["spec_json"]),
         )
 
-    def create_run(self, run: RunRecord, idempotency_key: Optional[str] = None) -> RunRecord:
+    def create_run(
+        self, run: RunRecord, idempotency_key: Optional[str] = None
+    ) -> RunRecord:
         with self._conn() as conn:
             if idempotency_key:
                 row = conn.execute(
@@ -297,7 +313,9 @@ class SqliteStorage:
 
     def get_run(self, run_id: str) -> RunRecord:
         with self._conn() as conn:
-            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
         if not row:
             raise KeyError(f"Run not found: {run_id}")
 
@@ -323,7 +341,9 @@ class SqliteStorage:
                     (experiment_id,),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM runs ORDER BY started_at DESC").fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM runs ORDER BY started_at DESC"
+                ).fetchall()
         return [
             RunRecord(
                 run_id=row["run_id"],
@@ -419,8 +439,8 @@ class SqliteStorage:
                     """,
                     (
                         entry.get("workflow_name"),
-                            entry.get("engine_namespace"),
-                            entry.get("engine_name"),
+                        entry.get("engine_namespace"),
+                        entry.get("engine_name"),
                         entry.get("app_namespace"),
                         entry.get("app_label"),
                         json.dumps(entry.get("experiment_types", [])),
@@ -456,7 +476,9 @@ class SqliteStorage:
             for row in rows
         ]
 
-    def upsert_run_features(self, run_id: str, experiment_id: str, features: Dict[str, Any]) -> None:
+    def upsert_run_features(
+        self, run_id: str, experiment_id: str, features: Dict[str, Any]
+    ) -> None:
         """Persist L1 features for a run. Idempotent.
 
         ``features['is_training']`` (bool) controls whether this row is
@@ -771,9 +793,7 @@ class SqliteStorage:
         ]
 
     # ── LLM analysis ─────────────────────────────────────────────────
-    def upsert_llm_analysis(
-        self, run_id: str, analysis: Dict[str, Any]
-    ) -> None:
+    def upsert_llm_analysis(self, run_id: str, analysis: Dict[str, Any]) -> None:
         """Persist the parsed LLM verdict alongside the run features."""
         with self._conn() as conn:
             conn.execute(
@@ -848,9 +868,7 @@ class SqliteStorage:
         operator = row["operator_label"]
         verdicts = [v for v in (heuristic, llm_verdict, operator) if v]
         agreement = len(set(verdicts)) <= 1 if verdicts else None
-        disagreement = (
-            None if agreement is None else (not agreement)
-        )
+        disagreement = None if agreement is None else (not agreement)
         return {
             "run_id": row["run_id"],
             "experiment_id": row["experiment_id"],

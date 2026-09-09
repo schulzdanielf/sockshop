@@ -1,3 +1,11 @@
+"""Pydantic request schemas for the HTTP API.
+
+Validation models for the inbound REST endpoints (create experiment,
+start/stop/approve runs, manual conclusions and operator labels). They
+live at the API boundary and are intentionally kept separate from the
+framework-agnostic domain dataclasses in :mod:`domain`.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Literal, Optional

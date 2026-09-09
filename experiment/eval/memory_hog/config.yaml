@@ -60,6 +60,72 @@ chaos_types:
       chaos_interval_seconds: 10        # → CHAOS_INTERVAL
       force: false                      # → FORCE
 
+  # ── Extended fault catalog ───────────────────────────────────────────────
+  # Baselines live in deploy/kubernetes/manifests-chaos/catalogue-<fault>.yaml.
+  # Empirically smoke-tested on this cluster (docker-desktop / WSL2 kernel
+  # 6.6.x). Runnability status:
+  #   network-latency   ✅ runs — requires host `sudo modprobe sch_netem`
+  #   network-loss      ✅ runs — requires host `sudo modprobe sch_netem`
+  #   http-status-code  ✅ runs (port-80 services; NOT front-end:8079)
+  #   container-kill    ✅ runs
+  #   io-stress         ❌ does NOT run here — stress-ng --hdd uses O_DIRECT,
+  #                        unsupported by the WSL2 overlayfs (exit status 1).
+  #   dns-error         ❌ does NOT run here — dns_interceptor exits 1 inside
+  #                        the target netns even with NFQUEUE modules loaded.
+  # The 4 runnable faults are wired into train/test below. io-stress and
+  # dns-error are kept as definitions (env + label) but left out of the matrix
+  # so they can be enabled on a compatible cluster without code changes.
+  # Run `make chaos-enable-netem` before any network-* run (see deploy README).
+  - name: network-latency
+    template_suffix: network-latency
+    short: netlat
+    fault_category: network-latency        # already in sock-shop allowed list
+    env:
+      network_latency_ms: 2000             # → NETWORK_LATENCY
+      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+
+  - name: network-loss
+    template_suffix: network-loss
+    short: netloss
+    fault_category: network-loss           # added to sock-shop allowed list
+    env:
+      network_packet_loss_percentage: 100  # → NETWORK_PACKET_LOSS_PERCENTAGE
+      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+
+  - name: dns-error
+    template_suffix: dns-error
+    short: dnserr
+    fault_category: dns-failure            # added to sock-shop allowed list
+    # ❌ NOT in the matrix: dns_interceptor incompatible with WSL2 kernel.
+    env:
+      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+
+  - name: io-stress
+    template_suffix: io-stress
+    short: iostress
+    fault_category: io-exhaustion          # added to sock-shop allowed list
+    # ❌ NOT in the matrix: incompatible with docker-desktop WSL2 overlayfs.
+    env:
+      filesystem_utilization_percentage: 10  # → FILESYSTEM_UTILIZATION_PERCENTAGE
+      number_of_workers: 4                   # → NUMBER_OF_WORKERS
+      total_chaos_duration_seconds: 120      # → TOTAL_CHAOS_DURATION
+
+  - name: http-status-code
+    template_suffix: http-status-code
+    short: httperr
+    fault_category: http-error             # added to sock-shop allowed list
+    env:
+      status_code: 500                     # → STATUS_CODE
+      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+
+  - name: container-kill
+    template_suffix: container-kill
+    short: ckill
+    fault_category: pod-failure            # reuses existing category (restart spike)
+    env:
+      total_chaos_duration_seconds: 20     # → TOTAL_CHAOS_DURATION
+      chaos_interval_seconds: 10           # → CHAOS_INTERVAL
+
 # ── Experiment timeline (passed into experiment spec → engine) ─────────────
 timeline:
   baseline_seconds: 30
@@ -114,6 +180,12 @@ train_experiments:
   - {service: shipping,  chaos_type: pod-delete}
   - {service: queue-master, chaos_type: memory-hog}
   - {service: front-end,   chaos_type: cpu-hog}
+  # Extended faults (runnable on docker-desktop WSL2 — see chaos_types notes).
+  # network-* require `make chaos-enable-netem` (sch_netem) before running.
+  - {service: catalogue, chaos_type: network-latency}
+  - {service: carts,     chaos_type: network-loss}
+  - {service: user,      chaos_type: http-status-code}   # port-80 service
+  - {service: orders,    chaos_type: container-kill}
 
 test_experiments:
   - {service: user,         chaos_type: memory-hog}
@@ -122,6 +194,11 @@ test_experiments:
   - {service: queue-master, chaos_type: cpu-hog}
   - {service: front-end,    chaos_type: pod-delete}
   - {service: orders,       chaos_type: memory-hog}
+  # Extended faults — held-out on different services than their train cells.
+  - {service: payment,      chaos_type: network-latency}
+  - {service: shipping,     chaos_type: network-loss}
+  - {service: orders,       chaos_type: http-status-code}  # port-80 service
+  - {service: user,         chaos_type: container-kill}
 
 replicas: 1                            # repetitions per (service, chaos_type)
 

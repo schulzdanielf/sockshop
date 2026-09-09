@@ -1,3 +1,10 @@
+"""HTTP client for the MCP observability server.
+
+``MCPToolClient`` invokes tools exposed by the MCP observability server
+and normalises their responses (decoding nested JSON payloads) so the
+metrics and trace plugins can consume plain Python structures.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -63,9 +70,13 @@ class MCPToolClient:
         )
         with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
             if response.status >= 400:
-                raise RuntimeError(f"SSE endpoint returned status HTTP {response.status}")
+                raise RuntimeError(
+                    f"SSE endpoint returned status HTTP {response.status}"
+                )
 
-    async def _call_tool_async(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
+    async def _call_tool_async(
+        self, name: str, arguments: Optional[Dict[str, Any]] = None
+    ) -> Any:
         async with sse_client(
             self.sse_url,
             timeout=self.timeout_seconds,
@@ -76,6 +87,8 @@ class MCPToolClient:
                 result = await session.call_tool(name, arguments or {})
                 return result.model_dump() if hasattr(result, "model_dump") else result
 
-    def call_tool_json(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
+    def call_tool_json(
+        self, name: str, arguments: Optional[Dict[str, Any]] = None
+    ) -> Any:
         raw = asyncio.run(self._call_tool_async(name, arguments))
         return _extract_mcp_payload(raw)

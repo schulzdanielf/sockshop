@@ -138,3 +138,20 @@ output-virtualbox-iso
 # Experiment runtime data (artifacts + sqlite) — keep system_cards/ tracked
 experiment/platform/data/*
 !experiment/platform/data/system_cards/
+
+# ── Python tooling / caches ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# ── Generated chaos/eval artifacts (re-created by the harness) ──────────────
+# These are produced by generate_chaos_manifests.py / runner.py; regenerate
+# instead of committing. Remove the leading '#' the first time you untrack them
+# with `git rm -r --cached <path>`.
+experiment/eval/memory_hog/out/
+experiment/eval/memory_hog/out-mini/

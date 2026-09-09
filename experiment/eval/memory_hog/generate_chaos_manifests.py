@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Generate per-(service, chaos_type) Argo Workflow manifests.
 
-The harness drives three chaos types via the platform's Litmus plugin:
-``memory-hog``, ``cpu-hog`` and ``pod-delete``. The plugin runs each chaos
-by *cloning* an existing Argo Workflow whose name matches
+The harness drives several chaos types via the platform's Litmus plugin —
+``memory-hog``, ``cpu-hog``, ``pod-delete``, ``network-latency``,
+``network-loss``, ``dns-error``, ``io-stress``, ``http-status-code`` and
+``container-kill`` (see ``RENDERERS``). The plugin runs each chaos by
+*cloning* an existing Argo Workflow whose name matches
 ``<service>-<template_suffix>`` (e.g. ``carts-cpu-hog``), so each combination
 must exist in the ``litmus`` namespace before the harness starts.
 
@@ -60,21 +62,30 @@ def _render_memory_hog(service: str, env: Dict[str, Any]) -> str:
     text = _strip_probe_ref(src)
     mem_mb = int(env.get("memory_consumption_mb", 60))
     duration_s = int(env.get("total_chaos_duration_seconds", 30))
-    text = _replace_in_order(text, [
-        # Workflow + label (most specific first)
-        ("catalogue-memory-hog", f"{service}-memory-hog"),
-        ("applabel: name=catalogue", f"applabel: name={service}"),
-        # TARGET_CONTAINER (multi-line context)
-        ("- name: TARGET_CONTAINER\n                              value: catalogue",
-         f"- name: TARGET_CONTAINER\n                              value: {service}"),
-        # Chaos parameters (only the ChaosEngine values — the ChaosExperiment
-        # defaults shipped inside install-chaos-faults stay at the upstream
-        # values; the engine values are what actually drive the run).
-        ("- name: MEMORY_CONSUMPTION\n                              value: \"60\"",
-         f"- name: MEMORY_CONSUMPTION\n                              value: \"{mem_mb}\""),
-        ("- name: TOTAL_CHAOS_DURATION\n                              value: \"30\"",
-         f"- name: TOTAL_CHAOS_DURATION\n                              value: \"{duration_s}\""),
-    ])
+    text = _replace_in_order(
+        text,
+        [
+            # Workflow + label (most specific first)
+            ("catalogue-memory-hog", f"{service}-memory-hog"),
+            ("applabel: name=catalogue", f"applabel: name={service}"),
+            # TARGET_CONTAINER (multi-line context)
+            (
+                "- name: TARGET_CONTAINER\n                              value: catalogue",
+                f"- name: TARGET_CONTAINER\n                              value: {service}",
+            ),
+            # Chaos parameters (only the ChaosEngine values — the ChaosExperiment
+            # defaults shipped inside install-chaos-faults stay at the upstream
+            # values; the engine values are what actually drive the run).
+            (
+                '- name: MEMORY_CONSUMPTION\n                              value: "60"',
+                f'- name: MEMORY_CONSUMPTION\n                              value: "{mem_mb}"',
+            ),
+            (
+                '- name: TOTAL_CHAOS_DURATION\n                              value: "30"',
+                f'- name: TOTAL_CHAOS_DURATION\n                              value: "{duration_s}"',
+            ),
+        ],
+    )
     return text
 
 
@@ -83,19 +94,28 @@ def _render_cpu_hog(service: str, env: Dict[str, Any]) -> str:
     text = _strip_probe_ref(src)
     cpu_cores = int(env.get("cpu_cores", 1))
     duration_s = int(env.get("total_chaos_duration_seconds", 60))
-    text = _replace_in_order(text, [
-        # NOTE: upstream workflow is named `catalogue-cpu` (no `-hog`).
-        # Normalize to `<service>-cpu-hog` so all chaos types share the
-        # `<service>-<template_suffix>` convention the plugin clones from.
-        ("catalogue-cpu", f"{service}-cpu-hog"),
-        ("applabel: name=catalogue", f"applabel: name={service}"),
-        ("- name: TARGET_CONTAINER\n                              value: catalogue",
-         f"- name: TARGET_CONTAINER\n                              value: {service}"),
-        ("- name: CPU_CORES\n                              value: \"1\"",
-         f"- name: CPU_CORES\n                              value: \"{cpu_cores}\""),
-        ("- name: TOTAL_CHAOS_DURATION\n                              value: \"60\"",
-         f"- name: TOTAL_CHAOS_DURATION\n                              value: \"{duration_s}\""),
-    ])
+    text = _replace_in_order(
+        text,
+        [
+            # NOTE: upstream workflow is named `catalogue-cpu` (no `-hog`).
+            # Normalize to `<service>-cpu-hog` so all chaos types share the
+            # `<service>-<template_suffix>` convention the plugin clones from.
+            ("catalogue-cpu", f"{service}-cpu-hog"),
+            ("applabel: name=catalogue", f"applabel: name={service}"),
+            (
+                "- name: TARGET_CONTAINER\n                              value: catalogue",
+                f"- name: TARGET_CONTAINER\n                              value: {service}",
+            ),
+            (
+                '- name: CPU_CORES\n                              value: "1"',
+                f'- name: CPU_CORES\n                              value: "{cpu_cores}"',
+            ),
+            (
+                '- name: TOTAL_CHAOS_DURATION\n                              value: "60"',
+                f'- name: TOTAL_CHAOS_DURATION\n                              value: "{duration_s}"',
+            ),
+        ],
+    )
     return text
 
 
@@ -286,10 +306,119 @@ def _render_pod_delete(service: str, env: Dict[str, Any]) -> str:
     )
 
 
+# ── Extended fault catalog (network / dns / io / http / container) ──────────
+# These faults ship a hand-authored baseline workflow under
+# ``deploy/kubernetes/manifests-chaos/catalogue-<fault>.yaml``. Unlike the
+# memory-hog/cpu-hog baselines (imported verbatim from the Litmus Portal),
+# these are authored so that:
+#   * the token ``catalogue`` appears ONLY where it identifies the target
+#     service (workflow name, ``workflow_name`` label, ``applabel`` and the
+#     engine ``TARGET_CONTAINER``) — so a global replace is safe; and
+#   * every ChaosExperiment default uses single-quoted env values while the
+#     ChaosEngine (the block that actually drives the run) uses double-quoted
+#     values — so a substitution like ``value: "60"`` targets the engine only
+#     and never the experiment default.
+# ``_sanity_check`` still guards against any accidental leftover ``catalogue``.
+def _render_from_baseline(
+    filename: str,
+    service: str,
+    engine_value_subs: List[tuple[str, str]],
+) -> str:
+    src = (CHAOS_MANIFEST_DIR / filename).read_text(encoding="utf-8")
+    text = _strip_probe_ref(src)
+    text = text.replace("catalogue", service)
+    text = _replace_in_order(text, engine_value_subs)
+    return text
+
+
+def _render_network_latency(service: str, env: Dict[str, Any]) -> str:
+    latency_ms = int(env.get("network_latency_ms", 2000))
+    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    return _render_from_baseline(
+        "catalogue-network-latency.yaml",
+        service,
+        [
+            ('value: "2000"', f'value: "{latency_ms}"'),
+            ('value: "60"', f'value: "{duration_s}"'),
+        ],
+    )
+
+
+def _render_network_loss(service: str, env: Dict[str, Any]) -> str:
+    loss_pct = int(env.get("network_packet_loss_percentage", 100))
+    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    return _render_from_baseline(
+        "catalogue-network-loss.yaml",
+        service,
+        [
+            ('value: "100"', f'value: "{loss_pct}"'),
+            ('value: "60"', f'value: "{duration_s}"'),
+        ],
+    )
+
+
+def _render_dns_error(service: str, env: Dict[str, Any]) -> str:
+    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    return _render_from_baseline(
+        "catalogue-dns-error.yaml",
+        service,
+        [
+            ('value: "60"', f'value: "{duration_s}"'),
+        ],
+    )
+
+
+def _render_io_stress(service: str, env: Dict[str, Any]) -> str:
+    fs_pct = int(env.get("filesystem_utilization_percentage", 10))
+    workers = int(env.get("number_of_workers", 4))
+    duration_s = int(env.get("total_chaos_duration_seconds", 120))
+    return _render_from_baseline(
+        "catalogue-io-stress.yaml",
+        service,
+        [
+            ('value: "10"', f'value: "{fs_pct}"'),
+            ('value: "4"', f'value: "{workers}"'),
+            ('value: "120"', f'value: "{duration_s}"'),
+        ],
+    )
+
+
+def _render_http_status_code(service: str, env: Dict[str, Any]) -> str:
+    status_code = int(env.get("status_code", 500))
+    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    return _render_from_baseline(
+        "catalogue-http-status-code.yaml",
+        service,
+        [
+            ('value: "500"', f'value: "{status_code}"'),
+            ('value: "60"', f'value: "{duration_s}"'),
+        ],
+    )
+
+
+def _render_container_kill(service: str, env: Dict[str, Any]) -> str:
+    duration_s = int(env.get("total_chaos_duration_seconds", 20))
+    interval_s = int(env.get("chaos_interval_seconds", 10))
+    return _render_from_baseline(
+        "catalogue-container-kill.yaml",
+        service,
+        [
+            ('value: "20"', f'value: "{duration_s}"'),
+            ('value: "10"', f'value: "{interval_s}"'),
+        ],
+    )
+
+
 RENDERERS: Dict[str, Callable[[str, Dict[str, Any]], str]] = {
     "memory-hog": _render_memory_hog,
     "cpu-hog": _render_cpu_hog,
     "pod-delete": _render_pod_delete,
+    "network-latency": _render_network_latency,
+    "network-loss": _render_network_loss,
+    "dns-error": _render_dns_error,
+    "io-stress": _render_io_stress,
+    "http-status-code": _render_http_status_code,
+    "container-kill": _render_container_kill,
 }
 
 
@@ -315,7 +444,8 @@ def _sanity_check(text: str, service: str, chaos_type: str) -> None:
     if service == "catalogue":
         return
     leftover = [
-        ln for ln in text.splitlines()
+        ln
+        for ln in text.splitlines()
         if "catalogue" in ln.lower() and not ln.strip().startswith("#")
     ]
     if leftover:
@@ -369,8 +499,10 @@ def main() -> int:
     print()
     print("Next: apply them ONCE so Litmus / Argo know the workflow templates:")
     print(f"  kubectl apply -f {output_dir.relative_to(ROOT)}/")
-    print("(Each apply triggers one workflow run; the workflow NAME persists "
-          "afterwards and the harness clones it for every chaos invocation.)")
+    print(
+        "(Each apply triggers one workflow run; the workflow NAME persists "
+        "afterwards and the harness clones it for every chaos invocation.)"
+    )
     return 0
 
 

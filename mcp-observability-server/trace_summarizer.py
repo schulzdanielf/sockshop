@@ -1,23 +1,22 @@
 """Trace summarizer: formats extracted features into a compact summary and optionally calls the local LLM."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import httpx
-
 from config import settings
-
 
 # ---------------------------------------------------------------------------
 # Compact text formatter
 # ---------------------------------------------------------------------------
+
 
 def format_trace_summary(features: Dict) -> str:
     """Format extracted trace features into a compact human-readable summary."""
     if "error" in features:
         return f"Error extracting features: {features['error']}"
 
-    dur = features['trace_duration_ms']
+    dur = features["trace_duration_ms"]
     lines: list[str] = []
 
     # ── Header ──────────────────────────────────────────────────────────
@@ -26,7 +25,11 @@ def format_trace_summary(features: Dict) -> str:
     lines.append(f"TRACE  {dur}ms  {features['span_count']} spans{err_tag}")
 
     # ── Critical path (semantic, skip pure internal groups) ─────────────
-    cp = [s for s in features.get("critical_path", []) if s.get("semantic") != "INTERNAL_GROUP"]
+    cp = [
+        s
+        for s in features.get("critical_path", [])
+        if s.get("semantic") != "INTERNAL_GROUP"
+    ]
     if cp:
         lines.append("")
         lines.append("CRITICAL PATH")
@@ -35,12 +38,16 @@ def format_trace_summary(features: Dict) -> str:
             lines.append(f"  {s['service']}.{s['name']}  {s['duration_ms']}ms{err}")
 
     # ── Top bottlenecks — exclusive latency only ─────────────────────────
-    hot = [s for s in features.get("hot_spans", []) if s["exclusive_duration_ms"] > 1][:4]
+    hot = [s for s in features.get("hot_spans", []) if s["exclusive_duration_ms"] > 1][
+        :4
+    ]
     if hot:
         lines.append("")
         lines.append("BOTTLENECKS  (exclusive ms — actual CPU/IO time)")
         for s in hot:
-            lines.append(f"  {s['service']}.{s['name']}  {s['exclusive_duration_ms']}ms")
+            lines.append(
+                f"  {s['service']}.{s['name']}  {s['exclusive_duration_ms']}ms"
+            )
 
     # ── Failure signatures (deduplicated, no redundant error span list) ──
     sigs = features.get("failure_signatures", [])
@@ -52,7 +59,9 @@ def format_trace_summary(features: Dict) -> str:
             # Show unique affected operations, trimmed
             ops = sorted({o.split(".")[-1] for o in sig["operations"]})
             ops_str = ", ".join(ops[:3]) + ("…" if len(ops) > 3 else "")
-            lines.append(f"  [{sig['signature']}]{ep}  x{sig['occurrence_count']}  {ops_str}")
+            lines.append(
+                f"  [{sig['signature']}]{ep}  x{sig['occurrence_count']}  {ops_str}"
+            )
 
     # ── Dependency graph — deduplicated by (from, to) service pair ───────
     dep = features.get("dependency_map", [])
@@ -87,8 +96,10 @@ def format_trace_summary(features: Dict) -> str:
 
     # ── Fanout anomalies — only non-middleware patterns ──────────────────
     anomalies = [
-        p for p in features.get("fanout_patterns", [])
-        if p["pattern"] != "N+1_REPEATED_CALL" or "middleware" not in p.get("operation", "").lower()
+        p
+        for p in features.get("fanout_patterns", [])
+        if p["pattern"] != "N+1_REPEATED_CALL"
+        or "middleware" not in p.get("operation", "").lower()
     ][:3]
     if anomalies:
         lines.append("")
@@ -112,11 +123,10 @@ def format_trace_summary(features: Dict) -> str:
     return "\n".join(lines)
 
 
-
-
 # ---------------------------------------------------------------------------
 # LLM analysis
 # ---------------------------------------------------------------------------
+
 
 def _build_llm_prompt(summary: str) -> str:
     return f"""You are an expert SRE analyzing a distributed microservices trace.
@@ -167,7 +177,9 @@ def analyze_with_llm(summary: str, max_new_tokens: int = 512) -> Optional[str]:
         return f"(LLM unavailable: {e})"
 
 
-def summarize_trace(features: Dict, use_llm: bool = True, max_new_tokens: int = 512) -> Dict:
+def summarize_trace(
+    features: Dict, use_llm: bool = True, max_new_tokens: int = 512
+) -> Dict:
     """Return a dict with the formatted summary and optional LLM analysis.
 
     Args:

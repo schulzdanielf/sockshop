@@ -10,6 +10,18 @@ Um servidor MCP (Model Context Protocol) com FastMCP para consultas em Prometheu
 - `prometheus_get_metrics` - Listar métricas disponíveis
 - `prometheus_get_series` - Buscar séries por padrão
 
+### Investigator Tools
+- `check_oom_kills` - Detectar OOMKills por serviço em uma janela fechada
+- `check_pod_restarts` - Contar restarts por serviço estritamente na janela
+- `get_cpu_saturation_top` - Top serviços por saturação de CPU
+- `get_memory_saturation_top` - Top serviços por saturação de memória
+- `check_http_error_rate_top` - Top serviços por taxa de erro HTTP 5xx
+- `check_request_latency_top` - Top serviços por latência P95
+
+Essas tools são as mais adequadas para agentes pequenos, porque escondem a
+PromQL crua e devolvem JSON estável com `found`, `count`, `top`, `query` e
+`window`.
+
 ### Loki Tools
 - `loki_query` - Consultas LogQL instantâneas
 - `loki_range_query` - Consultas LogQL em intervalos de tempo

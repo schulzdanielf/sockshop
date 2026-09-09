@@ -167,6 +167,10 @@ allowed_fault_categories:
   - memory-exhaustion
   - pod-failure
   - network-latency
+  - network-loss
+  - dns-failure
+  - io-exhaustion
+  - http-error
   - dependency-failure
   - deploy-related
   - unknown

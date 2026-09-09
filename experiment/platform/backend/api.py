@@ -1,32 +1,43 @@
+"""FastAPI application factory and HTTP routing layer.
+
+Exposes :func:`create_app`, which wires the orchestrator engine, storage
+and provider plugins into the REST API used to drive chaos experiments.
+This is the inbound adapter of the hexagonal architecture: it translates
+HTTP requests into domain operations and serialises domain state back out.
+"""
+
 from __future__ import annotations
 
 import time
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from opentelemetry.trace import Status, StatusCode
 
 from .adapters.noop_notifier import NoopNotificationAdapter
-from .engine import OrchestratorEngine
 from .analysis import (
-    rank_similar_runs,
+    LLMClientError,
+    assemble_prompt,
+    blob_to_vector,
+    call_llm,
+    get_embedding_provider,
+    list_system_cards,
+    llm_health,
+    localize_service,
+    parse_verdict_response,
     rank_by_embedding,
     rank_hybrid,
-    get_embedding_provider,
-    vector_to_blob,
-    blob_to_vector,
-    assemble_prompt,
-    call_llm,
-    parse_verdict_response,
-    llm_health,
-    LLMClientError,
-    list_system_cards,
-    system_card_meta,
+    rank_similar_runs,
     render_system_card,
+    system_card_meta,
+    validate_fault_category,
+    vector_to_blob,
 )
-import numpy as np
+from .engine import OrchestratorEngine
 from .models import (
     ApproveRunRequest,
     CreateExperimentRequest,
@@ -35,12 +46,20 @@ from .models import (
     StartRunRequest,
     StopRunRequest,
 )
+from .observability import (
+    GenAI,
+    capture_content,
+    get_tracer,
+    record_llm_metrics,
+    record_override,
+    setup_telemetry,
+)
 from .plugins.litmus_plugin import LitmusChaosPlugin
 from .plugins.locust_plugin import LocustLoadPlugin
 from .plugins.mcp_metrics_plugin import MCPPrometheusMetricsPlugin
 from .plugins.mcp_traces_plugin import MCPTempoTracesPlugin
-from .storage.sqlite_storage import SqliteStorage
 from .security import require_roles
+from .storage.sqlite_storage import SqliteStorage
 
 
 def create_app() -> FastAPI:
@@ -67,6 +86,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Chaos Platform", version="1.0.0")
 
+    # OpenTelemetry (AgentOps): traces/metrics for the RCA decision pipeline.
+    setup_telemetry(app)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -74,6 +96,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
     @app.get("/api/health")
     def health() -> dict:
         return {"status": "ok"}
@@ -264,7 +287,9 @@ def create_app() -> FastAPI:
                         row["vector"] = blob_to_vector(row["blob"], row["dim"])
                     except ValueError:
                         continue
-                    row["graph"] = (row.get("features") or {}).get("propagation_graph") or {}
+                    row["graph"] = (row.get("features") or {}).get(
+                        "propagation_graph"
+                    ) or {}
                     candidates.append(row)
                 neighbours = rank_hybrid(
                     target_vec,
@@ -278,7 +303,8 @@ def create_app() -> FastAPI:
                     "mode": "hybrid",
                     "query_tags": target.get("tags") or [],
                     "query_cascade": [
-                        c.get("service") for c in (target_graph.get("cascade_order") or [])
+                        c.get("service")
+                        for c in (target_graph.get("cascade_order") or [])
                         if isinstance(c, dict)
                     ],
                     "neighbours": [
@@ -290,7 +316,9 @@ def create_app() -> FastAPI:
                             "score": n["score"],
                             "semantic_score": n.get("semantic_score"),
                             "graph_score": n.get("graph_score"),
-                            "cascade_overlap_services": n.get("cascade_overlap_services", []),
+                            "cascade_overlap_services": n.get(
+                                "cascade_overlap_services", []
+                            ),
                             "graph_detail": n.get("graph_detail", {}),
                             "tags": n.get("tags") or [],
                             "created_at": n["created_at"],
@@ -366,9 +394,7 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/runs/{run_id}/rag-context")
-    def get_rag_context(
-        run_id: str, limit: int = 3, mode: str = "embedding"
-    ) -> dict:
+    def get_rag_context(run_id: str, limit: int = 3, mode: str = "embedding") -> dict:
         """Bundle target summary + top-K neighbour summaries for prompt assembly."""
         return _build_rag_context(run_id, limit, mode)
 
@@ -399,7 +425,9 @@ def create_app() -> FastAPI:
                         row["vector"] = blob_to_vector(row["blob"], row["dim"])
                     except ValueError:
                         continue
-                    row["graph"] = (row.get("features") or {}).get("propagation_graph") or {}
+                    row["graph"] = (row.get("features") or {}).get(
+                        "propagation_graph"
+                    ) or {}
                     candidates.append(row)
                 ranked = rank_hybrid(
                     target_vec,
@@ -417,7 +445,9 @@ def create_app() -> FastAPI:
                             "score": n["score"],
                             "semantic_score": n.get("semantic_score"),
                             "graph_score": n.get("graph_score"),
-                            "cascade_overlap_services": n.get("cascade_overlap_services", []),
+                            "cascade_overlap_services": n.get(
+                                "cascade_overlap_services", []
+                            ),
                             "verdict": n["verdict"],
                             "summary_text": n.get("summary_text", ""),
                         }
@@ -554,49 +584,236 @@ def create_app() -> FastAPI:
         system_id: str = "sock-shop",
     ) -> dict:
         """Assemble RAG prompt, call Qwen, persist parsed verdict."""
-        if not force:
-            cached = storage.get_llm_analysis(run_id)
-            if cached is not None:
-                return {**cached, "cached": True}
+        tracer = get_tracer()
+        with tracer.start_as_current_span("rca.analyze") as root:
+            root.set_attribute(GenAI.OPERATION_NAME, "invoke_agent")
+            root.set_attribute(GenAI.SYSTEM, "qwen")
+            root.set_attribute("rca.run_id", run_id)
+            root.set_attribute(GenAI.RAG_MODE, mode)
+            root.set_attribute("rca.rag.limit", limit)
+            root.set_attribute("rca.system_card_id", system_id)
+            root.set_attribute(GenAI.REQUEST_MAX_TOKENS, max_new_tokens)
+            root.set_attribute("rca.budget_tokens", budget_tokens)
 
-        rag = _build_rag_context(run_id, limit, mode)
-        prompt, meta = assemble_prompt(
-            rag,
-            budget_tokens=budget_tokens,
-            max_neighbours=limit,
-            system_id=system_id,
-        )
+            if not force:
+                cached = storage.get_llm_analysis(run_id)
+                if cached is not None:
+                    root.set_attribute("rca.cached", True)
+                    return {**cached, "cached": True}
+            root.set_attribute("rca.cached", False)
 
-        t_call_start = time.time()
-        try:
-            raw = call_llm(prompt, max_new_tokens=max_new_tokens)
-        except LLMClientError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+            # ── RAG retrieval ────────────────────────────────────────────
+            with tracer.start_as_current_span("rag.retrieve") as span:
+                rag = _build_rag_context(run_id, limit, mode)
+                neighbours = rag.get("neighbours") or []
+                span.set_attribute(GenAI.RAG_MODE, rag.get("mode") or mode)
+                span.set_attribute("rca.rag.neighbours_returned", len(neighbours))
+                span.set_attribute("rca.rag.empty", not neighbours)
+                scores = [
+                    n.get("score")
+                    for n in neighbours
+                    if isinstance(n.get("score"), (int, float))
+                ]
+                if scores:
+                    span.set_attribute("rca.rag.top_score", float(max(scores)))
 
-        llm_latency_ms = int((time.time() - t_call_start) * 1000)
-        parsed = parse_verdict_response(raw)
+            # ── Prompt assembly ──────────────────────────────────────────
+            with tracer.start_as_current_span("prompt.assemble") as span:
+                prompt, meta = assemble_prompt(
+                    rag,
+                    budget_tokens=budget_tokens,
+                    max_neighbours=limit,
+                    system_id=system_id,
+                )
+                span.set_attribute(
+                    "rca.prompt.tokens_estimate",
+                    int(meta.get("prompt_tokens_estimate") or 0),
+                )
+                span.set_attribute(
+                    "rca.prompt.neighbour_count", int(meta.get("neighbour_count") or 0)
+                )
+                span.set_attribute(
+                    "rca.system_card_id", str(meta.get("system_card_id") or system_id)
+                )
+                if capture_content():
+                    span.set_attribute(GenAI.PROMPT, prompt)
 
-        target = rag.get("target") or {}
-        analysis = {
-            **parsed,
-            "rag_mode": rag.get("mode"),
-            "prompt_meta": meta,
-            "max_new_tokens": max_new_tokens,
-            "llm_latency_ms": llm_latency_ms,
-        }
-        storage.upsert_llm_analysis(run_id, analysis)
-        return {
-            "run_id": run_id,
-            "heuristic_verdict": target.get("verdict"),
-            "analysis": analysis,
-            "cached": False,
-        }
+            # ── LLM call ─────────────────────────────────────────────────
+            t_call_start = time.time()
+            with tracer.start_as_current_span("gen_ai.chat") as span:
+                span.set_attribute(GenAI.OPERATION_NAME, "chat")
+                span.set_attribute(GenAI.SYSTEM, "qwen")
+                span.set_attribute(GenAI.REQUEST_MODEL, "qwen-14b")
+                span.set_attribute(GenAI.REQUEST_MAX_TOKENS, max_new_tokens)
+                try:
+                    raw = call_llm(prompt, max_new_tokens=max_new_tokens)
+                except LLMClientError as exc:
+                    span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    raise HTTPException(status_code=502, detail=str(exc))
+                if capture_content():
+                    span.set_attribute(GenAI.COMPLETION, raw)
+
+            llm_latency_ms = int((time.time() - t_call_start) * 1000)
+            with tracer.start_as_current_span("response.parse") as span:
+                parsed = parse_verdict_response(raw)
+                span.set_attribute("rca.parse_error", parsed.get("parse_error") or "")
+                span.set_attribute("rca.rca_present", bool(parsed.get("rca")))
+
+            # Single retry when the first attempt failed to produce a usable
+            # verdict (empty response, JSON parse error, or no `rca` field).
+            # The retry is cheap, scoped, and avoids leaving the eval row
+            # blank — which would also blind both post-processors below.
+            retry_count = 0
+            if not parsed.get("rca") or parsed.get("parse_error"):
+                retry_count = 1
+                with tracer.start_as_current_span("gen_ai.chat") as span:
+                    span.set_attribute(GenAI.OPERATION_NAME, "chat")
+                    span.set_attribute(GenAI.SYSTEM, "qwen")
+                    span.set_attribute("rca.retry", True)
+                    try:
+                        raw_retry = call_llm(prompt, max_new_tokens=max_new_tokens)
+                        parsed_retry = parse_verdict_response(raw_retry)
+                        if parsed_retry.get("rca") and not parsed_retry.get(
+                            "parse_error"
+                        ):
+                            parsed = parsed_retry
+                            raw = raw_retry
+                            llm_latency_ms = int((time.time() - t_call_start) * 1000)
+                    except LLMClientError:
+                        # Keep the original failure — don't mask the first error.
+                        pass
+
+            root.set_attribute("rca.retry_count", retry_count)
+            record_llm_metrics(duration_s=llm_latency_ms / 1000.0, model="qwen-14b")
+
+            target = rag.get("target") or {}
+            analysis = {
+                **parsed,
+                "rag_mode": rag.get("mode"),
+                "prompt_meta": meta,
+                "max_new_tokens": max_new_tokens,
+                "llm_latency_ms": llm_latency_ms,
+                "retry_count": retry_count,
+            }
+            # FaultCategoryValidator / ServiceLocalizerValidator —
+            # deterministic post-processors that may override
+            # `fault_category` / `rca` when window-scoped metric hotspots
+            # give an unambiguous signal. Always populate `validator_meta`
+            # for audit. See analysis/fault_category_validator.py and
+            # analysis/service_localizer.py for the rules.
+            try:
+                features_for_validator = storage.get_run_features(run_id) or {}
+                with tracer.start_as_current_span("validator.fault_category") as span:
+                    pre_fault = analysis.get("fault_category")
+                    analysis = validate_fault_category(
+                        analysis,
+                        features_for_validator,
+                    )
+                    vmeta = analysis.get("validator_meta") or {}
+                    span.set_attribute("rca.validator.fired", bool(vmeta.get("fired")))
+                    if vmeta.get("rule"):
+                        span.set_attribute("rca.validator.rule", str(vmeta["rule"]))
+                    fault_overrode = bool(vmeta.get("fired")) and (
+                        pre_fault != analysis.get("fault_category")
+                    )
+                    span.set_attribute("rca.validator.override_applied", fault_overrode)
+                    if fault_overrode:
+                        record_override("fault_category", vmeta.get("rule"))
+                with tracer.start_as_current_span(
+                    "validator.service_localizer"
+                ) as span:
+                    pre_rca = analysis.get("rca")
+                    analysis = localize_service(
+                        analysis,
+                        features_for_validator,
+                    )
+                    loc = (analysis.get("validator_meta") or {}).get("localizer") or {}
+                    span.set_attribute("rca.localizer.fired", bool(loc.get("fired")))
+                    if loc.get("rule"):
+                        span.set_attribute("rca.localizer.rule", str(loc["rule"]))
+                    rca_overrode = bool(loc.get("fired")) and (
+                        pre_rca != analysis.get("rca")
+                    )
+                    span.set_attribute("rca.localizer.override_applied", rca_overrode)
+                    if rca_overrode:
+                        record_override("rca", loc.get("rule"))
+            except Exception as exc:  # pragma: no cover - defensive
+                analysis["validator_meta"] = {
+                    "fired": False,
+                    "rule": None,
+                    "original_fault_category": analysis.get("fault_category"),
+                    "new_fault_category": analysis.get("fault_category"),
+                    "evidence": [],
+                    "conflict": None,
+                    "reason": f"validator error: {exc!s}",
+                }
+
+            # ── Decision provenance ──────────────────────────────────────
+            # Record which subsystem produced each final field and the
+            # evidence behind it — this is what lets us later answer
+            # "which data was essential for this decision?".
+            vmeta = analysis.get("validator_meta") or {}
+            loc = vmeta.get("localizer") or {}
+            fault_source = "validator_override" if vmeta.get("fired") else "llm"
+            rca_source = "localizer_override" if loc.get("fired") else "llm"
+            analysis["decision_provenance"] = {
+                "rca": {
+                    "source": rca_source,
+                    "value": analysis.get("rca"),
+                    "llm_original": (
+                        loc.get("original_rca")
+                        if loc.get("fired")
+                        else analysis.get("rca")
+                    ),
+                    "evidence": loc.get("evidence") or [],
+                },
+                "fault_category": {
+                    "source": fault_source,
+                    "value": analysis.get("fault_category"),
+                    "llm_original": (
+                        vmeta.get("original_fault_category")
+                        if vmeta.get("fired")
+                        else analysis.get("fault_category")
+                    ),
+                    "evidence": vmeta.get("evidence") or [],
+                },
+                "rag": {
+                    "mode": rag.get("mode"),
+                    "cited": parsed.get("citations") or [],
+                    "neighbours": [
+                        n.get("run_id") for n in (rag.get("neighbours") or [])
+                    ],
+                },
+            }
+            root.set_attribute(GenAI.DECISION_SOURCE_RCA, rca_source)
+            root.set_attribute(GenAI.DECISION_SOURCE_FAULT, fault_source)
+            if analysis.get("rca"):
+                root.set_attribute("rca.final.rca", str(analysis["rca"]))
+            if analysis.get("fault_category"):
+                root.set_attribute(
+                    "rca.final.fault_category", str(analysis["fault_category"])
+                )
+            if analysis.get("confidence") is not None:
+                root.set_attribute(
+                    "rca.final.confidence", float(analysis["confidence"])
+                )
+
+            with tracer.start_as_current_span("analysis.persist"):
+                storage.upsert_llm_analysis(run_id, analysis)
+            return {
+                "run_id": run_id,
+                "heuristic_verdict": target.get("verdict"),
+                "analysis": analysis,
+                "cached": False,
+            }
 
     @app.get("/api/runs/{run_id}/llm-analysis")
     def get_llm_analysis(run_id: str) -> dict:
         cached = storage.get_llm_analysis(run_id)
         if cached is None:
-            raise HTTPException(status_code=404, detail="llm analysis not generated yet")
+            raise HTTPException(
+                status_code=404, detail="llm analysis not generated yet"
+            )
         return {**cached, "cached": True}
 
     # ── Operator feedback / verdict reconciliation (Phase E) ─────────
@@ -626,9 +843,7 @@ def create_app() -> FastAPI:
         _: str = Depends(require_roles({"operator", "chaos_engineer", "admin"})),
     ) -> dict:
         try:
-            storage.upsert_operator_label(
-                run_id, req.label, by=req.by, note=req.note
-            )
+            storage.upsert_operator_label(run_id, req.label, by=req.by, note=req.note)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         return storage.get_run_verdicts(run_id) or {"run_id": run_id}
@@ -639,7 +854,9 @@ def create_app() -> FastAPI:
         verdict: Optional[str] = None,
         limit: int = 100,
     ) -> list[dict]:
-        return storage.list_run_features(experiment_id=experiment_id, verdict=verdict, limit=limit)
+        return storage.list_run_features(
+            experiment_id=experiment_id, verdict=verdict, limit=limit
+        )
 
     @app.post("/api/runs/{run_id}/manual-conclusion")
     def set_manual_conclusion(

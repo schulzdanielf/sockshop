@@ -6,11 +6,11 @@ class Settings(BaseSettings):
     """Application settings."""
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
-    
+
     # Prometheus settings
     prometheus_url: str = "http://localhost:9090"
     prometheus_timeout: int = 30
-    
+
     # Loki settings
     loki_url: str = "http://localhost:3100"
     loki_timeout: int = 30
@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     # Tempo settings
     tempo_url: str = "http://localhost:3200"
     tempo_timeout: int = 30
-    
+
     # LLM settings (local Qwen API)
     llm_url: str = "http://localhost:8001/generate"
 

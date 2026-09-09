@@ -17,7 +17,6 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-
 _CARDS_DIR = Path(__file__).resolve().parents[2] / "data" / "system_cards"
 
 

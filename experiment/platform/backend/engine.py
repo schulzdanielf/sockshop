@@ -1,3 +1,11 @@
+"""Orchestrator engine: the application core that runs experiments.
+
+``OrchestratorEngine`` coordinates the chaos, load, metrics and trace
+provider ports, drives a run through its lifecycle (start → inject chaos →
+collect → analyse → conclude) and persists state via the storage port. It
+depends only on the port Protocols, never on concrete adapters.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -7,14 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .domain import DomainEvent, ExperimentVersion, RunRecord, RunStatus, utc_now_iso
 from .analysis import (
+    anonymize_services,
     build_run_summary_l2,
     compute_temporal_features,
     get_embedding_provider,
     vector_to_blob,
-    anonymize_services,
 )
+from .domain import DomainEvent, ExperimentVersion, RunRecord, RunStatus, utc_now_iso
 from .ports import (
     ChaosProviderPort,
     LoadProviderPort,
@@ -65,7 +73,11 @@ class OrchestratorEngine:
     ) -> RunRecord:
         gov = exp.spec.get("governance", {})
         requires_approval = bool(gov.get("requires_approval", False))
-        initial_status = RunStatus.PENDING_APPROVAL if requires_approval and not approved_by else RunStatus.PENDING
+        initial_status = (
+            RunStatus.PENDING_APPROVAL
+            if requires_approval and not approved_by
+            else RunStatus.PENDING
+        )
 
         run = RunRecord(
             run_id=f"run-{uuid.uuid4().hex[:12]}",
@@ -80,15 +92,24 @@ class OrchestratorEngine:
         run.summary["is_training"] = bool(is_training)
         run = self.storage.create_run(run, idempotency_key=idempotency_key)
 
-        self._event(run.run_id, "run_created", {"status": run.status.value, "initiated_by": initiated_by})
+        self._event(
+            run.run_id,
+            "run_created",
+            {"status": run.status.value, "initiated_by": initiated_by},
+        )
 
         if run.status == RunStatus.PENDING_APPROVAL:
-            self.notifier.notify("approval_required", {"run_id": run.run_id, "experiment_id": exp.experiment_id})
+            self.notifier.notify(
+                "approval_required",
+                {"run_id": run.run_id, "experiment_id": exp.experiment_id},
+            )
             return run
 
         stop_flag = threading.Event()
         self._stop_flags[run.run_id] = stop_flag
-        t = threading.Thread(target=self._execute_run, args=(run.run_id, exp), daemon=True)
+        t = threading.Thread(
+            target=self._execute_run, args=(run.run_id, exp), daemon=True
+        )
         t.start()
         return run
 
@@ -103,13 +124,17 @@ class OrchestratorEngine:
 
         stop_flag = threading.Event()
         self._stop_flags[run.run_id] = stop_flag
-        t = threading.Thread(target=self._execute_run, args=(run.run_id, exp), daemon=True)
+        t = threading.Thread(
+            target=self._execute_run, args=(run.run_id, exp), daemon=True
+        )
         t.start()
 
         self._event(run_id, "run_approved", {"approved_by": approved_by})
         return self.storage.get_run(run_id)
 
-    def stop_run(self, run_id: str, requested_by: str, reason: str = "manual_stop") -> RunRecord:
+    def stop_run(
+        self, run_id: str, requested_by: str, reason: str = "manual_stop"
+    ) -> RunRecord:
         flag = self._stop_flags.get(run_id)
         if flag:
             flag.set()
@@ -126,7 +151,9 @@ class OrchestratorEngine:
         run.summary["stop_reason"] = reason
         self.storage.update_run(run)
 
-        self._event(run_id, "run_stopped", {"requested_by": requested_by, "reason": reason})
+        self._event(
+            run_id, "run_stopped", {"requested_by": requested_by, "reason": reason}
+        )
         self.notifier.notify("run_stopped", {"run_id": run_id, "reason": reason})
         return run
 
@@ -157,11 +184,18 @@ class OrchestratorEngine:
 
         if str(scope.get("environment", "")).lower() == "production":
             if not governance.get("approved_window"):
-                raise ValueError(
-                    "Production run requires governance.approved_window"
-                )
+                raise ValueError("Production run requires governance.approved_window")
 
-        if min(baseline_seconds, warmup_seconds, fault_duration_seconds, post_seconds, step) < 0:
+        if (
+            min(
+                baseline_seconds,
+                warmup_seconds,
+                fault_duration_seconds,
+                post_seconds,
+                step,
+            )
+            < 0
+        ):
             raise ValueError("Timeline values must be non-negative")
         if step == 0:
             raise ValueError("sampling_interval_seconds must be > 0")
@@ -188,7 +222,12 @@ class OrchestratorEngine:
 
             # Load runs through ALL phases (baseline → warmup → fault → post)
             # so baseline metrics capture real traffic before the fault.
-            total_load = baseline_seconds + warmup_seconds + fault_duration_seconds + post_seconds
+            total_load = (
+                baseline_seconds
+                + warmup_seconds
+                + fault_duration_seconds
+                + post_seconds
+            )
             load_cfg["run_time_seconds"] = max(total_load, 1)
             load_handle = self.load.start_load(context, load_cfg)
             self._runtime_handles.setdefault(run_id, {})["load"] = load_handle
@@ -216,7 +255,9 @@ class OrchestratorEngine:
             self.chaos.stop(context, chaos_handle)
             self._event(run_id, "fault_completed", {})
 
-            self._event(run_id, "recovery_observation_started", {"seconds": post_seconds})
+            self._event(
+                run_id, "recovery_observation_started", {"seconds": post_seconds}
+            )
             self._sleep_interruptible(stop_flag, post_seconds)
             recovery_end = utc_now_iso()
 
@@ -224,15 +265,23 @@ class OrchestratorEngine:
             load_summary = self.load.collect_summary(context, load_handle)
             chaos_artifacts = self.chaos.collect_artifacts(context, chaos_handle)
 
-            metrics_raw = self.metrics.collect_window(context, metrics_cfg, run_start_iso, recovery_end, step)
+            metrics_raw = self.metrics.collect_window(
+                context, metrics_cfg, run_start_iso, recovery_end, step
+            )
             metrics_summary = self.metrics.summarize(metrics_raw)
-            traces_raw = self.traces.collect_window(context, traces_cfg, fault_start, recovery_end)
+            traces_raw = self.traces.collect_window(
+                context, traces_cfg, fault_start, recovery_end
+            )
             traces_summary = self.traces.summarize(traces_raw)
 
-            metrics_path = self.storage.save_artifact(run_id, "metrics_raw", metrics_raw)
+            metrics_path = self.storage.save_artifact(
+                run_id, "metrics_raw", metrics_raw
+            )
             traces_path = self.storage.save_artifact(run_id, "traces_raw", traces_raw)
             load_path = self.storage.save_artifact(run_id, "load_summary", load_summary)
-            chaos_path = self.storage.save_artifact(run_id, "chaos_artifacts", chaos_artifacts)
+            chaos_path = self.storage.save_artifact(
+                run_id, "chaos_artifacts", chaos_artifacts
+            )
 
             phases = [
                 ("baseline", run_start_iso, warmup_start),
@@ -267,19 +316,21 @@ class OrchestratorEngine:
                 )
                 features["summary_text"] = summary_text
                 features["tags"] = tags
-                self.storage.save_artifact(run_id, "run_summary_l2", {
-                    "summary_text": summary_text,
-                    "tags": tags,
-                })
+                self.storage.save_artifact(
+                    run_id,
+                    "run_summary_l2",
+                    {
+                        "summary_text": summary_text,
+                        "tags": tags,
+                    },
+                )
             except Exception as exc:  # pragma: no cover - summary best-effort
                 self._event(run_id, "run_summary_l2_failed", {"error": str(exc)})
 
             # Propagate the train/test flag from RunRecord.summary into the
             # features dict so the storage layer can persist it.
             current_run = self.storage.get_run(run_id)
-            features["is_training"] = bool(
-                current_run.summary.get("is_training", True)
-            )
+            features["is_training"] = bool(current_run.summary.get("is_training", True))
 
             # ── Ground-truth auto-labelling ─────────────────────────────────
             # Experiments submitted by the eval harness carry their ground
@@ -289,7 +340,9 @@ class OrchestratorEngine:
             # eval harness keeping a static chaos_type → fault_category map.
             # Future fault families (config-error, network-degradation, etc.)
             # just need to ship the right tag on the experiment spec.
-            exp_meta = exp.spec.get("experiment", {}) if isinstance(exp.spec, dict) else {}
+            exp_meta = (
+                exp.spec.get("experiment", {}) if isinstance(exp.spec, dict) else {}
+            )
             spec_tags = exp_meta.get("tags") or []
             gt_service: Optional[str] = None
             gt_fault: Optional[str] = None
@@ -353,7 +406,9 @@ class OrchestratorEngine:
                 "baseline_seconds": baseline_seconds,
                 "warmup_time_seconds": warmup_seconds,
                 "fault_injection_duration_seconds": fault_duration_seconds,
-                "experiment_total_duration_seconds": _duration_seconds(run_start_iso, run.ended_at),
+                "experiment_total_duration_seconds": _duration_seconds(
+                    run_start_iso, run.ended_at
+                ),
                 "post_recovery_observation_seconds": post_seconds,
                 "recovery_time_seconds": features.get("recovery_time_seconds"),
             }
@@ -377,7 +432,9 @@ class OrchestratorEngine:
             self.storage.update_run(run)
 
             self._event(run_id, "run_completed", {"verdict": run.verdict})
-            self.notifier.notify("run_completed", {"run_id": run_id, "verdict": run.verdict})
+            self.notifier.notify(
+                "run_completed", {"run_id": run_id, "verdict": run.verdict}
+            )
 
         except InterruptedError:
             run = self.storage.get_run(run_id)
@@ -501,24 +558,38 @@ class OrchestratorEngine:
         }
         for metric_id, (label, threshold) in slo_map.items():
             phase_stats = per_phase.get(metric_id, {})
-            base = phase_stats.get("baseline", {}) if isinstance(phase_stats, dict) else {}
-            baseline_means[metric_id] = base.get("mean") if isinstance(base, dict) else None
+            base = (
+                phase_stats.get("baseline", {}) if isinstance(phase_stats, dict) else {}
+            )
+            baseline_means[metric_id] = (
+                base.get("mean") if isinstance(base, dict) else None
+            )
             for phase_name in ("warmup", "fault", "post"):
-                s = phase_stats.get(phase_name, {}) if isinstance(phase_stats, dict) else {}
+                s = (
+                    phase_stats.get(phase_name, {})
+                    if isinstance(phase_stats, dict)
+                    else {}
+                )
                 if not isinstance(s, dict) or s.get("count", 0) == 0:
                     continue
                 observed = s.get("p95") if "latency" in metric_id else s.get("max")
                 if observed is None:
                     continue
                 if observed > threshold:
-                    slo_violations.append({
-                        "phase": phase_name,
-                        "metric": metric_id,
-                        "slo": label,
-                        "threshold": threshold,
-                        "observed": round(float(observed), 4),
-                        "delta_pct": round((float(observed) - threshold) / threshold * 100.0, 1) if threshold else None,
-                    })
+                    slo_violations.append(
+                        {
+                            "phase": phase_name,
+                            "metric": metric_id,
+                            "slo": label,
+                            "threshold": threshold,
+                            "observed": round(float(observed), 4),
+                            "delta_pct": round(
+                                (float(observed) - threshold) / threshold * 100.0, 1
+                            )
+                            if threshold
+                            else None,
+                        }
+                    )
 
         # ── Recovery time (use error_rate first, fall back to latency_p95) ──
         recovery_method = getattr(self.metrics, "find_recovery_time", None)
@@ -576,7 +647,9 @@ class OrchestratorEngine:
 
         # ── Verdict (SLO-driven) ────────────────────────────────────────────
         verdict = "resilient"
-        had_violation = bool(slo_violations) or traces_summary.get("error_trace_count", 0) > 0
+        had_violation = (
+            bool(slo_violations) or traces_summary.get("error_trace_count", 0) > 0
+        )
         if had_violation:
             if recovery_time is None:
                 verdict = "degraded_persistent"
@@ -618,14 +691,20 @@ class OrchestratorEngine:
             f"Failure signatures: {len(features.get('top_failure_signatures') or [])}."
         )
 
-    def _executive_summary(self, verdict: Optional[str], features: Dict[str, Any]) -> str:
+    def _executive_summary(
+        self, verdict: Optional[str], features: Dict[str, Any]
+    ) -> str:
         viol = features.get("slo_violations") or []
         rt = features.get("recovery_time_seconds")
         services = features.get("affected_services") or []
         if verdict == "resilient":
             return "System remained within SLOs during fault injection — resilient behavior confirmed."
         primary = services[0] if services else "service(s)"
-        rt_text = f"recovered in {rt:.0f}s" if isinstance(rt, (int, float)) else "did not recover within window"
+        rt_text = (
+            f"recovered in {rt:.0f}s"
+            if isinstance(rt, (int, float))
+            else "did not recover within window"
+        )
         return (
             f"Verdict: {verdict}. {len(viol)} SLO violation(s) detected; "
             f"{primary} most affected; system {rt_text}."
@@ -647,5 +726,7 @@ class OrchestratorEngine:
             if rca.get("confidence") == "HIGH":
                 recs.append(f"High-confidence RCA: {rca.get('hypothesis')}")
         if not recs:
-            recs.append("No SLO violation detected — consider increasing fault intensity or duration.")
+            recs.append(
+                "No SLO violation detected — consider increasing fault intensity or duration."
+            )
         return recs

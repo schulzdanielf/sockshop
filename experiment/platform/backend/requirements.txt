@@ -3,6 +3,13 @@ uvicorn>=0.30,<1
 pydantic>=2.8,<3
 mcp>=1.0.0
 numpy>=1.26,<3
+# OpenTelemetry — distributed traces/metrics for the RCA decision pipeline.
+# Telemetry is best-effort: set OTEL_SDK_DISABLED=true to make it a no-op.
+opentelemetry-api>=1.42,<2
+opentelemetry-sdk>=1.42,<2
+opentelemetry-exporter-otlp-proto-http>=1.42,<2
+opentelemetry-instrumentation-fastapi>=0.63b0,<1
+opentelemetry-semantic-conventions>=0.63b0,<1
 # Optional: LLM observability via Langfuse self-hosted (deploy/docker-compose/docker-compose.langfuse.yml)
 # Activated only when LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are set.
 langfuse>=2.50,<3

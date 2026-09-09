@@ -44,6 +44,30 @@ uvicorn experiment.platform.backend.main:app --host 0.0.0.0 --port 8010 --reload
 
 - http://localhost:8010/
 
+## Development & Tests
+
+Dev tooling is configured at the repository root (`pyproject.toml` for
+`black`/`isort`/`pytest`, `.flake8` for linting).
+
+```bash
+# install dev tooling
+pip install -r requirements-dev.txt
+
+# format + import sort (line length 88)
+isort . && black .
+
+# lint
+flake8 experiment mcp-observability-server model
+
+# run the unit-test suite (from the repo root)
+pytest
+```
+
+The suite covers the pure-logic modules: the fault-category validator and
+service localizer (`experiment/platform/tests/`), the chaos-manifest
+generator (`experiment/eval/memory_hog/tests/`) and the MCP investigator
+helpers (`mcp-observability-server/tests/`).
+
 ## Current MVP Capabilities
 
 - Create/version experiment definitions from GUI wizard

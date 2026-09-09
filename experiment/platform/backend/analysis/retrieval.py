@@ -114,7 +114,9 @@ def _jaccard(a: Iterable[Any], b: Iterable[Any]) -> float:
     return len(inter) / len(union) if union else 0.0
 
 
-def _cascade_overlap(qc: List[Dict[str, Any]], cc: List[Dict[str, Any]]) -> Tuple[float, List[str]]:
+def _cascade_overlap(
+    qc: List[Dict[str, Any]], cc: List[Dict[str, Any]]
+) -> Tuple[float, List[str]]:
     """Order-aware similarity between two cascade sequences.
 
     Returns ``(score, overlap_services)`` where ``score`` blends the
@@ -170,8 +172,16 @@ def score_graph_similarity(
         }
     q_nodes = query_graph.get("nodes") or []
     c_nodes = candidate_graph.get("nodes") or []
-    q_edges = [(e.get("from"), e.get("to")) for e in (query_graph.get("edges") or []) if isinstance(e, dict)]
-    c_edges = [(e.get("from"), e.get("to")) for e in (candidate_graph.get("edges") or []) if isinstance(e, dict)]
+    q_edges = [
+        (e.get("from"), e.get("to"))
+        for e in (query_graph.get("edges") or [])
+        if isinstance(e, dict)
+    ]
+    c_edges = [
+        (e.get("from"), e.get("to"))
+        for e in (candidate_graph.get("edges") or [])
+        if isinstance(e, dict)
+    ]
 
     nodes_j = _jaccard(q_nodes, c_nodes)
     edges_j = _jaccard(q_edges, c_edges)
@@ -225,9 +235,7 @@ def rank_hybrid(
                 sem_score = cosine_similarity(query_vec, vec)
 
         gra_detail = score_graph_similarity(query_graph, cand.get("graph"))
-        gra_score = gra_detail["score"] if (
-            cand.get("graph") and query_graph
-        ) else None
+        gra_score = gra_detail["score"] if (cand.get("graph") and query_graph) else None
 
         # Renormalise weights over available components.
         parts: List[Tuple[float, float]] = []
@@ -282,7 +290,11 @@ def rank_by_embedding(
         if exclude_run_id and cand.get("run_id") == exclude_run_id:
             continue
         vec = cand.get("vector")
-        if vec is None or not isinstance(vec, np.ndarray) or vec.shape != query_vec.shape:
+        if (
+            vec is None
+            or not isinstance(vec, np.ndarray)
+            or vec.shape != query_vec.shape
+        ):
             continue
         score = cosine_similarity(query_vec, vec)
         if score < min_score:

@@ -22,11 +22,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .system_card import render_system_card
 
-
 # Regex that matches " | chaos_type: `<value>`" in the L2 summary second line.
 # We strip this segment from the TARGET summary before sending to the LLM so
 # the model must infer the fault category from metrics/traces alone.
-_CHAOS_TYPE_RE = re.compile(r'\s*\|\s*chaos_type:\s*`[^`]*`')
+_CHAOS_TYPE_RE = re.compile(r"\s*\|\s*chaos_type:\s*`[^`]*`")
 
 # Regex that strips "(experiment <experiment_id>)" from the H1 line of the
 # summary.  The experiment_id encodes both the fault short-name
@@ -34,19 +33,19 @@ _CHAOS_TYPE_RE = re.compile(r'\s*\|\s*chaos_type:\s*`[^`]*`')
 # from the TARGET block to prevent direct ground-truth leakage.
 # Example: "# Run run-abc123 (experiment cpuhog-orders-r0-20260523-194346)"
 #       →  "# Run run-abc123"
-_EXPERIMENT_ID_RE = re.compile(r'\s*\(experiment\s+[^)]+\)')
+_EXPERIMENT_ID_RE = re.compile(r"\s*\(experiment\s+[^)]+\)")
 
 # Regex that strips ", affected_services=[...]" from the Traces line.
 # The list almost always starts with the chaos-injected service, giving the
 # LLM the answer to RCA. We keep the trace/error counts intact.
-_AFFECTED_SERVICES_RE = re.compile(r',\s*affected_services=\[[^\]]*\]')
+_AFFECTED_SERVICES_RE = re.compile(r",\s*affected_services=\[[^\]]*\]")
 
 # Regex that removes whole H2 sections that name services directly:
 #   - "## Top failure signatures" — each line cites the affected service.
 #   - "## Propagation graph"      — cascade order + edges expose RCA.
 # Matches from the H2 header to (but not including) the next H2 or EOF.
 _SERVICE_SECTIONS_RE = re.compile(
-    r'\n## (?:Top failure signatures|Propagation graph)\n[\s\S]*?(?=\n## |\Z)'
+    r"\n## (?:Top failure signatures|Propagation graph)\n[\s\S]*?(?=\n## |\Z)"
 )
 
 
@@ -68,10 +67,10 @@ def _mask_target_summary(text: str) -> str:
     5. ``## Propagation graph`` section — cascade order + edges expose the
        epicentre service and full topology.
     """
-    text = _CHAOS_TYPE_RE.sub('', text)
-    text = _EXPERIMENT_ID_RE.sub('', text)
-    text = _AFFECTED_SERVICES_RE.sub('', text)
-    text = _SERVICE_SECTIONS_RE.sub('', text)
+    text = _CHAOS_TYPE_RE.sub("", text)
+    text = _EXPERIMENT_ID_RE.sub("", text)
+    text = _AFFECTED_SERVICES_RE.sub("", text)
+    text = _SERVICE_SECTIONS_RE.sub("", text)
     return text
 
 
@@ -160,19 +159,22 @@ def assemble_prompt(
             f"score={n.get('score')}, verdict={n.get('verdict')})\n{text}"
         )
         neighbour_blocks.append(block)
-        citations.append({
-            "ref": cite,
-            "run_id": n.get("run_id"),
-            "score": n.get("score"),
-            "verdict": n.get("verdict"),
-        })
+        citations.append(
+            {
+                "ref": cite,
+                "run_id": n.get("run_id"),
+                "score": n.get("score"),
+                "verdict": n.get("verdict"),
+            }
+        )
 
     # Strip tags that would leak the injected fault or target service to the
     # LLM — those are ground-truth labels and must not appear in the target
     # block. Neighbours keep their full tags (they are the reference corpus).
     _LEAKAGE_PREFIXES = ("chaos:", "svc:", "fault_category:")
     tags_visible = [
-        t for t in (target.get("tags") or [])
+        t
+        for t in (target.get("tags") or [])
         if not any(t.startswith(p) for p in _LEAKAGE_PREFIXES)
     ]
     tags = ", ".join(tags_visible)
@@ -185,9 +187,7 @@ def assemble_prompt(
 
     body_parts: List[str] = [target_block]
     if neighbour_blocks:
-        body_parts.append(
-            "\n## Retrieved past runs\n" + "\n\n".join(neighbour_blocks)
-        )
+        body_parts.append("\n## Retrieved past runs\n" + "\n\n".join(neighbour_blocks))
         task_instruction = (
             "Classify the target run and explain the call. "
             "Reference past runs by their citation id (e.g. [n1])."
@@ -210,12 +210,15 @@ def assemble_prompt(
 
     prompt = (
         f"<system>{SYSTEM_PROMPT}</system>\n\n"
-        + (f"<system_card>\n{system_card_text}\n</system_card>\n\n"
-           if system_card_text else "")
+        + (
+            f"<system_card>\n{system_card_text}\n</system_card>\n\n"
+            if system_card_text
+            else ""
+        )
         + f"<context>\n{body}\n</context>\n\n"
         + f"<task>\n{task_instruction}\n"
-          f"Respond ONLY with a JSON object following this schema:\n"
-          f"{ANSWER_SCHEMA}\n</task>"
+        f"Respond ONLY with a JSON object following this schema:\n"
+        f"{ANSWER_SCHEMA}\n</task>"
     )
 
     meta = {

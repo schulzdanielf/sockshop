@@ -33,6 +33,29 @@ DEPLOYMENT_ENV  ?= local
 MODEL_HOST      ?= 0.0.0.0
 MODEL_PORT      ?= 8001
 
+# ── Full experiment orchestration (make experiment-run) ────────────────────────
+# Interpreter used to launch the model server, platform and harness.
+PYTHON               ?= .venv/bin/python
+# Health endpoints used to decide whether a service is already up.
+LLM_HEALTH_URL       ?= http://localhost:$(MODEL_PORT)/health
+PLATFORM_BASE        ?= http://127.0.0.1:8010
+PLATFORM_HEALTH_URL  ?= $(PLATFORM_BASE)/api/health
+# Local port the MCP observability server is port-forwarded to (see `port-forward`).
+MCP_LOCAL_PORT       ?= 18080
+# Experiment harness wiring.
+EXPERIMENT_CONFIG    ?= experiment/eval/memory_hog/config.yaml
+EXPERIMENT_RUNNER    ?= experiment/eval/memory_hog/runner.py
+# Extra args forwarded to the harness, e.g. RUN_ARGS="--phase chaos --retry-failed".
+RUN_ARGS             ?=
+# Readiness polling. The model load (ExLlamaV2) can take minutes, hence the
+# larger retry budget; the platform comes up in seconds.
+HEALTH_DELAY         ?= 5
+HEALTH_RETRIES       ?= 60
+MODEL_BOOT_RETRIES   ?= 120
+SMOKE_AGENT_ARGS     ?=
+ENV_ASSESSOR_ARGS    ?=
+AGENT_CONSOLE_ARGS   ?=
+
 
 .PHONY: front-end-build
 front-end-build:
@@ -95,6 +118,16 @@ chaos-install:
 	kubectl apply -f $(LITMUS_ADMIN_RBAC_URL)
 	kubectl apply -n sock-shop -f $(LITMUS_POD_DELETE_URL)
 	kubectl apply -f deploy/kubernetes/manifests-chaos/pod-delete-rbac.yaml
+
+# Network chaos (pod-network-latency / pod-network-loss) needs the `sch_netem`
+# qdisc module in the (shared) node kernel. On docker-desktop / WSL2 the module
+# ships with the kernel but is not auto-loaded; run this once per host boot
+# BEFORE any network-* chaos. NOTE: non-persistent — re-run after a WSL restart
+# (or add `sch_netem` to /etc/modules-load.d/ to make it permanent).
+.PHONY: chaos-enable-netem
+chaos-enable-netem:
+	sudo modprobe sch_netem
+	@lsmod | grep -q '^sch_netem' && echo "sch_netem loaded OK" || (echo "sch_netem NOT loaded" && exit 1)
 
 .PHONY: chaos-run-pod-delete
 chaos-run-pod-delete:
@@ -228,6 +261,18 @@ apply-loadtest:
 cluster-down: observability-stop-port-forward loadtest-down observability-down app-down
 
 .PHONY: cluster-up
+
+.PHONY: metrics-agent-smoke
+metrics-agent-smoke:
+	$(PYTHON) -m experiment.platform.backend.metrics_smoke_agent $(SMOKE_AGENT_ARGS)
+
+.PHONY: environment-assessor
+environment-assessor:
+	$(PYTHON) -m experiment.platform.backend.environment_assessor $(ENV_ASSESSOR_ARGS)
+
+.PHONY: agent-console
+agent-console:
+	$(PYTHON) -m experiment.platform.backend.agent_console $(AGENT_CONSOLE_ARGS)
 cluster-up: app-up observability-up loadtest-up
 
 .PHONY: cluster-restart
@@ -248,6 +293,102 @@ model-serve:
 experiment-platform-up:
 	.venv/bin/python -m uvicorn experiment.platform.backend.main:app \
 		--host 0.0.0.0 --port 8010 --reload
+
+# ── Full experiment orchestration ──────────────────────────────────────────────
+# `make experiment-run` brings up every dependency a complete experiment needs
+# (port-forwards → LLM model server → platform), validates them, then launches
+# the chaos/RCA harness. Each dependency is started only if it isn't already up,
+# so the target is safe to re-run. Background services log to /tmp/*.log.
+#
+# Usage examples:
+#   make experiment-run                              # full train+eval matrix
+#   make experiment-run RUN_ARGS="--phase chaos"     # only inject chaos
+#   make experiment-run RUN_ARGS="--dry-run"         # print first spec and exit
+
+.PHONY: model-serve-bg
+## Start the LLM model server in the background (used by `experiment-run`).
+model-serve-bg:
+	@echo ">> Starting LLM model server on :$(MODEL_PORT) (log: /tmp/model-serve.log)"
+	@OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
+		nohup $(PYTHON) -m uvicorn model.server:app \
+			--host $(MODEL_HOST) --port $(MODEL_PORT) \
+			>/tmp/model-serve.log 2>&1 &
+
+.PHONY: experiment-platform-up-bg
+## Start the experiment platform in the background (used by `experiment-run`).
+experiment-platform-up-bg:
+	@echo ">> Starting experiment platform on :8010 (log: /tmp/experiment-platform.log)"
+	@nohup $(PYTHON) -m uvicorn experiment.platform.backend.main:app \
+		--host 0.0.0.0 --port 8010 >/tmp/experiment-platform.log 2>&1 &
+
+.PHONY: ensure-cluster
+## Fail fast if the Kubernetes cluster is unreachable.
+ensure-cluster:
+	@kubectl get nodes >/dev/null 2>&1 || \
+		{ echo "ERROR: cannot reach the Kubernetes cluster (kubectl get nodes failed)." >&2; exit 1; }
+	@echo ">> Kubernetes cluster reachable."
+
+.PHONY: ensure-port-forward
+## Bring up port-forwards (MCP/Prometheus/Tempo/...) if the MCP port is closed.
+ensure-port-forward:
+	@if $(PYTHON) -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',$(MCP_LOCAL_PORT)))==0 else 1)" 2>/dev/null; then \
+		echo ">> Port-forwards already up (MCP :$(MCP_LOCAL_PORT))."; \
+	else \
+		echo ">> Port-forwards down — running 'make port-forward'..."; \
+		$(MAKE) port-forward; \
+		echo "   waiting for port-forwards to settle..."; \
+		sleep $(HEALTH_DELAY); \
+	fi
+
+.PHONY: ensure-model
+## Ensure the LLM model server is healthy, starting it if necessary.
+ensure-model:
+	@if curl -sf --max-time 3 $(LLM_HEALTH_URL) >/dev/null 2>&1; then \
+		echo ">> LLM model server already healthy at $(LLM_HEALTH_URL)."; \
+	else \
+		echo ">> LLM model server down — starting it (model load may take minutes)..."; \
+		$(MAKE) model-serve-bg; \
+		i=0; \
+		until curl -sf --max-time 3 $(LLM_HEALTH_URL) >/dev/null 2>&1; do \
+			i=$$((i+1)); \
+			if [ $$i -ge $(MODEL_BOOT_RETRIES) ]; then \
+				echo "ERROR: LLM model not healthy after $$((MODEL_BOOT_RETRIES*HEALTH_DELAY))s. See /tmp/model-serve.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep $(HEALTH_DELAY); \
+		done; \
+		echo ">> LLM model server is healthy."; \
+	fi
+
+.PHONY: ensure-platform
+## Ensure the experiment platform is healthy, starting it if necessary.
+ensure-platform:
+	@if curl -sf --max-time 3 $(PLATFORM_HEALTH_URL) >/dev/null 2>&1; then \
+		echo ">> Experiment platform already healthy at $(PLATFORM_HEALTH_URL)."; \
+	else \
+		echo ">> Experiment platform down — starting it..."; \
+		$(MAKE) experiment-platform-up-bg; \
+		i=0; \
+		until curl -sf --max-time 3 $(PLATFORM_HEALTH_URL) >/dev/null 2>&1; do \
+			i=$$((i+1)); \
+			if [ $$i -ge $(HEALTH_RETRIES) ]; then \
+				echo "ERROR: platform not healthy after $$((HEALTH_RETRIES*HEALTH_DELAY))s. See /tmp/experiment-platform.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep $(HEALTH_DELAY); \
+		done; \
+		echo ">> Experiment platform is healthy."; \
+	fi
+
+.PHONY: experiment-run
+## One-shot: ensure every dependency is up, then run the full experiment harness.
+experiment-run: ensure-cluster ensure-port-forward ensure-model ensure-platform
+	@echo ">> Verifying the platform can reach the LLM (/api/llm/health)..."
+	@curl -sf --max-time 5 $(PLATFORM_BASE)/api/llm/health \
+		|| echo "   WARNING: /api/llm/health not OK — the analysis phase may fail."
+	@echo
+	@echo ">> Launching experiment harness: $(EXPERIMENT_RUNNER) (config: $(EXPERIMENT_CONFIG))"
+	$(PYTHON) $(EXPERIMENT_RUNNER) --config $(EXPERIMENT_CONFIG) $(RUN_ARGS)
 
 .PHONY: git
 git:

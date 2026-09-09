@@ -41,6 +41,64 @@ def _phase_line(metric_id: str, phase_stats: Dict[str, Any]) -> str:
     return f"- {metric_id}: " + " | ".join(parts)
 
 
+def _render_pod_health(features: Dict[str, Any]) -> List[str]:
+    """Convert OOMKilled / pod_restarts_total hotspots into explicit
+    English sentences.
+
+    Why a dedicated section instead of leaving the signal in
+    ``Resource saturation hotspots``: those rows read as continuous Δs
+    (``fault=0.5 baseline=0.0 Δ=+0.50``), which forces the LLM to
+    re-interpret what a 0.5 delta on a 0/1 gauge means. A plain
+    "Pod X was OOMKilled" line is far less ambiguous for a small model.
+
+    We rely on the per-label hotspot deltas already computed by
+    ``MCPPrometheusMetricsPlugin.per_label_hotspots`` (which buckets by
+    baseline vs fault phase, scoped to the experiment window — so no
+    cross-experiment leakage from earlier OOMs / restarts).
+    """
+    hotspots = features.get("metric_hotspots") or {}
+    out: List[str] = []
+
+    oom = hotspots.get("oom_killed") or {}
+    oom_rows = [
+        r
+        for r in (oom.get("top") or [])
+        if isinstance(r, dict) and (r.get("delta_abs") or 0) > 0.4
+    ]
+    for r in oom_rows:
+        label = r.get("label", "unknown")
+        # The gauge is 0/1 per container; a delta > 0.4 means the
+        # OOMKilled gauge transitioned for at least one container in
+        # that pod/service during the fault window.
+        out.append(
+            f"- **OOMKilled**: container(s) in `{label}` were OOMKilled "
+            f"during the run (last-terminated-reason gauge "
+            f"baseline={_fmt_num(r.get('baseline_mean'), 2)} → "
+            f"fault={_fmt_num(r.get('fault_mean'), 2)})."
+        )
+
+    restarts = hotspots.get("pod_restarts_total") or {}
+    restart_rows = [
+        r
+        for r in (restarts.get("top") or [])
+        if isinstance(r, dict) and (r.get("delta_abs") or 0) > 0.05
+    ]
+    for r in restart_rows:
+        label = r.get("label", "unknown")
+        # delta_abs on a monotonic counter ≈ (mid-fault - mid-baseline);
+        # we flag presence of restarts but do not claim an exact count.
+        out.append(
+            f"- **Restarts**: `{label}` accumulated restarts during the run "
+            f"(counter Δ≈{_fmt_num(r.get('delta_abs'), 2)})."
+        )
+
+    if not out:
+        # Make the absence explicit so the LLM doesn't infer it from
+        # silence — useful when classifying pod-failure vs cpu-hog.
+        out.append("- No OOMKills or pod restarts observed during the run.")
+    return out
+
+
 def _render_hotspot_lines(
     hotspots: Dict[str, Any],
     metric_ids: Tuple[str, ...],
@@ -60,10 +118,10 @@ def _render_hotspot_lines(
             continue
         # Drop rows where there is no signal at all (fault==baseline==0).
         meaningful = [
-            r for r in rows
+            r
+            for r in rows
             if isinstance(r, dict)
-            and (abs(r.get("delta_abs", 0.0)) > 1e-6
-                 or r.get("fault_mean", 0.0) > 1e-6)
+            and (abs(r.get("delta_abs", 0.0)) > 1e-6 or r.get("fault_mean", 0.0) > 1e-6)
         ]
         if not meaningful:
             continue
@@ -110,7 +168,11 @@ def build_summary_tags(features: Dict[str, Any]) -> List[str]:
     graph = features.get("propagation_graph") or {}
     cascade = graph.get("cascade_order") or []
     if cascade:
-        names = [c.get("service") for c in cascade[:3] if isinstance(c, dict) and c.get("service")]
+        names = [
+            c.get("service")
+            for c in cascade[:3]
+            if isinstance(c, dict) and c.get("service")
+        ]
         if names:
             tags.append("cascade:" + "->".join(names))
     edge_count = graph.get("edge_count")
@@ -209,8 +271,14 @@ def build_run_summary_l2(
     if hotspots:
         _SYMPTOM_METRICS = ("error_rate", "latency_p95", "latency_p99", "traffic")
         _CAUSAL_METRICS = (
-            "memory_saturation_pct", "cpu_saturation_pct", "cpu_throttled",
-            "pod_restarts", "memory_working_set_bytes", "cpu_usage_cores",
+            "memory_saturation_pct",
+            "cpu_saturation_pct",
+            "cpu_throttled",
+            "oom_killed",
+            "pod_restarts_total",
+            "pod_restarts",
+            "memory_working_set_bytes",
+            "cpu_usage_cores",
         )
         symptom_lines = _render_hotspot_lines(hotspots, _SYMPTOM_METRICS)
         causal_lines = _render_hotspot_lines(hotspots, _CAUSAL_METRICS)
@@ -228,6 +296,18 @@ def build_run_summary_l2(
             if causal_lines:
                 lines.append("\n### Resource saturation hotspots")
                 lines.extend(causal_lines)
+
+    # ── Pod health events — discrete counts, not continuous Δs ───────────
+    # The hotspot block above is great for continuous metrics (saturation,
+    # latency) but reads awkwardly for counters/gauges where what matters
+    # is "did this event happen at all, and how many times?". We render
+    # OOMKills and restart counts as plain English here so the LLM does
+    # not have to translate (fault_mean − baseline_mean) deltas back into
+    # event counts.
+    pod_health_lines = _render_pod_health(features)
+    if pod_health_lines:
+        lines.append("\n## Pod health events")
+        lines.extend(pod_health_lines)
 
     # Traces
     lines.append("\n## Traces")
@@ -252,9 +332,7 @@ def build_run_summary_l2(
     if rcas:
         lines.append("\n## RCA hypotheses")
         for rca in rcas[:3]:
-            lines.append(
-                f"- [{rca.get('confidence')}] {rca.get('hypothesis')}"
-            )
+            lines.append(f"- [{rca.get('confidence')}] {rca.get('hypothesis')}")
 
     # Phase F1 — Temporal dynamics
     temporal = features.get("temporal_features") or {}
@@ -293,7 +371,9 @@ def build_run_summary_l2(
             )
             lines.append(f"Cascade: {chain}")
         if edges:
-            err_edges = sum(1 for e in edges if isinstance(e, dict) and e.get("error_count", 0) > 0)
+            err_edges = sum(
+                1 for e in edges if isinstance(e, dict) and e.get("error_count", 0) > 0
+            )
             lines.append(
                 f"Edges: {len(edges)} total, {err_edges} with errors "
                 f"(top {min(5, len(edges))} below)"
