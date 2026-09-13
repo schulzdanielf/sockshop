@@ -359,7 +359,12 @@ class OrchestratorEngine:
                 features["ground_truth_fault_category"] = gt_fault
 
             try:
-                self.storage.upsert_run_features(run_id, exp.experiment_id, features)
+                self.storage.upsert_run_features(
+                    run_id,
+                    exp.experiment_id,
+                    features,
+                    experiment_version=exp.version,
+                )
             except Exception as exc:  # pragma: no cover - storage best-effort
                 self._event(run_id, "run_features_persist_failed", {"error": str(exc)})
 

@@ -618,7 +618,12 @@ def _safe_get(d: Any, *keys: str, default: Any = None) -> Any:
 
 
 def evaluate_strategy(
-    api: ApiClient, run: RunRecord, strategy: Dict[str, Any], expected_fault: str
+    api: ApiClient,
+    run: RunRecord,
+    strategy: Dict[str, Any],
+    expected_fault: str,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
 ) -> StrategyResult:
     """Score one (run × strategy) cell on two RCA dimensions:
 
@@ -639,6 +644,11 @@ def evaluate_strategy(
             system_id=strategy["system_id"],
             budget_tokens=strategy["budget_tokens"],
             max_new_tokens=strategy.get("max_new_tokens", 512),
+            provider=llm_provider,
+            model=llm_model,
+            eval_target=run.chaos_target,
+            eval_fault=expected_fault,
+            eval_strategy=name,
         )
     except Exception as exc:  # pragma: no cover - network/LLM failures
         return StrategyResult(
@@ -931,7 +941,12 @@ def phase_chaos(
 
 
 def phase_eval(
-    api: ApiClient, cfg: Dict[str, Any], runs: List[RunRecord], eval_csv: Path
+    api: ApiClient,
+    cfg: Dict[str, Any],
+    runs: List[RunRecord],
+    eval_csv: Path,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
 ) -> List[StrategyResult]:
     print("─── PHASE 3: EVAL (strategy sweep on test runs) ─────────────────")
     test_runs = [
@@ -972,7 +987,14 @@ def phase_eval(
                 f"  [EVAL ] run={run.run_id} target={run.chaos_target} "
                 f"fault={expected_fault} strategy={strategy['name']}"
             )
-            res = evaluate_strategy(api, run, strategy, expected_fault)
+            res = evaluate_strategy(
+                api,
+                run,
+                strategy,
+                expected_fault,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
+            )
             results.append(res)
             if res.raw_error:
                 print(f"         error: {res.raw_error}")
@@ -996,6 +1018,34 @@ def _norm(s: Any) -> str:
     return str(s).strip().lower().replace("_", "-").replace(" ", "-")
 
 
+def _compute_prediction_scores(
+    *,
+    raw_rca: Optional[str],
+    raw_fault_category: Optional[str],
+    final_rca: Optional[str],
+    final_fault_category: Optional[str],
+    chaos_target: str,
+    expected_fault_category: str,
+) -> tuple[dict[str, bool], dict[str, bool]]:
+    """Return the raw-model and final-pipeline scores for one result.
+
+    The raw model prediction is the answer *before* deterministic post-
+    processing. The final scores represent the answer *after* validator/localizer
+    overrides, which is what the operational pipeline actually reports.
+    """
+
+    def _score(rca: Optional[str], fault: Optional[str]) -> dict[str, bool]:
+        target_ok = bool(rca) and _norm(rca) == _norm(chaos_target)
+        fault_ok = bool(fault) and _norm(fault) == _norm(expected_fault_category)
+        return {
+            "correct_target": target_ok,
+            "correct_fault": fault_ok,
+            "correct_full": target_ok and fault_ok,
+        }
+
+    return _score(raw_rca, raw_fault_category), _score(final_rca, final_fault_category)
+
+
 def _raw_scores(r: StrategyResult, chaos_target: str) -> tuple:
     """Recover the *pre-override* LLM answer for one strategy result.
 
@@ -1012,9 +1062,19 @@ def _raw_scores(r: StrategyResult, chaos_target: str) -> tuple:
     """
     raw_rca = r.localizer_original_rca if r.localizer_fired else r.predicted_rca
     raw_fault = r.validator_original_fault if r.validator_fired else r.fault_category
-    target_ok = bool(raw_rca) and _norm(raw_rca) == _norm(chaos_target)
-    fault_ok = bool(raw_fault) and _norm(raw_fault) == _norm(r.expected_fault_category)
-    return target_ok, fault_ok, (target_ok and fault_ok)
+    raw_scores, _ = _compute_prediction_scores(
+        raw_rca=raw_rca,
+        raw_fault_category=raw_fault,
+        final_rca=r.predicted_rca,
+        final_fault_category=r.fault_category,
+        chaos_target=chaos_target,
+        expected_fault_category=r.expected_fault_category,
+    )
+    return (
+        raw_scores["correct_target"],
+        raw_scores["correct_fault"],
+        raw_scores["correct_full"],
+    )
 
 
 def _print_accuracy_table(
@@ -1039,9 +1099,20 @@ def _print_accuracy_table(
             acc_fault = sum(1 for s in scored if s[1]) / n if n else 0.0
             acc_full = sum(1 for s in scored if s[2]) / n if n else 0.0
         else:
-            acc_target = (sum(1 for r in rows if r.correct_target) / n) if n else 0.0
-            acc_fault = (sum(1 for r in rows if r.correct_fault) / n) if n else 0.0
-            acc_full = (sum(1 for r in rows if r.correct_full) / n) if n else 0.0
+            final_scores = []
+            for r in rows:
+                _, score = _compute_prediction_scores(
+                    raw_rca=r.localizer_original_rca if r.localizer_fired else r.predicted_rca,
+                    raw_fault_category=r.validator_original_fault if r.validator_fired else r.fault_category,
+                    final_rca=r.predicted_rca,
+                    final_fault_category=r.fault_category,
+                    chaos_target=r.chaos_target,
+                    expected_fault_category=r.expected_fault_category,
+                )
+                final_scores.append(score)
+            acc_target = sum(1 for s in final_scores if s["correct_target"]) / n if n else 0.0
+            acc_fault = sum(1 for s in final_scores if s["correct_fault"]) / n if n else 0.0
+            acc_full = sum(1 for s in final_scores if s["correct_full"]) / n if n else 0.0
         avg_tok = (
             (sum((r.prompt_tokens or 0) for r in valid) / len(valid)) if valid else 0.0
         )
@@ -1099,6 +1170,18 @@ def main() -> int:
         "before the chaos phase (assume they already exist in the cluster).",
     )
     p.add_argument(
+        "--llm-provider",
+        choices=["qwen", "gpt", "gpt-4o-mini", "openai", "github", "gemini"],
+        default=None,
+        help="LLM provider for evaluation phase. Default: qwen (local). "
+        "Use 'gemini' for Google Gemini or 'gpt' for OpenAI.",
+    )
+    p.add_argument(
+        "--llm-model",
+        default=None,
+        help="Override LLM model name (e.g., gpt-4o-mini, qwen-14b).",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the spec for the first cell and exit.",
@@ -1148,7 +1231,14 @@ def main() -> int:
             return 2
 
     if args.phase in ("all", "eval"):
-        phase_eval(api, cfg, runs, eval_csv)
+        phase_eval(
+            api,
+            cfg,
+            runs,
+            eval_csv,
+            llm_provider=args.llm_provider,
+            llm_model=args.llm_model,
+        )
     return 0
 
 

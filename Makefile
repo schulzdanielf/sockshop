@@ -283,6 +283,7 @@ cluster-restart: cluster-down cluster-up port-forward
 ## Requires the cluster to be running and 29-otel-collector-svc.yaml applied.
 model-serve:
 	OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) \
+	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=1 \
 	DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
 	.venv/bin/python -m uvicorn model.server:app \
 		--host $(MODEL_HOST) --port $(MODEL_PORT)
@@ -291,6 +292,8 @@ model-serve:
 .PHONY: experiment-platform-up
 ## Start the experiment platform (FastAPI backend + GUI) on http://localhost:8010
 experiment-platform-up:
+	OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) \
+	DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
 	.venv/bin/python -m uvicorn experiment.platform.backend.main:app \
 		--host 0.0.0.0 --port 8010 --reload
 
@@ -309,7 +312,9 @@ experiment-platform-up:
 ## Start the LLM model server in the background (used by `experiment-run`).
 model-serve-bg:
 	@echo ">> Starting LLM model server on :$(MODEL_PORT) (log: /tmp/model-serve.log)"
-	@OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
+	@OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) \
+		OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=1 \
+		DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
 		nohup $(PYTHON) -m uvicorn model.server:app \
 			--host $(MODEL_HOST) --port $(MODEL_PORT) \
 			>/tmp/model-serve.log 2>&1 &
@@ -318,7 +323,8 @@ model-serve-bg:
 ## Start the experiment platform in the background (used by `experiment-run`).
 experiment-platform-up-bg:
 	@echo ">> Starting experiment platform on :8010 (log: /tmp/experiment-platform.log)"
-	@nohup $(PYTHON) -m uvicorn experiment.platform.backend.main:app \
+	@OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
+		nohup $(PYTHON) -m uvicorn experiment.platform.backend.main:app \
 		--host 0.0.0.0 --port 8010 >/tmp/experiment-platform.log 2>&1 &
 
 .PHONY: ensure-cluster

@@ -8,6 +8,7 @@ HTTP requests into domain operations and serialises domain state back out.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,8 @@ from opentelemetry.trace import Status, StatusCode
 
 from .adapters.noop_notifier import NoopNotificationAdapter
 from .analysis import (
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_URL,
     LLMClientError,
     assemble_prompt,
     blob_to_vector,
@@ -49,7 +52,9 @@ from .models import (
 from .observability import (
     GenAI,
     capture_content,
+    configure_llm_io_audit,
     get_tracer,
+    record_llm_io,
     record_llm_metrics,
     record_override,
     setup_telemetry,
@@ -88,6 +93,7 @@ def create_app() -> FastAPI:
 
     # OpenTelemetry (AgentOps): traces/metrics for the RCA decision pipeline.
     setup_telemetry(app)
+    configure_llm_io_audit(str(data_dir / "llm_io_audit.jsonl"))
 
     app.add_middleware(
         CORSMiddleware,
@@ -262,6 +268,9 @@ def create_app() -> FastAPI:
         if target is None:
             raise HTTPException(status_code=404, detail="summary not found")
 
+        target_experiment_id = target.get("experiment_id")
+        target_experiment_version = target.get("experiment_version")
+
         # Phase F1 — hybrid mode: cosine(embedding) + propagation-graph similarity.
         if mode == "hybrid":
             target_emb = storage.get_run_embedding(run_id)
@@ -276,6 +285,8 @@ def create_app() -> FastAPI:
                 rows = storage.iter_run_embeddings(
                     provider=target_emb["provider"],
                     chaos_type=chaos_type,
+                    experiment_id=target_experiment_id,
+                    experiment_version=target_experiment_version,
                     limit=1000,
                     include_features=True,
                 )
@@ -348,6 +359,8 @@ def create_app() -> FastAPI:
             rows = storage.iter_run_embeddings(
                 provider=target_emb["provider"],
                 chaos_type=chaos_type,
+                experiment_id=target_experiment_id,
+                experiment_version=target_experiment_version,
                 limit=1000,
             )
             candidates = []
@@ -364,6 +377,8 @@ def create_app() -> FastAPI:
             )
         else:
             candidates = storage.list_run_summaries(
+                experiment_id=target_experiment_id,
+                experiment_version=target_experiment_version,
                 chaos_type=chaos_type or target.get("chaos_type"),
                 verdict=verdict,
                 limit=500,
@@ -413,9 +428,8 @@ def create_app() -> FastAPI:
                 target_vec = blob_to_vector(target_emb["blob"], target_emb["dim"])
                 rows = storage.iter_run_embeddings(
                     provider=target_emb["provider"],
-                    # NOTE: do NOT filter by chaos_type — that would act as an
-                    # oracle, only returning neighbours of the same fault type
-                    # as the target and trivialising the classification task.
+                    experiment_id=target.get("experiment_id"),
+                    experiment_version=target.get("experiment_version"),
                     limit=1000,
                     include_features=True,
                 )
@@ -470,7 +484,8 @@ def create_app() -> FastAPI:
             target_vec = blob_to_vector(target_emb["blob"], target_emb["dim"])
             rows = storage.iter_run_embeddings(
                 provider=target_emb["provider"],
-                # NOTE: do NOT filter by chaos_type — see hybrid branch above.
+                experiment_id=target.get("experiment_id"),
+                experiment_version=target.get("experiment_version"),
                 limit=1000,
             )
             candidates = []
@@ -486,7 +501,8 @@ def create_app() -> FastAPI:
             used_mode = "embedding"
         else:
             cand = storage.list_run_summaries(
-                # NOTE: do NOT filter by chaos_type — see hybrid branch above.
+                experiment_id=target.get("experiment_id"),
+                experiment_version=target.get("experiment_version"),
                 limit=500,
             )
             ranked = rank_similar_runs(
@@ -582,13 +598,75 @@ def create_app() -> FastAPI:
         budget_tokens: int = 3200,
         force: bool = False,
         system_id: str = "sock-shop",
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        eval_target: Optional[str] = None,
+        eval_fault: Optional[str] = None,
+        eval_strategy: Optional[str] = None,
     ) -> dict:
-        """Assemble RAG prompt, call Qwen, persist parsed verdict."""
+        """Assemble RAG prompt, call LLM, persist parsed verdict."""
+
+        def _trim_for_span(text: Optional[str], limit: int = 8000) -> str:
+            if not text:
+                return ""
+            if len(text) <= limit:
+                return text
+            return text[:limit] + "...[truncated]"
+
+        # Resolve LLM target URL and model name for this request.
+        # Fall back to environment defaults (Qwen local) if not explicitly passed.
+        prov = (provider or "").strip().lower()
+        if prov in {"gemini", "gemini-flash", "gemini-1.5-flash", "gemini-2.5-flash", "google"}:
+            target_model = model or "gemini-2.5-flash"
+            target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
+            target_api_style = "gemini"
+        elif prov in {"gpt", "gpt-4o-mini", "openai", "github"}:
+            env_url = os.environ.get("LLM_URL")
+            if env_url and "localhost" not in env_url and "127.0.0.1" not in env_url:
+                target_url = env_url
+            else:
+                target_url = "https://api.openai.com/v1/chat/completions"
+            target_model = model or os.environ.get("LLM_MODEL") or "gpt-4o-mini"
+            target_api_style = "openai"
+        elif prov in {"qwen", "local"}:
+            target_url = "http://localhost:8001/generate"
+            target_model = model or "qwen-14b"
+            target_api_style = "legacy"
+        elif prov:
+            target_url = prov  # custom URL passed directly
+            target_model = model or DEFAULT_LLM_MODEL
+            target_api_style = None
+        else:
+            target_url = DEFAULT_LLM_URL
+            target_model = model or DEFAULT_LLM_MODEL
+            target_api_style = None
+
         tracer = get_tracer()
+        llm_sys = "qwen" if "qwen" in target_model.lower() else "llm"
+        audit_base = {
+            "event": "llm.request_response",
+            "run_id": run_id,
+            "eval_target": eval_target,
+            "eval_fault": eval_fault,
+            "eval_strategy": eval_strategy,
+            "rag_mode_requested": mode,
+            "rag_limit": int(limit),
+            "system_card_id": system_id,
+            "budget_tokens": int(budget_tokens),
+            "max_new_tokens": int(max_new_tokens),
+            "model": target_model,
+        }
         with tracer.start_as_current_span("rca.analyze") as root:
             root.set_attribute(GenAI.OPERATION_NAME, "invoke_agent")
-            root.set_attribute(GenAI.SYSTEM, "qwen")
+            root.set_attribute(GenAI.SYSTEM, llm_sys)
             root.set_attribute("rca.run_id", run_id)
+            if eval_target:
+                root.set_attribute("rca.eval.target", eval_target)
+            if eval_fault:
+                root.set_attribute("rca.eval.fault", eval_fault)
+            if eval_strategy:
+                root.set_attribute("rca.eval.strategy", eval_strategy)
             root.set_attribute(GenAI.RAG_MODE, mode)
             root.set_attribute("rca.rag.limit", limit)
             root.set_attribute("rca.system_card_id", system_id)
@@ -642,22 +720,97 @@ def create_app() -> FastAPI:
             t_call_start = time.time()
             with tracer.start_as_current_span("gen_ai.chat") as span:
                 span.set_attribute(GenAI.OPERATION_NAME, "chat")
-                span.set_attribute(GenAI.SYSTEM, "qwen")
-                span.set_attribute(GenAI.REQUEST_MODEL, "qwen-14b")
+                span.set_attribute(GenAI.SYSTEM, llm_sys)
+                span.set_attribute(GenAI.REQUEST_MODEL, target_model)
                 span.set_attribute(GenAI.REQUEST_MAX_TOKENS, max_new_tokens)
+                span.set_attribute("rca.llm.attempt", 1)
+                if eval_target:
+                    span.set_attribute("rca.eval.target", eval_target)
+                if eval_fault:
+                    span.set_attribute("rca.eval.fault", eval_fault)
+                if eval_strategy:
+                    span.set_attribute("rca.eval.strategy", eval_strategy)
+                span.add_event(
+                    "llm.request",
+                    {
+                        "attempt": 1,
+                        "retry": False,
+                        "prompt": _trim_for_span(prompt),
+                    },
+                )
                 try:
-                    raw = call_llm(prompt, max_new_tokens=max_new_tokens)
+                    raw = call_llm(
+                        prompt,
+                        max_new_tokens=max_new_tokens,
+                        url=target_url,
+                        model=target_model,
+                        api_style=target_api_style,
+                        api_key=api_key,
+                    )
                 except LLMClientError as exc:
+                    record_llm_io(
+                        {
+                            **audit_base,
+                            "attempt": 1,
+                            "retry": False,
+                            "status": "error",
+                            "error": str(exc),
+                            "prompt": prompt,
+                        }
+                    )
+                    span.add_event(
+                        "llm.response_error",
+                        {
+                            "attempt": 1,
+                            "retry": False,
+                            "error": _trim_for_span(str(exc), 2000),
+                        },
+                    )
                     span.set_status(Status(StatusCode.ERROR, str(exc)))
-                    raise HTTPException(status_code=502, detail=str(exc))
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
                 if capture_content():
                     span.set_attribute(GenAI.COMPLETION, raw)
+                span.add_event(
+                    "llm.response",
+                    {
+                        "attempt": 1,
+                        "retry": False,
+                        "response": _trim_for_span(raw),
+                    },
+                )
 
             llm_latency_ms = int((time.time() - t_call_start) * 1000)
             with tracer.start_as_current_span("response.parse") as span:
                 parsed = parse_verdict_response(raw)
                 span.set_attribute("rca.parse_error", parsed.get("parse_error") or "")
                 span.set_attribute("rca.rca_present", bool(parsed.get("rca")))
+                span.add_event(
+                    "llm.parse",
+                    {
+                        "attempt": 1,
+                        "retry": False,
+                        "parse_error": str(parsed.get("parse_error") or ""),
+                        "rca_present": bool(parsed.get("rca")),
+                        "fault_category_present": bool(parsed.get("fault_category")),
+                    },
+                )
+            record_llm_io(
+                {
+                    **audit_base,
+                    "attempt": 1,
+                    "retry": False,
+                    "status": "ok",
+                    "prompt": prompt,
+                    "response": raw,
+                    "parse_error": parsed.get("parse_error"),
+                    "rca_present": bool(parsed.get("rca")),
+                    "fault_category_present": bool(parsed.get("fault_category")),
+                    "prompt_tokens_estimate": int(
+                        (meta or {}).get("prompt_tokens_estimate") or 0
+                    ),
+                    "neighbour_count": int((meta or {}).get("neighbour_count") or 0),
+                }
+            )
 
             # Single retry when the first attempt failed to produce a usable
             # verdict (empty response, JSON parse error, or no `rca` field).
@@ -668,23 +821,99 @@ def create_app() -> FastAPI:
                 retry_count = 1
                 with tracer.start_as_current_span("gen_ai.chat") as span:
                     span.set_attribute(GenAI.OPERATION_NAME, "chat")
-                    span.set_attribute(GenAI.SYSTEM, "qwen")
+                    span.set_attribute(GenAI.SYSTEM, llm_sys)
                     span.set_attribute("rca.retry", True)
+                    span.set_attribute("rca.llm.attempt", 2)
+                    if eval_target:
+                        span.set_attribute("rca.eval.target", eval_target)
+                    if eval_fault:
+                        span.set_attribute("rca.eval.fault", eval_fault)
+                    if eval_strategy:
+                        span.set_attribute("rca.eval.strategy", eval_strategy)
+                    span.add_event(
+                        "llm.request",
+                        {
+                            "attempt": 2,
+                            "retry": True,
+                            "prompt": _trim_for_span(prompt),
+                        },
+                    )
                     try:
-                        raw_retry = call_llm(prompt, max_new_tokens=max_new_tokens)
+                        raw_retry = call_llm(
+                            prompt,
+                            max_new_tokens=max_new_tokens,
+                            url=target_url,
+                            model=target_model,
+                            api_style=target_api_style,
+                            api_key=api_key,
+                        )
                         parsed_retry = parse_verdict_response(raw_retry)
+                        span.add_event(
+                            "llm.response",
+                            {
+                                "attempt": 2,
+                                "retry": True,
+                                "response": _trim_for_span(raw_retry),
+                            },
+                        )
+                        span.add_event(
+                            "llm.parse",
+                            {
+                                "attempt": 2,
+                                "retry": True,
+                                "parse_error": str(
+                                    parsed_retry.get("parse_error") or ""
+                                ),
+                                "rca_present": bool(parsed_retry.get("rca")),
+                                "fault_category_present": bool(
+                                    parsed_retry.get("fault_category")
+                                ),
+                            },
+                        )
+                        record_llm_io(
+                            {
+                                **audit_base,
+                                "attempt": 2,
+                                "retry": True,
+                                "status": "ok",
+                                "prompt": prompt,
+                                "response": raw_retry,
+                                "parse_error": parsed_retry.get("parse_error"),
+                                "rca_present": bool(parsed_retry.get("rca")),
+                                "fault_category_present": bool(
+                                    parsed_retry.get("fault_category")
+                                ),
+                            }
+                        )
                         if parsed_retry.get("rca") and not parsed_retry.get(
                             "parse_error"
                         ):
                             parsed = parsed_retry
                             raw = raw_retry
                             llm_latency_ms = int((time.time() - t_call_start) * 1000)
-                    except LLMClientError:
+                    except LLMClientError as exc:
+                        span.add_event(
+                            "llm.response_error",
+                            {
+                                "attempt": 2,
+                                "retry": True,
+                                "error": _trim_for_span(str(exc), 2000),
+                            },
+                        )
+                        record_llm_io(
+                            {
+                                **audit_base,
+                                "attempt": 2,
+                                "retry": True,
+                                "status": "error",
+                                "error": str(exc),
+                                "prompt": prompt,
+                            }
+                        )
                         # Keep the original failure — don't mask the first error.
-                        pass
 
             root.set_attribute("rca.retry_count", retry_count)
-            record_llm_metrics(duration_s=llm_latency_ms / 1000.0, model="qwen-14b")
+            record_llm_metrics(duration_s=llm_latency_ms / 1000.0, model=target_model)
 
             target = rag.get("target") or {}
             analysis = {

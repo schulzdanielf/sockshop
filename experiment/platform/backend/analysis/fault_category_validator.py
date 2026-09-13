@@ -74,6 +74,18 @@ _CPU_THROTTLE_DELTA_MIN = 0.10
 # kernel reclaim kept up just enough to avoid kill).
 _MEM_SAT_FAULT_MIN = 90.0
 
+# Network issues are usually observable as a rise in request latency, not
+# only as a rise in error_count. A service whose p95 latency rises above
+# 300ms during the fault window is a strong network-latency indicator.
+_LATENCY_FAULT_MIN = 0.30
+_LATENCY_DELTA_MIN = 0.10
+
+# HTTP failures usually show up as a jump in 5xx / request error rate.
+# The threshold is intentionally modest to avoid overfitting to a single
+# run while still catching the kinds of failures seen in the experiment.
+_HTTP_ERROR_RATE_MIN = 0.05
+_HTTP_ERROR_DELTA_MIN = 0.02
+
 # OOM-restart fingerprint — fallback when ``oom_killed`` was not
 # collected (older runs). Signature: the pod restarts repeatedly (OOM
 # kill) while its memory saturation *drops* (each restart resets the
@@ -266,6 +278,51 @@ def _check_pod_failure(
     return True, evidence
 
 
+def _check_network_latency(
+    hotspots: Dict[str, Any],
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """Network-latency faults appear as a sustained latency spike.
+
+    This is intentionally conservative: it only fires when a service's
+    p95/p99 latency rises materially above the baseline and there is no
+    stronger memory/CPU/OOM signal competing for the same run.
+    """
+    latency_rows = _top_rows(hotspots, "latency_p95")
+    latency_rows += _top_rows(hotspots, "latency_p99")
+    if not latency_rows:
+        return False, []
+
+    fault_mean = _max_fault_mean(latency_rows)
+    delta = _max_delta(latency_rows)
+    if fault_mean <= _LATENCY_FAULT_MIN and delta <= _LATENCY_DELTA_MIN:
+        return False, []
+
+    evidence = _summarise_evidence("latency_p95", latency_rows)
+    return True, evidence
+
+
+def _check_http_error(
+    hotspots: Dict[str, Any],
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """HTTP faults are usually the result of elevated error-rate or 5xx.
+
+    We treat a significant increase in per-service error_rate as the
+    discriminative signal for http-error, even when the overall run also
+    shows network latency.
+    """
+    err_rows = _top_rows(hotspots, "error_rate")
+    if not err_rows:
+        return False, []
+
+    fault_mean = _max_fault_mean(err_rows)
+    delta = _max_delta(err_rows)
+    if fault_mean <= _HTTP_ERROR_RATE_MIN and delta <= _HTTP_ERROR_DELTA_MIN:
+        return False, []
+
+    evidence = _summarise_evidence("error_rate", err_rows)
+    return True, evidence
+
+
 # ── Public API ──────────────────────────────────────────────────────────
 def validate_fault_category(
     analysis: Dict[str, Any],
@@ -312,6 +369,8 @@ def validate_fault_category(
         ("memory-exhaustion", _check_memory_exhaustion),
         ("cpu-exhaustion", _check_cpu_exhaustion),
         ("pod-failure", _check_pod_failure),
+        ("network-latency", _check_network_latency),
+        ("http-error", _check_http_error),
     ):
         fired, evidence = checker(hotspots)
         if fired:
@@ -330,6 +389,10 @@ def validate_fault_category(
             "cpu_sat_fault_min": _CPU_SAT_FAULT_MIN,
             "cpu_throttle_delta_min": _CPU_THROTTLE_DELTA_MIN,
             "mem_sat_fault_min": _MEM_SAT_FAULT_MIN,
+            "latency_fault_min": _LATENCY_FAULT_MIN,
+            "latency_delta_min": _LATENCY_DELTA_MIN,
+            "http_error_rate_min": _HTTP_ERROR_RATE_MIN,
+            "http_error_delta_min": _HTTP_ERROR_DELTA_MIN,
             "oom_restart_delta_min": _OOM_RESTART_DELTA_MIN,
             "oom_mem_drop_min": _OOM_MEM_DROP_MIN,
         },

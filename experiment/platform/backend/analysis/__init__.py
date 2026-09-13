@@ -11,6 +11,8 @@ from .embeddings import (
 )
 from .fault_category_validator import validate_fault_category
 from .llm_client import (
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_URL,
     LLMClientError,
     call_llm,
     call_llm_messages,

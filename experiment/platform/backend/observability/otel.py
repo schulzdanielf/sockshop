@@ -21,7 +21,12 @@ Design goals
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from opentelemetry import metrics, trace
@@ -65,6 +70,10 @@ _tracer: Optional[trace.Tracer] = None
 _hist_duration = None
 _hist_tokens = None
 _counter_override = None
+_llm_io_logger: Optional[logging.Logger] = None
+_llm_io_stream_logger: Optional[logging.Logger] = None
+_llm_io_otlp_logger: Optional[logging.Logger] = None
+_llm_io_otlp_handler: Optional[logging.Handler] = None
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -74,6 +83,109 @@ def _truthy(value: Optional[str]) -> bool:
 def capture_content() -> bool:
     """Whether prompt/response text may be attached to spans (opt-in)."""
     return _truthy(os.environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"))
+
+
+def configure_llm_io_audit(path: Optional[str] = None) -> str:
+    """Configure JSONL audit logging for all LLM request/response attempts.
+
+    The default path can be overridden with ``LLM_IO_AUDIT_PATH``.
+    """
+    global _llm_io_logger, _llm_io_stream_logger, _llm_io_otlp_logger
+    log_path = path or os.environ.get("LLM_IO_AUDIT_PATH")
+    if not log_path:
+        log_path = "experiment/platform/data/llm_io_audit.jsonl"
+
+    dst = Path(log_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("rca.llm_io_audit")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    # Idempotent handler setup: replace existing handlers when reconfigured.
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+        try:
+            h.close()
+        except OSError:
+            pass
+
+    handler = logging.FileHandler(dst, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    _llm_io_logger = logger
+
+    stream_logger = logging.getLogger("rca.llm_io_audit.stdout")
+    stream_logger.setLevel(logging.INFO)
+    stream_logger.propagate = False
+    for h in list(stream_logger.handlers):
+        stream_logger.removeHandler(h)
+        try:
+            h.close()
+        except OSError:
+            pass
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    stream_logger.addHandler(stream_handler)
+    _llm_io_stream_logger = stream_logger
+
+    if _llm_io_otlp_handler is not None:
+        otlp_logger = logging.getLogger("rca.llm_io_audit.otlp")
+        otlp_logger.setLevel(logging.INFO)
+        otlp_logger.propagate = False
+        for h in list(otlp_logger.handlers):
+            otlp_logger.removeHandler(h)
+            try:
+                h.close()
+            except OSError:
+                pass
+        otlp_logger.addHandler(_llm_io_otlp_handler)
+        _llm_io_otlp_logger = otlp_logger
+    return str(dst)
+
+
+def _trace_context_ids() -> dict:
+    """Return current trace/span IDs as hex strings when available."""
+    ctx = trace.get_current_span().get_span_context()
+    if not ctx or not ctx.is_valid:
+        return {"trace_id": None, "span_id": None}
+    return {
+        "trace_id": f"{ctx.trace_id:032x}",
+        "span_id": f"{ctx.span_id:016x}",
+    }
+
+
+def record_llm_io(entry: dict) -> None:
+    """Write one JSONL row for an LLM attempt (best-effort).
+
+    Expected fields are flexible; callers can attach request context,
+    response body, parse status, retry marker, and errors.
+    """
+    if _llm_io_logger is None:
+        configure_llm_io_audit()
+    if _llm_io_logger is None:
+        return
+
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "service": _SERVICE_NAME,
+        **_trace_context_ids(),
+        **(entry or {}),
+    }
+    try:
+        line = json.dumps(payload, ensure_ascii=True)
+        _llm_io_logger.info(line)
+        # Stdout emission enables direct Loki/Grafana log queries in
+        # containerized deployments that scrape process output.
+        if _llm_io_stream_logger is not None:
+            _llm_io_stream_logger.info(line)
+        # OTLP bridge enables forwarding logs directly to the collector,
+        # even when this process is not running inside Kubernetes.
+        if _llm_io_otlp_logger is not None:
+            _llm_io_otlp_logger.info(line)
+    except (TypeError, ValueError, OSError):
+        # Observability must never break request execution.
+        return
 
 
 def setup_telemetry(app=None) -> None:
@@ -116,10 +228,15 @@ def setup_telemetry(app=None) -> None:
 
 
 def _install_sdk() -> None:
+    global _llm_io_otlp_handler
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
         OTLPMetricExporter,
     )
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry._logs import get_logger_provider, set_logger_provider
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.resources import Resource
@@ -159,6 +276,18 @@ def _install_sdk() -> None:
         )
         metrics.set_meter_provider(mp)
 
+    # OTLP log export (Python stdlib logging -> OTel logs pipeline -> Loki)
+    if not isinstance(get_logger_provider(), LoggerProvider):
+        lp = LoggerProvider(resource=resource)
+        lp.add_log_record_processor(
+            BatchLogRecordProcessor(OTLPLogExporter(endpoint=base + "v1/logs"))
+        )
+        set_logger_provider(lp)
+    _llm_io_otlp_handler = LoggingHandler(
+        level=logging.INFO,
+        logger_provider=get_logger_provider(),
+    )
+
 
 def _instrument_fastapi(app) -> None:
     try:
@@ -181,12 +310,14 @@ def record_llm_metrics(
     duration_s: Optional[float] = None,
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
-    model: str = "qwen-14b",
+    model: Optional[str] = None,
 ) -> None:
     """Record GenAI client duration + token-usage histograms (best-effort)."""
     if _hist_duration is None:
         return
-    base_attrs = {GenAI.SYSTEM: "qwen", GenAI.REQUEST_MODEL: model}
+    req_model = model or os.environ.get("LLM_MODEL", "qwen-14b")
+    sys_name = "qwen" if "qwen" in req_model.lower() else "llm"
+    base_attrs = {GenAI.SYSTEM: sys_name, GenAI.REQUEST_MODEL: req_model}
     if duration_s is not None:
         _hist_duration.record(duration_s, attributes=base_attrs)
     if input_tokens is not None and input_tokens >= 0:

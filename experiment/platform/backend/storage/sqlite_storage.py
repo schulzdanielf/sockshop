@@ -101,6 +101,7 @@ class SqliteStorage:
                 CREATE TABLE IF NOT EXISTS run_features (
                     run_id TEXT PRIMARY KEY,
                     experiment_id TEXT NOT NULL,
+                    experiment_version INTEGER NOT NULL DEFAULT 1,
                     chaos_type TEXT,
                     verdict TEXT,
                     slo_violation_count INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +178,14 @@ class SqliteStorage:
                     "CREATE INDEX IF NOT EXISTS idx_run_features_is_training "
                     "ON run_features(is_training)"
                 )
+            if "experiment_version" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE run_features ADD COLUMN experiment_version INTEGER NOT NULL DEFAULT 1"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_run_features_experiment_version "
+                "ON run_features(experiment_id, experiment_version)"
+            )
             conn.commit()
 
     def create_experiment(
@@ -477,28 +486,41 @@ class SqliteStorage:
         ]
 
     def upsert_run_features(
-        self, run_id: str, experiment_id: str, features: Dict[str, Any]
+        self,
+        run_id: str,
+        experiment_id: str,
+        features: Dict[str, Any],
+        experiment_version: Optional[int] = None,
     ) -> None:
         """Persist L1 features for a run. Idempotent.
 
         ``features['is_training']`` (bool) controls whether this row is
         eligible as a RAG neighbour. Defaults to True when unset, matching
         legacy behaviour.
+
+        ``experiment_version`` isolates retrieval to the same campaign revision.
         """
         affected = features.get("affected_services", []) or []
         summary_text = features.get("summary_text")
         tags = features.get("tags") or []
         is_training = 1 if features.get("is_training", True) else 0
+        version = (
+            int(experiment_version)
+            if experiment_version is not None
+            else int(features.get("experiment_version", 1))
+        )
         with self._conn() as conn:
             conn.execute(
                 """
                 INSERT INTO run_features (
-                    run_id, experiment_id, chaos_type, verdict,
+                    run_id, experiment_id, experiment_version, chaos_type, verdict,
                     slo_violation_count, recovery_time_seconds,
                     affected_services_json, features_json,
                     summary_text, tags_json, is_training, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
+                    experiment_id=excluded.experiment_id,
+                    experiment_version=excluded.experiment_version,
                     chaos_type=excluded.chaos_type,
                     verdict=excluded.verdict,
                     slo_violation_count=excluded.slo_violation_count,
@@ -512,6 +534,7 @@ class SqliteStorage:
                 (
                     run_id,
                     experiment_id,
+                    version,
                     features.get("chaos_type"),
                     features.get("verdict"),
                     int(len(features.get("slo_violations", []) or [])),
@@ -539,7 +562,7 @@ class SqliteStorage:
         with self._conn() as conn:
             row = conn.execute(
                 """
-                SELECT run_id, experiment_id, chaos_type, verdict,
+                SELECT run_id, experiment_id, experiment_version, chaos_type, verdict,
                        summary_text, tags_json, created_at
                 FROM run_features WHERE run_id = ?
                 """,
@@ -550,6 +573,7 @@ class SqliteStorage:
         return {
             "run_id": row["run_id"],
             "experiment_id": row["experiment_id"],
+            "experiment_version": row["experiment_version"],
             "chaos_type": row["chaos_type"],
             "verdict": row["verdict"],
             "summary_text": row["summary_text"] or "",
@@ -561,6 +585,7 @@ class SqliteStorage:
         self,
         *,
         experiment_id: Optional[str] = None,
+        experiment_version: Optional[int] = None,
         verdict: Optional[str] = None,
         chaos_type: Optional[str] = None,
         is_training_only: bool = True,
@@ -571,12 +596,17 @@ class SqliteStorage:
         ``is_training_only`` (default True) restricts the result set to rows
         marked as training corpus. Callers that genuinely need test rows
         (e.g. evaluation tooling) must opt out explicitly.
+
+        ``experiment_version`` keeps retrieval in the same campaign revision.
         """
         where: List[str] = ["summary_text IS NOT NULL"]
         params: List[Any] = []
         if experiment_id:
             where.append("experiment_id = ?")
             params.append(experiment_id)
+        if experiment_version is not None:
+            where.append("experiment_version = ?")
+            params.append(int(experiment_version))
         if verdict:
             where.append("verdict = ?")
             params.append(verdict)
@@ -590,7 +620,7 @@ class SqliteStorage:
         with self._conn() as conn:
             rows = conn.execute(
                 f"""
-                SELECT run_id, experiment_id, chaos_type, verdict,
+                SELECT run_id, experiment_id, experiment_version, chaos_type, verdict,
                        summary_text, tags_json, created_at
                 FROM run_features
                 {clause}
@@ -603,6 +633,7 @@ class SqliteStorage:
             {
                 "run_id": r["run_id"],
                 "experiment_id": r["experiment_id"],
+                "experiment_version": r["experiment_version"],
                 "chaos_type": r["chaos_type"],
                 "verdict": r["verdict"],
                 "summary_text": r["summary_text"] or "",
@@ -697,6 +728,8 @@ class SqliteStorage:
         *,
         provider: Optional[str] = None,
         chaos_type: Optional[str] = None,
+        experiment_id: Optional[str] = None,
+        experiment_version: Optional[int] = None,
         is_training_only: bool = True,
         limit: int = 1000,
         include_features: bool = False,
@@ -710,6 +743,9 @@ class SqliteStorage:
         ``is_training_only`` (default True) restricts the result set to
         rows flagged as training corpus, preventing test-set self-leakage
         through embedding similarity.
+
+        ``experiment_id`` and ``experiment_version`` narrow candidates to the
+        same campaign revision, avoiding cross-campaign retrieval.
         """
         where: List[str] = ["embedding_blob IS NOT NULL"]
         params: List[Any] = []
@@ -719,6 +755,12 @@ class SqliteStorage:
         if chaos_type:
             where.append("chaos_type = ?")
             params.append(chaos_type)
+        if experiment_id:
+            where.append("experiment_id = ?")
+            params.append(experiment_id)
+        if experiment_version is not None:
+            where.append("experiment_version = ?")
+            params.append(int(experiment_version))
         if is_training_only:
             where.append("is_training = 1")
         clause = "WHERE " + " AND ".join(where)
@@ -727,7 +769,7 @@ class SqliteStorage:
         with self._conn() as conn:
             rows = conn.execute(
                 f"""
-                SELECT run_id, experiment_id, chaos_type, verdict,
+                SELECT run_id, experiment_id, experiment_version, chaos_type, verdict,
                        summary_text, tags_json, created_at,
                        embedding_blob, embedding_provider, embedding_dim{extra_cols}
                 FROM run_features
@@ -742,6 +784,7 @@ class SqliteStorage:
             item: Dict[str, Any] = {
                 "run_id": r["run_id"],
                 "experiment_id": r["experiment_id"],
+                "experiment_version": r["experiment_version"],
                 "chaos_type": r["chaos_type"],
                 "verdict": r["verdict"],
                 "summary_text": r["summary_text"] or "",

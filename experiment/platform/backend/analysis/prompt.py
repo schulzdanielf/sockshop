@@ -83,17 +83,19 @@ SYSTEM_PROMPT = (
     "[n2]. Always cite the runs you used. Identify the most likely "
     "root-cause service (`rca`) and fault category using ONLY the "
     "allowed vocabularies given in the system card; use `unknown` if "
-    "you cannot decide. Answer with EXACTLY ONE JSON object and NOTHING "
-    "ELSE — no code fences, no prose before or after, no second copy."
+    "you cannot decide. You MUST respond with a single JSON object. "
+    "Do NOT include any reasoning, thoughts, or text outside the JSON object "
+    "(NO <think> tags, NO intro text, NO markdown code fences). "
+    "The very first character of your response MUST be '{'."
 )
 
 ANSWER_SCHEMA = (
     "{\n"
+    '  "reasoning": "Step-by-step analysis of telemetry, metrics, and logs...",\n'
     '  "verdict": "resilient|degraded_recoverable|degraded_persistent",\n'
     '  "rca": "<service name from allowed_rca_targets>",\n'
     '  "fault_category": "<value from allowed_fault_categories>",\n'
     '  "confidence": 0.0,\n'
-    '  "reasoning": "short paragraph",\n'
     '  "citations": ["n1", "n2"],\n'
     '  "follow_ups": ["actionable suggestion", "..."]\n'
     "}"

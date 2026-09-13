@@ -102,6 +102,34 @@ def test_conflicting_signals_keep_llm_verdict():
     assert sorted(meta["conflict"]) == ["cpu-exhaustion", "memory-exhaustion"]
 
 
+def test_network_latency_signal_overrides_to_network_latency():
+    features = {
+        "metric_hotspots": _hotspots(
+            latency_p95=[_row("orders", 0.1, 0.9)],
+            error_rate=[_row("orders", 0.0, 0.02)],
+        )
+    }
+    analysis = {"fault_category": "cpu-exhaustion"}
+    out = validate_fault_category(analysis, features)
+
+    assert out["fault_category"] == "network-latency"
+    assert out["validator_meta"]["rule"] == "network-latency"
+
+
+def test_http_error_signal_overrides_to_http_error():
+    features = {
+        "metric_hotspots": _hotspots(
+            error_rate=[_row("orders", 0.0, 0.5)],
+            latency_p95=[_row("orders", 0.1, 0.15)],
+        )
+    }
+    analysis = {"fault_category": "network-latency"}
+    out = validate_fault_category(analysis, features)
+
+    assert out["fault_category"] == "http-error"
+    assert out["validator_meta"]["rule"] == "http-error"
+
+
 def test_validator_is_idempotent():
     features = {
         "metric_hotspots": _hotspots(

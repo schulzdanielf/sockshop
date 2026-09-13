@@ -64,6 +64,32 @@ def test_pod_failure_anchor_uses_restart_counter():
     assert out["rca"] == "user"
 
 
+def test_network_latency_anchor_uses_latency_metric():
+    features = {
+        "metric_hotspots": _hotspots(
+            latency_p95=[_row("shipping", 0.3), _row("orders", 0.05)],
+        )
+    }
+    analysis = {"fault_category": "network-latency", "rca": "orders"}
+    out = localize_service(analysis, features)
+
+    assert out["rca"] == "shipping"
+    assert out["validator_meta"]["localizer"]["fired"] is True
+
+
+def test_http_error_anchor_uses_error_rate_metric():
+    features = {
+        "metric_hotspots": _hotspots(
+            error_rate=[_row("payment", 0.4), _row("orders", 0.05)],
+        )
+    }
+    analysis = {"fault_category": "http-error", "rca": "orders"}
+    out = localize_service(analysis, features)
+
+    assert out["rca"] == "payment"
+    assert out["validator_meta"]["localizer"]["fired"] is True
+
+
 def test_unknown_category_does_not_override():
     features = {
         "metric_hotspots": _hotspots(

@@ -233,10 +233,48 @@ def _anchor_pod_failure(
     return None
 
 
+def _anchor_network_latency(
+    hotspots: Dict[str, Any],
+) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
+    """Network-latency faults are anchored by the service with the largest
+    latency increase during the fault window.
+    """
+    rows = _top_rows(hotspots, "latency_p95") + _top_rows(hotspots, "latency_p99")
+    if not rows:
+        return None
+    ranked = _rank_by(rows, "delta_abs", use_abs=True)
+    pick = _pick_dominant(ranked, floor=0.10)
+    if pick is not None:
+        label, score, row = pick
+        return label, [_evidence("latency_p95", score, row)]
+    return None
+
+
+def _anchor_http_error(
+    hotspots: Dict[str, Any],
+) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
+    """HTTP failures are anchored by the service with the largest jump in
+    error_rate, i.e. the service producing the dominant 5xx / request error
+    signal.
+    """
+    rows = _top_rows(hotspots, "error_rate")
+    if not rows:
+        return None
+    ranked = _rank_by(rows, "delta_abs", use_abs=True)
+    pick = _pick_dominant(ranked, floor=0.02)
+    if pick is not None:
+        label, score, row = pick
+        return label, [_evidence("error_rate", score, row)]
+    return None
+
+
 _ANCHORS = {
     "memory-exhaustion": _anchor_memory,
     "cpu-exhaustion": _anchor_cpu,
     "pod-failure": _anchor_pod_failure,
+    "network-latency": _anchor_network_latency,
+    "network-loss": _anchor_network_latency,
+    "http-error": _anchor_http_error,
 }
 
 
@@ -287,7 +325,7 @@ def localize_service(
     result = anchor_fn(hotspots)
     if result is None:
         decision["reason"] = (
-            f"no dominant anchor signal for {fault_cat!r} " "(below threshold or tied)"
+            f"no anchor for {fault_cat!r}: no dominant signal " "(below threshold or tied)"
         )
         parent_meta["localizer"] = decision
         return analysis
