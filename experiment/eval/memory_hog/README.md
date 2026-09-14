@@ -66,6 +66,45 @@ workflow template name must already exist in Litmus.
 Tweaks to memory consumption, chaos duration, or the service list go in
 `config.yaml`; just re-run `generate_chaos_manifests.py` afterwards.
 
+## Catálogo de falhas estendido (network / dns / io / http / container)
+
+Além de `memory-hog`, `cpu-hog` e `pod-delete`, o gerador suporta seis falhas
+adicionais. Os baselines do serviço `catalogue` ficam em
+`deploy/kubernetes/manifests-chaos/` e o catálogo completo (parâmetros,
+`fault_category` e ressalvas) está documentado em
+[`deploy/kubernetes/manifests-chaos/README.md`](../../../deploy/kubernetes/manifests-chaos/README.md).
+
+| `chaos_type` | ChaosExperiment | `fault_category` | Na matriz? | Status docker-desktop/WSL2 |
+|---|---|---|---|---|
+| `network-latency` | `pod-network-latency` | `network-latency` | ✅ sim | ✅ roda (requer `sch_netem`) |
+| `network-loss` | `pod-network-loss` | `network-loss` | ✅ sim | ✅ roda (requer `sch_netem`) |
+| `http-status-code` | `pod-http-status-code` | `http-error` | ✅ sim | ✅ roda |
+| `container-kill` | `container-kill` | `pod-failure` | ✅ sim | ✅ roda |
+| `io-stress` | `pod-io-stress` | `io-exhaustion` | ❌ não | ❌ não roda (overlayfs/O_DIRECT) |
+| `dns-error` | `pod-dns-error` | `dns-failure` | ❌ não | ❌ não roda (dns_interceptor) |
+
+As **4 falhas marcadas ✅** já estão nas listas `train_experiments` /
+`test_experiments` (cada tipo aparece em treino e em teste, em serviços
+diferentes). `io-stress` e `dns-error` continuam declaradas em `chaos_types`
+mas **fora da matriz**, porque não rodam neste cluster (ver abaixo). Para
+habilitá-las em outro ambiente, adicione células `{service, chaos_type}` nas
+duas listas e re-rode `generate_chaos_manifests.py`.
+
+> ⚠️ **Falhas de rede:** rode `make chaos-enable-netem` (`sudo modprobe
+> sch_netem`) **uma vez por boot** antes de qualquer run `network-*`. Sem isso
+> elas abortam com `Specified qdisc kind is unknown`. O carregamento não é
+> persistente no WSL2.
+>
+> ❌ **Não rodam aqui:** `io-stress` falha porque `stress-ng --hdd` usa
+> `O_DIRECT` (sem suporte no overlayfs do WSL2); `dns-error` falha porque o
+> `dns_interceptor` sai com `exit status 1` no netns do alvo (mesmo com os
+> módulos NFQUEUE carregados). Ambas devem funcionar em nós de cluster reais.
+>
+> ⚠️ **RCA:** as categorias novas já estão no `allowed_fault_categories` do
+> system card, mas o validador/localizador só têm regras dedicadas para
+> `memory/cpu/pod-failure`. Veja a seção "Integração com o pipeline de RCA" no
+> README dos manifestos.
+
 ## Run the experiment
 
 End-to-end (train → test → eval):

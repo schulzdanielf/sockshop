@@ -75,6 +75,7 @@ _prompt = PromptTemplate.from_template(_REACT_TEMPLATE_STR)
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse_action(text: str) -> tuple[Optional[str], dict]:
     """Extract Action and Action Input from model output.
 
@@ -86,7 +87,7 @@ def _parse_action(text: str) -> tuple[Optional[str], dict]:
         return None, {}
 
     tool_name = action_pos.group(1).strip()
-    after_action = text[action_pos.start():]
+    after_action = text[action_pos.start() :]
 
     input_match = re.search(r"Action Input:\s*(\{.*?\})", after_action, re.DOTALL)
     tool_args: dict = {}
@@ -107,7 +108,9 @@ def _parse_final_answer(text: str) -> Optional[str]:
     """
     if re.search(r"\bAction:\s*\S+", text):
         return None
-    match = re.search(r"Final Answer:\s*(.+?)(?=\nThought:|\nAction:|\Z)", text, re.DOTALL)
+    match = re.search(
+        r"Final Answer:\s*(.+?)(?=\nThought:|\nAction:|\Z)", text, re.DOTALL
+    )
     return match.group(1).strip() if match else None
 
 
@@ -125,11 +128,16 @@ def _truncate_observation(observation: str, max_chars: int = 2000) -> str:
         obj = json.loads(observation)
         content = obj.get("content", []) if isinstance(obj, dict) else []
         if content and isinstance(content, list):
-            text_val = content[0].get("text", "") if isinstance(content[0], dict) else ""
+            text_val = (
+                content[0].get("text", "") if isinstance(content[0], dict) else ""
+            )
             if text_val:
                 if len(text_val) <= max_chars:
                     return text_val
-                return text_val[:max_chars] + f"... [truncado: {len(text_val)} chars total]"
+                return (
+                    text_val[:max_chars]
+                    + f"... [truncado: {len(text_val)} chars total]"
+                )
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -146,6 +154,7 @@ def _extract_text(raw) -> str:
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
+
 
 class ReActAgent:
     """ReAct agent loop compatible with plain BaseLLM.
@@ -189,7 +198,9 @@ class ReActAgent:
 
             # Pass stop sequences so the model halts before writing Observation
             # max_new_tokens=1024 to ensure Qwen3 has budget beyond <think> blocks
-            raw = await self.llm.ainvoke(prompt, stop=_STOP_SEQUENCES, max_new_tokens=1024)
+            raw = await self.llm.ainvoke(
+                prompt, stop=_STOP_SEQUENCES, max_new_tokens=1024
+            )
             response = _extract_text(raw)
 
             if verbose:
@@ -207,7 +218,9 @@ class ReActAgent:
                 return response.strip()
 
             if verbose:
-                print(f"\n[Tool] {tool_name}({json.dumps(tool_args, ensure_ascii=False)})")
+                print(
+                    f"\n[Tool] {tool_name}({json.dumps(tool_args, ensure_ascii=False)})"
+                )
 
             # 3. Execute the real tool
             observation = await self._call_tool(tool_name, tool_args)
@@ -218,8 +231,12 @@ class ReActAgent:
                 print(f"[Observation] {preview}{suffix}")
 
             # 4. Append to scratchpad with truncated observation
-            obs_scratchpad = _truncate_observation(observation, self.max_observation_chars)
-            thought_match = re.search(r"Thought:(.*?)(?=\nAction:|\Z)", response, re.DOTALL)
+            obs_scratchpad = _truncate_observation(
+                observation, self.max_observation_chars
+            )
+            thought_match = re.search(
+                r"Thought:(.*?)(?=\nAction:|\Z)", response, re.DOTALL
+            )
             thought_text = thought_match.group(1).strip() if thought_match else ""
             scratchpad += (
                 f"Thought: {thought_text}\n"

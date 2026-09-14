@@ -1,3 +1,10 @@
+"""Tempo trace provider backed by the MCP server.
+
+``MCPTempoTracesPlugin`` implements :class:`ports.TraceProviderPort`,
+fetching distributed traces from Tempo via the MCP observability server
+and reducing them to per-service latency/error summaries.
+"""
+
 from __future__ import annotations
 
 import statistics
@@ -9,7 +16,9 @@ from .mcp_client import MCPToolClient
 class MCPTempoTracesPlugin:
     def validate(self, config: Dict[str, Any]) -> None:
         if config.get("provider") not in {"mcp-tempo", "tempo"}:
-            raise ValueError("observability.traces.provider must be 'mcp-tempo' or 'tempo'")
+            raise ValueError(
+                "observability.traces.provider must be 'mcp-tempo' or 'tempo'"
+            )
         if not config.get("mcp_sse_url"):
             raise ValueError("observability.traces.mcp_sse_url is required")
 
@@ -44,7 +53,9 @@ class MCPTempoTracesPlugin:
             trace_id = item.get("traceID") or item.get("traceId")
             if not trace_id:
                 continue
-            features = client.call_tool_json("tempo_analyze_trace", {"trace_id": trace_id})
+            features = client.call_tool_json(
+                "tempo_analyze_trace", {"trace_id": trace_id}
+            )
             summary = client.call_tool_json(
                 "tempo_summarize_trace",
                 {
@@ -55,15 +66,17 @@ class MCPTempoTracesPlugin:
             )
             # Preserve search-level metadata so downstream analyses
             # (propagation graph, cascade order) can sort by trace start.
-            analyzed.append({
-                "trace_id": trace_id,
-                "root_service": item.get("rootServiceName"),
-                "root_trace_name": item.get("rootTraceName"),
-                "start_time_unix_nano": item.get("startTimeUnixNano"),
-                "duration_ms": item.get("durationMs"),
-                "features": features,
-                "summary": summary,
-            })
+            analyzed.append(
+                {
+                    "trace_id": trace_id,
+                    "root_service": item.get("rootServiceName"),
+                    "root_trace_name": item.get("rootTraceName"),
+                    "start_time_unix_nano": item.get("startTimeUnixNano"),
+                    "duration_ms": item.get("durationMs"),
+                    "features": features,
+                    "summary": summary,
+                }
+            )
 
         return {
             "window_start": start_iso,
@@ -147,7 +160,11 @@ class MCPTempoTracesPlugin:
                 dur = float(fs.get("max_duration_ms", 0) or 0)
                 if dur > b["max_duration_ms"]:
                     b["max_duration_ms"] = dur
-                if trace_id and trace_id not in b["trace_ids"] and len(b["trace_ids"]) < 3:
+                if (
+                    trace_id
+                    and trace_id not in b["trace_ids"]
+                    and len(b["trace_ids"]) < 3
+                ):
                     b["trace_ids"].append(trace_id)
                 if key[2]:
                     affected[key[2]] = affected.get(key[2], 0) + 1
@@ -285,14 +302,18 @@ class MCPTempoTracesPlugin:
 
         cascade_order: List[Dict[str, Any]] = []
         if first_error_ts:
-            base = earliest_trace_ts if earliest_trace_ts is not None else min(
-                first_error_ts.values()
+            base = (
+                earliest_trace_ts
+                if earliest_trace_ts is not None
+                else min(first_error_ts.values())
             )
             for svc, ts in sorted(first_error_ts.items(), key=lambda kv: kv[1]):
-                cascade_order.append({
-                    "service": svc,
-                    "t_offset_s": round(ts - base, 3),
-                })
+                cascade_order.append(
+                    {
+                        "service": svc,
+                        "t_offset_s": round(ts - base, 3),
+                    }
+                )
 
         edges = sorted(
             edge_buckets.values(),

@@ -1,3 +1,12 @@
+"""Core domain model for the experiment platform.
+
+Framework-agnostic dataclasses and enums (``ExperimentDefinition``,
+``ExperimentVersion``, ``RunRecord``, ``DomainEvent``, ``RunStatus``) that
+represent the platform's business state. This module has no I/O and no
+web/persistence dependencies, keeping the domain at the centre of the
+hexagonal architecture.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

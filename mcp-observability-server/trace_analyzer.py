@@ -6,10 +6,10 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _ns_to_ms(value: Any) -> float:
     """Convert nanoseconds (int or string) to milliseconds."""
@@ -41,8 +41,17 @@ def _get_attr(span: Dict, key: str) -> Optional[str]:
 # Semantic span classification
 # ---------------------------------------------------------------------------
 
-_OUTBOUND_ATTR_KEYS = {"http.url", "url.full", "http.target", "peer.service", "rpc.service",
-                        "net.peer.name", "net.peer.ip", "server.address"}
+_OUTBOUND_ATTR_KEYS = {
+    "http.url",
+    "url.full",
+    "http.target",
+    "peer.service",
+    "rpc.service",
+    "net.peer.name",
+    "net.peer.ip",
+    "server.address",
+}
+
 
 def _classify_span(span: Dict) -> str:
     """Return a semantic category string for a span."""
@@ -58,8 +67,8 @@ def _classify_span(span: Dict) -> str:
     if attr_keys & {"rpc.service", "rpc.method"}:
         return "RPC_CALL"
     if attr_keys & {"http.url", "url.full"} or (
-        any(m in name for m in ("get ", "post ", "put ", "delete ", "patch ")) and
-        attr_keys & {"http.status_code", "http.method"}
+        any(m in name for m in ("get ", "post ", "put ", "delete ", "patch "))
+        and attr_keys & {"http.status_code", "http.method"}
     ):
         return "OUTBOUND_HTTP"
     if attr_keys & _OUTBOUND_ATTR_KEYS:
@@ -82,8 +91,12 @@ def _extract_remote_endpoint(span: Dict) -> Optional[str]:
             m = re.match(r"https?://([^/]+)(/[^?]*)?", val)
             return m.group(1) + (m.group(2) or "") if m else val
     # Host
-    host = (_get_attr(span, "http.host") or _get_attr(span, "server.address")
-            or _get_attr(span, "net.peer.name") or _get_attr(span, "net.peer.ip"))
+    host = (
+        _get_attr(span, "http.host")
+        or _get_attr(span, "server.address")
+        or _get_attr(span, "net.peer.name")
+        or _get_attr(span, "net.peer.ip")
+    )
     port = _get_attr(span, "server.port") or _get_attr(span, "net.peer.port")
     if host:
         return f"{host}:{port}" if port else host
@@ -129,7 +142,9 @@ def _extract_failure_signatures(error_spans: List[Dict]) -> List[Dict]:
         sig_type = _classify_failure(msg)
         endpoint = _get_attr(span, "peer.service") or _get_attr(span, "net.peer.ip")
         if not endpoint:
-            endpoint = _endpoint_from_message(msg) or _extract_remote_endpoint(span) or ""
+            endpoint = (
+                _endpoint_from_message(msg) or _extract_remote_endpoint(span) or ""
+            )
 
         key = (sig_type, endpoint)
         if key not in bucket:
@@ -148,14 +163,16 @@ def _extract_failure_signatures(error_spans: List[Dict]) -> List[Dict]:
 
     result = []
     for entry in bucket.values():
-        result.append({
-            "signature": entry["signature"],
-            "endpoint": entry["endpoint"],
-            "affected_service": entry["affected_service"],
-            "operations": sorted(entry["operations"]),
-            "occurrence_count": entry["count"],
-            "max_duration_ms": round(max(entry["durations_ms"]), 2),
-        })
+        result.append(
+            {
+                "signature": entry["signature"],
+                "endpoint": entry["endpoint"],
+                "affected_service": entry["affected_service"],
+                "operations": sorted(entry["operations"]),
+                "occurrence_count": entry["count"],
+                "max_duration_ms": round(max(entry["durations_ms"]), 2),
+            }
+        )
     result.sort(key=lambda x: x["max_duration_ms"], reverse=True)
     return result
 
@@ -163,6 +180,7 @@ def _extract_failure_signatures(error_spans: List[Dict]) -> List[Dict]:
 # ---------------------------------------------------------------------------
 # Fanout pattern detection
 # ---------------------------------------------------------------------------
+
 
 def _detect_fanout_patterns(
     spans: List[Dict],
@@ -176,13 +194,15 @@ def _detect_fanout_patterns(
     name_counter = Counter((s["service"], s["name"]) for s in spans)
     for (svc, name), count in name_counter.most_common():
         if count >= 4:
-            patterns.append({
-                "pattern": "N+1_REPEATED_CALL",
-                "service": svc,
-                "operation": name,
-                "count": count,
-                "description": f"{count}x repeated '{svc}.{name}'",
-            })
+            patterns.append(
+                {
+                    "pattern": "N+1_REPEATED_CALL",
+                    "service": svc,
+                    "operation": name,
+                    "count": count,
+                    "description": f"{count}x repeated '{svc}.{name}'",
+                }
+            )
 
     # Retry storm: multiple error spans with the same name
     error_name_counter = Counter(
@@ -190,26 +210,30 @@ def _detect_fanout_patterns(
     )
     for (svc, name), count in error_name_counter.most_common():
         if count > 1:
-            patterns.append({
-                "pattern": "RETRY_STORM",
-                "service": svc,
-                "operation": name,
-                "count": count,
-                "description": f"{count}x failed call to '{svc}.{name}'",
-            })
+            patterns.append(
+                {
+                    "pattern": "RETRY_STORM",
+                    "service": svc,
+                    "operation": name,
+                    "count": count,
+                    "description": f"{count}x failed call to '{svc}.{name}'",
+                }
+            )
 
     # Excessive fanout: single span with many direct children
     for sid, kids in children.items():
         if sid not in span_map or len(kids) <= 5:
             continue
         span = span_map[sid]
-        patterns.append({
-            "pattern": "EXCESSIVE_FANOUT",
-            "service": span["service"],
-            "operation": span["name"],
-            "count": len(kids),
-            "description": f"{len(kids)} direct children from '{span['service']}.{span['name']}'",
-        })
+        patterns.append(
+            {
+                "pattern": "EXCESSIVE_FANOUT",
+                "service": span["service"],
+                "operation": span["name"],
+                "count": len(kids),
+                "description": f"{len(kids)} direct children from '{span['service']}.{span['name']}'",
+            }
+        )
 
     # Downstream amplification: error in parent propagates to all children
     for sid, kids in children.items():
@@ -217,15 +241,19 @@ def _detect_fanout_patterns(
             continue
         parent = span_map[sid]
         if parent["is_error"] and len(kids) >= 3:
-            child_errors = sum(1 for cid in kids if span_map.get(cid, {}).get("is_error"))
+            child_errors = sum(
+                1 for cid in kids if span_map.get(cid, {}).get("is_error")
+            )
             if child_errors >= 2:
-                patterns.append({
-                    "pattern": "ERROR_PROPAGATION",
-                    "service": parent["service"],
-                    "operation": parent["name"],
-                    "count": child_errors,
-                    "description": f"Error in '{parent['name']}' propagated to {child_errors} children",
-                })
+                patterns.append(
+                    {
+                        "pattern": "ERROR_PROPAGATION",
+                        "service": parent["service"],
+                        "operation": parent["name"],
+                        "count": child_errors,
+                        "description": f"Error in '{parent['name']}' propagated to {child_errors} children",
+                    }
+                )
 
     patterns.sort(key=lambda x: x["count"], reverse=True)
     return patterns[:8]
@@ -234,6 +262,7 @@ def _detect_fanout_patterns(
 # ---------------------------------------------------------------------------
 # RCA hypothesis generation
 # ---------------------------------------------------------------------------
+
 
 def _generate_rca_hypotheses(
     spans: List[Dict],
@@ -248,83 +277,99 @@ def _generate_rca_hypotheses(
         ep = sig.get("endpoint") or "unknown endpoint"
 
         if sig["signature"] == "NETWORK_CONNECTION_REFUSED":
-            hypotheses.append({
-                "hypothesis": f"Downstream dependency unavailable at {ep}",
-                "confidence": "HIGH",
-                "evidence": [
-                    f"ECONNREFUSED at {ep}",
-                    f"Affected service: {sig['affected_service']}",
-                    f"Operations: {', '.join(sig['operations'])}",
-                    f"Max blocked duration: {sig['max_duration_ms']}ms",
-                ],
-                "suggested_actions": [
-                    f"Verify the service at {ep} is running (kubectl get pods/endpoints)",
-                    "Check Kubernetes Service/EndpointSlice for this cluster IP",
-                    "Inspect network policies between services",
-                    "Add circuit breaker / fallback to prevent cascading failure",
-                ],
-            })
+            hypotheses.append(
+                {
+                    "hypothesis": f"Downstream dependency unavailable at {ep}",
+                    "confidence": "HIGH",
+                    "evidence": [
+                        f"ECONNREFUSED at {ep}",
+                        f"Affected service: {sig['affected_service']}",
+                        f"Operations: {', '.join(sig['operations'])}",
+                        f"Max blocked duration: {sig['max_duration_ms']}ms",
+                    ],
+                    "suggested_actions": [
+                        f"Verify the service at {ep} is running (kubectl get pods/endpoints)",
+                        "Check Kubernetes Service/EndpointSlice for this cluster IP",
+                        "Inspect network policies between services",
+                        "Add circuit breaker / fallback to prevent cascading failure",
+                    ],
+                }
+            )
 
         elif sig["signature"] == "NETWORK_TIMEOUT":
-            hypotheses.append({
-                "hypothesis": f"Downstream dependency slow or overloaded ({ep})",
-                "confidence": "MEDIUM",
-                "evidence": [f"Timeout in {sig['affected_service']}", f"Max latency: {sig['max_duration_ms']}ms"],
-                "suggested_actions": [
-                    "Review timeout thresholds and add adaptive retries",
-                    "Check resource utilization (CPU/memory) of the dependency",
-                    "Consider async/non-blocking pattern",
-                ],
-            })
+            hypotheses.append(
+                {
+                    "hypothesis": f"Downstream dependency slow or overloaded ({ep})",
+                    "confidence": "MEDIUM",
+                    "evidence": [
+                        f"Timeout in {sig['affected_service']}",
+                        f"Max latency: {sig['max_duration_ms']}ms",
+                    ],
+                    "suggested_actions": [
+                        "Review timeout thresholds and add adaptive retries",
+                        "Check resource utilization (CPU/memory) of the dependency",
+                        "Consider async/non-blocking pattern",
+                    ],
+                }
+            )
 
         elif sig["signature"] == "DNS_RESOLUTION_FAILURE":
-            hypotheses.append({
-                "hypothesis": "DNS resolution failure for a dependency",
-                "confidence": "HIGH",
-                "evidence": [f"DNS error in {sig['affected_service']}"],
-                "suggested_actions": [
-                    "Verify Kubernetes Service name matches the DNS hostname",
-                    "Check CoreDNS logs: kubectl logs -n kube-system -l k8s-app=kube-dns",
-                ],
-            })
+            hypotheses.append(
+                {
+                    "hypothesis": "DNS resolution failure for a dependency",
+                    "confidence": "HIGH",
+                    "evidence": [f"DNS error in {sig['affected_service']}"],
+                    "suggested_actions": [
+                        "Verify Kubernetes Service name matches the DNS hostname",
+                        "Check CoreDNS logs: kubectl logs -n kube-system -l k8s-app=kube-dns",
+                    ],
+                }
+            )
 
     # tcp.connect dominates exclusive latency
     tcp_error_spans = [
-        s for s in spans
+        s
+        for s in spans
         if "tcp.connect" in s.get("name", "").lower()
         and s.get("exclusive_duration_ms", 0) > trace_duration_ms * 0.4
     ]
     if tcp_error_spans:
         worst = max(tcp_error_spans, key=lambda s: s.get("exclusive_duration_ms", 0))
         pct = round(worst["exclusive_duration_ms"] / trace_duration_ms * 100)
-        hypotheses.append({
-            "hypothesis": f"Connection establishment accounts for {pct}% of trace latency",
-            "confidence": "HIGH",
-            "evidence": [
-                f"{worst['service']}.{worst['name']} exclusive latency: {worst['exclusive_duration_ms']}ms",
-                f"{pct}% of total {trace_duration_ms}ms trace duration",
-                "TCP connect is on the critical path",
-            ],
-            "suggested_actions": [
-                "Enable HTTP keep-alive / connection pooling in the client",
-                "Verify the target IP resolves to the correct service",
-                "Check if the dependency is reachable from this pod's network namespace",
-            ],
-        })
+        hypotheses.append(
+            {
+                "hypothesis": f"Connection establishment accounts for {pct}% of trace latency",
+                "confidence": "HIGH",
+                "evidence": [
+                    f"{worst['service']}.{worst['name']} exclusive latency: {worst['exclusive_duration_ms']}ms",
+                    f"{pct}% of total {trace_duration_ms}ms trace duration",
+                    "TCP connect is on the critical path",
+                ],
+                "suggested_actions": [
+                    "Enable HTTP keep-alive / connection pooling in the client",
+                    "Verify the target IP resolves to the correct service",
+                    "Check if the dependency is reachable from this pod's network namespace",
+                ],
+            }
+        )
 
     # All errors in a single service
     error_services = [s["service"] for s in spans if s["is_error"]]
     if error_services and len(set(error_services)) == 1:
         svc = error_services[0]
-        hypotheses.append({
-            "hypothesis": f"Error isolated to service '{svc}' — upstream services are healthy",
-            "confidence": "MEDIUM",
-            "evidence": [f"All {len(error_services)} error span(s) belong to {svc}"],
-            "suggested_actions": [
-                f"Focus investigation on {svc} outbound calls and configuration",
-                f"Review {svc} deployment environment variables and secrets",
-            ],
-        })
+        hypotheses.append(
+            {
+                "hypothesis": f"Error isolated to service '{svc}' — upstream services are healthy",
+                "confidence": "MEDIUM",
+                "evidence": [
+                    f"All {len(error_services)} error span(s) belong to {svc}"
+                ],
+                "suggested_actions": [
+                    f"Focus investigation on {svc} outbound calls and configuration",
+                    f"Review {svc} deployment environment variables and secrets",
+                ],
+            }
+        )
 
     return hypotheses
 
@@ -332,6 +377,7 @@ def _generate_rca_hypotheses(
 # ---------------------------------------------------------------------------
 # Exclusive latency computation
 # ---------------------------------------------------------------------------
+
 
 def _compute_exclusive_latency(
     spans: List[Dict],
@@ -346,7 +392,9 @@ def _compute_exclusive_latency(
             for cid in children.get(sid, [])
             if cid in span_map
         )
-        span["exclusive_duration_ms"] = round(max(0.0, span["duration_ms"] - kids_total), 2)
+        span["exclusive_duration_ms"] = round(
+            max(0.0, span["duration_ms"] - kids_total), 2
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +402,7 @@ def _compute_exclusive_latency(
 # ---------------------------------------------------------------------------
 
 _INTERNAL_CATEGORIES = {"MIDDLEWARE", "REQUEST_HANDLER", "INTERNAL"}
+
 
 def _compress_critical_path(
     critical_path_ids: List[str],
@@ -368,13 +417,15 @@ def _compress_critical_path(
             return
         total = sum(s["exclusive_duration_ms"] for s in group)
         if total > 0.5:  # only emit if they collectively consume measurable time
-            compressed.append({
-                "service": group[0]["service"],
-                "name": f"[{len(group)} internal spans]",
-                "duration_ms": round(sum(s["duration_ms"] for s in group), 2),
-                "exclusive_duration_ms": round(total, 2),
-                "semantic": "INTERNAL_GROUP",
-            })
+            compressed.append(
+                {
+                    "service": group[0]["service"],
+                    "name": f"[{len(group)} internal spans]",
+                    "duration_ms": round(sum(s["duration_ms"] for s in group), 2),
+                    "exclusive_duration_ms": round(total, 2),
+                    "semantic": "INTERNAL_GROUP",
+                }
+            )
 
     for sid in critical_path_ids:
         if sid not in span_map:
@@ -400,14 +451,16 @@ def _compress_critical_path(
             else:
                 semantic_name = span["name"]
 
-            compressed.append({
-                "service": span["service"],
-                "name": semantic_name,
-                "duration_ms": span["duration_ms"],
-                "exclusive_duration_ms": span["exclusive_duration_ms"],
-                "semantic": cat,
-                "is_error": span["is_error"],
-            })
+            compressed.append(
+                {
+                    "service": span["service"],
+                    "name": semantic_name,
+                    "duration_ms": span["duration_ms"],
+                    "exclusive_duration_ms": span["exclusive_duration_ms"],
+                    "semantic": cat,
+                    "is_error": span["is_error"],
+                }
+            )
 
     _flush_internal(internal_group)
     return compressed
@@ -416,6 +469,7 @@ def _compress_critical_path(
 # ---------------------------------------------------------------------------
 # Span parser
 # ---------------------------------------------------------------------------
+
 
 def _parse_spans(trace_data: Dict) -> List[Dict]:
     """Flatten all spans from OTLP trace payload and enrich with service_name + duration_ms."""
@@ -437,7 +491,10 @@ def _parse_spans(trace_data: Dict) -> List[Dict]:
                 status = span.get("status", {})
                 status_code = status.get("code", 0)
                 # OTLP JSON encodes the status code as int (2) or string ("STATUS_CODE_ERROR")
-                is_error = status_code in (2, "STATUS_CODE_ERROR", "error") or str(status_code) == "2"
+                is_error = (
+                    status_code in (2, "STATUS_CODE_ERROR", "error")
+                    or str(status_code) == "2"
+                )
                 # Fallback: HTTP spans with 4xx/5xx status codes that don't set OTLP status
                 if not is_error:
                     for attr in span.get("attributes", []):
@@ -449,18 +506,20 @@ def _parse_spans(trace_data: Dict) -> List[Dict]:
                                 pass
                             break
 
-                spans.append({
-                    "span_id": span.get("spanId", ""),
-                    "parent_span_id": span.get("parentSpanId", ""),
-                    "name": span.get("name", ""),
-                    "service": service_name,
-                    "start_ns": start_ns,
-                    "end_ns": end_ns,
-                    "duration_ms": round(duration_ms, 2),
-                    "is_error": is_error,
-                    "status_message": span.get("status", {}).get("message", ""),
-                    "attributes": span.get("attributes", []),
-                })
+                spans.append(
+                    {
+                        "span_id": span.get("spanId", ""),
+                        "parent_span_id": span.get("parentSpanId", ""),
+                        "name": span.get("name", ""),
+                        "service": service_name,
+                        "start_ns": start_ns,
+                        "end_ns": end_ns,
+                        "duration_ms": round(duration_ms, 2),
+                        "is_error": is_error,
+                        "status_message": span.get("status", {}).get("message", ""),
+                        "attributes": span.get("attributes", []),
+                    }
+                )
 
     return spans
 
@@ -506,6 +565,7 @@ def _find_critical_path(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def extract_features(trace_data: Dict) -> Dict:
     """Extract all observability features from an OTLP trace payload.
@@ -558,7 +618,9 @@ def extract_features(trace_data: Dict) -> Dict:
     critical_path = _compress_critical_path(critical_path_ids, span_map)
 
     # ---- hot spans by exclusive latency (real bottlenecks) -------------
-    sorted_exclusive = sorted(spans, key=lambda s: s["exclusive_duration_ms"], reverse=True)
+    sorted_exclusive = sorted(
+        spans, key=lambda s: s["exclusive_duration_ms"], reverse=True
+    )
     hot_spans = [
         {
             "service": s["service"],
@@ -646,15 +708,17 @@ def extract_features(trace_data: Dict) -> Dict:
     for svc, svc_span_list in sorted(svc_spans.items()):
         incl = [s["duration_ms"] for s in svc_span_list]
         excl = [s["exclusive_duration_ms"] for s in svc_span_list]
-        service_latency.append({
-            "service": svc,
-            "span_count": len(incl),
-            "total_exclusive_ms": round(sum(excl), 2),
-            "total_inclusive_ms": round(sum(incl), 2),
-            "avg_ms": round(sum(excl) / len(excl), 2),
-            "max_exclusive_ms": round(max(excl), 2),
-            "max_inclusive_ms": round(max(incl), 2),
-        })
+        service_latency.append(
+            {
+                "service": svc,
+                "span_count": len(incl),
+                "total_exclusive_ms": round(sum(excl), 2),
+                "total_inclusive_ms": round(sum(incl), 2),
+                "avg_ms": round(sum(excl) / len(excl), 2),
+                "max_exclusive_ms": round(max(excl), 2),
+                "max_inclusive_ms": round(max(incl), 2),
+            }
+        )
     service_latency.sort(key=lambda x: x["total_exclusive_ms"], reverse=True)
 
     # ---- RCA hypotheses ------------------------------------------------

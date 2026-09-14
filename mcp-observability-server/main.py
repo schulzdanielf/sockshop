@@ -1,14 +1,21 @@
 """MCP Server for observability - Prometheus, Loki, Metrics and KPIs."""
 import json
-from typing import Any
+
+from config import settings
 from fastmcp import FastMCP
-from prometheus_client import PrometheusClient
+from investigators import check_oom_kills as _inv_check_oom_kills
+from investigators import check_pod_restarts as _inv_check_pod_restarts
+from investigators import check_http_error_rate_top as _inv_http_error_rate_top
+from investigators import check_request_latency_top as _inv_request_latency_top
+from investigators import get_cpu_saturation_top as _inv_cpu_top
+from investigators import get_memory_saturation_top as _inv_memory_top
 from loki_client import LokiClient
+from prometheus_client import PrometheusClient
 from tempo_client import TempoClient
 from trace_analyzer import extract_features
 from trace_summarizer import summarize_trace
+
 from metrics import get_golden_metrics_dict, get_kpis_dict
-from config import settings
 
 # Initialize FastMCP server
 mcp = FastMCP("observability-server")
@@ -31,13 +38,14 @@ def init_clients():
 # PROMETHEUS TOOLS
 # ============================================================================
 
+
 @mcp.tool()
 def prometheus_instant_query(query: str) -> str:
     """Execute an instant query against Prometheus.
-    
+
     Args:
         query: PromQL query string (e.g., 'up{job="prometheus"}')
-    
+
     Returns:
         JSON string with query results
     """
@@ -49,19 +57,16 @@ def prometheus_instant_query(query: str) -> str:
 
 @mcp.tool()
 def prometheus_range_query(
-    query: str,
-    start: str = None,
-    end: str = None,
-    step: str = "1m"
+    query: str, start: str = None, end: str = None, step: str = "1m"
 ) -> str:
     """Execute a range query against Prometheus.
-    
+
     Args:
         query: PromQL query string
         start: Start time (ISO format or duration). Defaults to 1 hour ago
         end: End time (ISO format or duration). Defaults to now
         step: Query resolution step (default: 1m)
-    
+
     Returns:
         JSON string with time series data
     """
@@ -74,7 +79,7 @@ def prometheus_range_query(
 @mcp.tool()
 def prometheus_get_metrics() -> str:
     """Get list of available metrics in Prometheus.
-    
+
     Returns:
         JSON string with metric names
     """
@@ -87,10 +92,10 @@ def prometheus_get_metrics() -> str:
 @mcp.tool()
 def prometheus_get_series(match: str) -> str:
     """Get time series matching a pattern.
-    
+
     Args:
         match: Series matcher pattern (e.g., '{job="prometheus"}')
-    
+
     Returns:
         JSON string with matching series
     """
@@ -104,14 +109,15 @@ def prometheus_get_series(match: str) -> str:
 # LOKI TOOLS
 # ============================================================================
 
+
 @mcp.tool()
 def loki_query(query: str, limit: int = 1000) -> str:
     """Execute an instant query against Loki.
-    
+
     Args:
         query: LogQL query string (e.g., '{job="varlogs"}')
         limit: Maximum number of log lines (default: 1000)
-    
+
     Returns:
         JSON string with log results
     """
@@ -123,19 +129,16 @@ def loki_query(query: str, limit: int = 1000) -> str:
 
 @mcp.tool()
 def loki_range_query(
-    query: str,
-    start: str = None,
-    end: str = None,
-    limit: int = 1000
+    query: str, start: str = None, end: str = None, limit: int = 1000
 ) -> str:
     """Execute a range query against Loki.
-    
+
     Args:
         query: LogQL query string
         start: Start time (Unix timestamp in nanoseconds). Defaults to 1 hour ago
         end: End time (Unix timestamp in nanoseconds). Defaults to now
         limit: Maximum number of log lines (default: 1000)
-    
+
     Returns:
         JSON string with log results
     """
@@ -148,7 +151,7 @@ def loki_range_query(
 @mcp.tool()
 def loki_get_labels() -> str:
     """Get available label names in Loki.
-    
+
     Returns:
         JSON string with label names
     """
@@ -161,10 +164,10 @@ def loki_get_labels() -> str:
 @mcp.tool()
 def loki_get_label_values(label: str) -> str:
     """Get available values for a label in Loki.
-    
+
     Args:
         label: Label name (e.g., 'job', 'pod', 'namespace')
-    
+
     Returns:
         JSON string with label values
     """
@@ -177,6 +180,7 @@ def loki_get_label_values(label: str) -> str:
 # ============================================================================
 # TEMPO TOOLS
 # ============================================================================
+
 
 @mcp.tool()
 def tempo_search_traces(
@@ -262,7 +266,9 @@ def tempo_analyze_trace(trace_id: str) -> str:
 
 
 @mcp.tool()
-def tempo_summarize_trace(trace_id: str, use_llm: bool = True, max_new_tokens: int = 512) -> str:
+def tempo_summarize_trace(
+    trace_id: str, use_llm: bool = True, max_new_tokens: int = 512
+) -> str:
     """Fetch a trace, extract features, and produce a compact human-readable summary.
 
     When use_llm=True the summary is also sent to the local Qwen model which returns
@@ -347,7 +353,11 @@ def tempo_search_and_analyze(
         if not trace_id:
             continue
         trace_data = tempo.get_trace(trace_id)
-        features = extract_features(trace_data) if trace_data.get("status") != "error" else {"error": trace_data.get("error")}
+        features = (
+            extract_features(trace_data)
+            if trace_data.get("status") != "error"
+            else {"error": trace_data.get("error")}
+        )
         analyzed.append({"trace_id": trace_id, "features": features})
 
     return json.dumps(analyzed, indent=2)
@@ -357,10 +367,11 @@ def tempo_search_and_analyze(
 # GOLDEN METRICS TOOLS
 # ============================================================================
 
+
 @mcp.tool()
 def get_golden_metrics() -> str:
     """Get list of golden metrics (RED method).
-    
+
     Returns the golden metrics definitions including:
     - Request Rate: Number of requests per second
     - Error Rate: Proportion of requests that result in error
@@ -368,7 +379,7 @@ def get_golden_metrics() -> str:
     - CPU and Memory Usage: Resource consumption
     - Disk Write Throughput: Filesystem write rate per pod
     - MySQL/MongoDB/Redis: Database throughput and latency indicators
-    
+
     Returns:
         JSON string with golden metrics definitions
     """
@@ -376,35 +387,84 @@ def get_golden_metrics() -> str:
     return json.dumps(result, indent=2)
 
 
+# ============================================================================
+# HIGH-LEVEL INVESTIGATOR TOOLS
+# ============================================================================
+
+
+@mcp.tool()
+def check_http_error_rate_top(
+    start: str,
+    end: str,
+    step: str = "15s",
+    k: int = 5,
+) -> str:
+    """Return top services by HTTP 5xx error rate in the given window.
+
+    This is a high-level RCA-oriented tool meant for agents. It hides PromQL and
+    returns a stable JSON contract with found/count/top/query/window.
+    """
+    if not prometheus:
+        init_clients()
+    result = _inv_http_error_rate_top(
+        prometheus,
+        start=start,
+        end=end,
+        step=step,
+        k=k,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def check_request_latency_top(
+    start: str,
+    end: str,
+    step: str = "15s",
+    k: int = 5,
+) -> str:
+    """Return top services by request latency P95 in the given window."""
+    if not prometheus:
+        init_clients()
+    result = _inv_request_latency_top(
+        prometheus,
+        start=start,
+        end=end,
+        step=step,
+        k=k,
+    )
+    return json.dumps(result, indent=2)
+
+
 @mcp.tool()
 def query_golden_metric(metric_name: str) -> str:
     """Query a specific golden metric from Prometheus.
-    
+
     Args:
         metric_name: Name of the golden metric (e.g., 'Request Rate', 'Latency P95', 'MySQL Query Rate', 'MongoDB Ops Rate')
-    
+
     Returns:
         JSON string with metric values
     """
     if not prometheus:
         init_clients()
-    
+
     metrics_dict = get_golden_metrics_dict()
     metric = None
-    
+
     for m in metrics_dict["metrics"]:
         if m["name"].lower() == metric_name.lower():
             metric = m
             break
-    
+
     if not metric:
         return json.dumps({"error": f"Golden metric '{metric_name}' not found"})
-    
+
     result = prometheus.query(metric["query"])
     result["metric_info"] = {
         "name": metric["name"],
         "description": metric["description"],
-        "unit": metric["unit"]
+        "unit": metric["unit"],
     }
     return json.dumps(result, indent=2)
 
@@ -413,10 +473,11 @@ def query_golden_metric(metric_name: str) -> str:
 # KPI TOOLS
 # ============================================================================
 
+
 @mcp.tool()
 def get_kpis() -> str:
     """Get list of application KPIs.
-    
+
     Returns KPI definitions including:
     - Service Availability
     - Mean Time To Recovery (MTTR)
@@ -425,7 +486,7 @@ def get_kpis() -> str:
     - Queue Depth
     - Database Connection Pool Utilization
     - Concurrency
-    
+
     Returns:
         JSON string with KPI definitions
     """
@@ -436,33 +497,33 @@ def get_kpis() -> str:
 @mcp.tool()
 def query_kpi(kpi_name: str) -> str:
     """Query a specific KPI from Prometheus.
-    
+
     Args:
         kpi_name: Name of the KPI (e.g., 'Service Availability', 'Cache Hit Rate', 'Concurrency')
-    
+
     Returns:
         JSON string with KPI values
     """
     if not prometheus:
         init_clients()
-    
+
     kpis_dict = get_kpis_dict()
     kpi = None
-    
+
     for k in kpis_dict["kpis"]:
         if k["name"].lower() == kpi_name.lower():
             kpi = k
             break
-    
+
     if not kpi:
         return json.dumps({"error": f"KPI '{kpi_name}' not found"})
-    
+
     result = prometheus.query(kpi["query"])
     result["kpi_info"] = {
         "name": kpi["name"],
         "description": kpi["description"],
         "threshold": kpi["threshold"],
-        "alert_condition": kpi["alert_condition"]
+        "alert_condition": kpi["alert_condition"],
     }
     return json.dumps(result, indent=2)
 
@@ -470,37 +531,192 @@ def query_kpi(kpi_name: str) -> str:
 @mcp.tool()
 def query_all_kpis() -> str:
     """Query all KPIs from Prometheus.
-    
+
     Returns:
         JSON string with all KPI values
     """
     if not prometheus:
         init_clients()
-    
+
     kpis_dict = get_kpis_dict()
     results = {"kpis_status": []}
-    
+
     for kpi in kpis_dict["kpis"]:
         query_result = prometheus.query(kpi["query"])
-        results["kpis_status"].append({
-            "name": kpi["name"],
-            "description": kpi["description"],
-            "threshold": kpi["threshold"],
-            "alert_condition": kpi["alert_condition"],
-            "current_value": query_result.get("data", {}).get("result", [])
-        })
-    
+        results["kpis_status"].append(
+            {
+                "name": kpi["name"],
+                "description": kpi["description"],
+                "threshold": kpi["threshold"],
+                "alert_condition": kpi["alert_condition"],
+                "current_value": query_result.get("data", {}).get("result", []),
+            }
+        )
+
     return json.dumps(results, indent=2)
+
+
+# ============================================================================
+# INVESTIGATOR TOOLS (high-level, window-scoped, agent-friendly)
+# ============================================================================
+# These wrap raw PromQL with stable JSON contracts so a small LLM (or a
+# step in an agentic pipeline) can ask "did any pod get OOMKilled between
+# t0 and t1?" without writing PromQL. Every tool takes explicit
+# start/end ISO timestamps — never an open-ended `increase(...[1h])` —
+# so signals are strictly scoped to the caller's window and never leak
+# across experiments. Implementation: investigators.py.
+
+
+@mcp.tool()
+def check_oom_kills(
+    start: str,
+    end: str,
+    namespace: str = "sock-shop",
+    step: str = "15s",
+) -> str:
+    """Return services with OOMKilled containers within ``[start, end]``.
+
+    Args:
+        start: ISO timestamp (inclusive) of the investigation window start.
+        end: ISO timestamp (inclusive) of the investigation window end.
+        namespace: Kubernetes namespace to inspect.
+        step: Range-query resolution (default 15s).
+
+    Returns:
+        JSON object with keys ``found`` (bool), ``count`` (int),
+        ``top`` (list of {service, transitioned_in_window, delta,
+        max_in_window, pods}), ``query``, ``window``.
+        ``transitioned_in_window=True`` means the OOMKilled gauge went
+        from 0 to 1 inside the window (i.e. the OOM happened *during*
+        this run, not before).
+    """
+    if not prometheus:
+        init_clients()
+    result = _inv_check_oom_kills(
+        prometheus,
+        start=start,
+        end=end,
+        namespace=namespace,
+        step=step,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def check_pod_restarts(
+    start: str,
+    end: str,
+    namespace: str = "sock-shop",
+    step: str = "15s",
+) -> str:
+    """Return services that experienced pod restarts within ``[start, end]``.
+
+    Computed as ``max(counter) - min(counter)`` on a range-query
+    bounded by the window — so an experiment of 6 minutes returns
+    restarts in those 6 minutes regardless of any earlier OOMs.
+
+    Args:
+        start: ISO timestamp (inclusive) of the investigation window start.
+        end: ISO timestamp (inclusive) of the investigation window end.
+        namespace: Kubernetes namespace to inspect.
+        step: Range-query resolution (default 15s).
+
+    Returns:
+        JSON object with keys ``found`` (bool), ``count`` (int),
+        ``top`` (list of {service, restarts_in_window, pods}),
+        ``query``, ``window``.
+    """
+    if not prometheus:
+        init_clients()
+    result = _inv_check_pod_restarts(
+        prometheus,
+        start=start,
+        end=end,
+        namespace=namespace,
+        step=step,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_cpu_saturation_top(
+    start: str,
+    end: str,
+    namespace: str = "sock-shop",
+    step: str = "15s",
+    k: int = 3,
+) -> str:
+    """Top-K services by CPU saturation (% of limit) within the window.
+
+    Saturation is ``rate(container_cpu_usage_seconds_total) /
+    (cpu_quota / cpu_period)``. Reports both ``saturation_mean_pct``
+    (typical) and ``saturation_max_pct`` (peak) so an agent can tell
+    sustained pressure from short spikes. Pods without a CPU limit
+    are excluded — no saturation signal exists for them.
+
+    Args:
+        start: ISO timestamp (inclusive) of the window start.
+        end: ISO timestamp (inclusive) of the window end.
+        namespace: Kubernetes namespace to inspect.
+        step: Range-query resolution (default 15s).
+        k: Number of top services to return (default 3).
+    """
+    if not prometheus:
+        init_clients()
+    result = _inv_cpu_top(
+        prometheus,
+        start=start,
+        end=end,
+        namespace=namespace,
+        step=step,
+        k=k,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_memory_saturation_top(
+    start: str,
+    end: str,
+    namespace: str = "sock-shop",
+    step: str = "15s",
+    k: int = 3,
+) -> str:
+    """Top-K services by memory saturation (% of limit) within the window.
+
+    Saturation is ``container_memory_working_set_bytes /
+    container_spec_memory_limit_bytes``. Pods without a memory limit
+    are excluded (no saturation signal exists for them).
+
+    Args:
+        start: ISO timestamp (inclusive) of the window start.
+        end: ISO timestamp (inclusive) of the window end.
+        namespace: Kubernetes namespace to inspect.
+        step: Range-query resolution (default 15s).
+        k: Number of top services to return (default 3).
+    """
+    if not prometheus:
+        init_clients()
+    result = _inv_memory_top(
+        prometheus,
+        start=start,
+        end=end,
+        namespace=namespace,
+        step=step,
+        k=k,
+    )
+    return json.dumps(result, indent=2)
 
 
 # ============================================================================
 # UTILITY TOOLS
 # ============================================================================
 
+
 @mcp.tool()
 def health_check() -> str:
     """Check health status of Prometheus, Loki and Tempo services.
-    
+
     Returns:
         JSON string with health status
     """
@@ -510,33 +726,36 @@ def health_check() -> str:
         init_clients()
     if not tempo:
         init_clients()
-    
-    health_status = {
-        "status": "healthy",
-        "services": {}
-    }
-    
+
+    health_status = {"status": "healthy", "services": {}}
+
     # Check Prometheus
     try:
         result = prometheus.query("up{job='prometheus'}")
-        health_status["services"]["prometheus"] = "ok" if result.get("status") == "success" else "error"
+        health_status["services"]["prometheus"] = (
+            "ok" if result.get("status") == "success" else "error"
+        )
     except Exception as e:
         health_status["services"]["prometheus"] = f"error: {str(e)}"
-    
+
     # Check Loki
     try:
         result = loki.get_labels()
-        health_status["services"]["loki"] = "ok" if result.get("status") == "success" else "error"
+        health_status["services"]["loki"] = (
+            "ok" if result.get("status") == "success" else "error"
+        )
     except Exception as e:
         health_status["services"]["loki"] = f"error: {str(e)}"
 
     # Check Tempo
     try:
         result = tempo.search_traces(limit=1)
-        health_status["services"]["tempo"] = "ok" if result.get("status") != "error" else "error"
+        health_status["services"]["tempo"] = (
+            "ok" if result.get("status") != "error" else "error"
+        )
     except Exception as e:
         health_status["services"]["tempo"] = f"error: {str(e)}"
-    
+
     return json.dumps(health_status, indent=2)
 
 

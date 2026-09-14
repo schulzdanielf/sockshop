@@ -1,0 +1,6 @@
+# Development & CI tooling (formatting, linting, testing).
+# Install with:  pip install -r requirements-dev.txt
+black==24.*
+isort==5.*
+flake8==7.*
+pytest==8.*

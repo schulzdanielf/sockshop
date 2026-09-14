@@ -1,15 +1,16 @@
+"""Local Qwen-14B inference engine (ExLlamaV2 backend).
+
+``Qwen14BEngine`` loads a quantised Qwen-14B model with ExLlamaV2 and
+exposes thread-safe text generation. Used by the model server to serve
+the RCA agent's LLM calls locally.
+"""
+
 import os
 import re
 import threading
 
-from exllamav2 import (
-    ExLlamaV2,
-    ExLlamaV2Config,
-    ExLlamaV2Tokenizer,
-    ExLlamaV2Cache_Q8,
-)
+from exllamav2 import ExLlamaV2, ExLlamaV2Cache_Q8, ExLlamaV2Config, ExLlamaV2Tokenizer
 from exllamav2.generator import ExLlamaV2BaseGenerator, ExLlamaV2Sampler
-
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/home/daniel/models/qwen14b-exl2-v2")
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "8192"))
@@ -31,32 +32,37 @@ class Qwen14BEngine:
         config = ExLlamaV2Config()
         config.model_dir = MODEL_DIR
         config.max_seq_len = MAX_SEQ_LEN
-        print(f"[DEBUG] ExLlamaV2Config prepared, calling prepare()", flush=True)
+        print("[DEBUG] ExLlamaV2Config prepared, calling prepare()", flush=True)
         config.prepare()
 
-        print(f"[DEBUG] ExLlamaV2 model object create", flush=True)
+        print("[DEBUG] ExLlamaV2 model object create", flush=True)
         self.model = ExLlamaV2(config)
-        print(f"[DEBUG] ExLlamaV2Tokenizer create", flush=True)
+        print("[DEBUG] ExLlamaV2Tokenizer create", flush=True)
         self.tokenizer = ExLlamaV2Tokenizer(config)
 
         print(f"[DEBUG] ExLlamaV2Cache_Q8 create  seq_len={MAX_SEQ_LEN}", flush=True)
         self.cache = ExLlamaV2Cache_Q8(self.model, max_seq_len=MAX_SEQ_LEN)
-        print(f"[DEBUG] load_autosplit start", flush=True)
+        print("[DEBUG] load_autosplit start", flush=True)
         self.model.load_autosplit(self.cache)
-        print(f"[DEBUG] load_autosplit done", flush=True)
+        print("[DEBUG] load_autosplit done", flush=True)
 
         # BaseGenerator
-        print(f"[DEBUG] ExLlamaV2BaseGenerator create", flush=True)
+        print("[DEBUG] ExLlamaV2BaseGenerator create", flush=True)
         self.generator = ExLlamaV2BaseGenerator(self.model, self.cache, self.tokenizer)
-        print(f"[DEBUG] ExLlamaV2BaseGenerator done", flush=True)
+        print("[DEBUG] ExLlamaV2BaseGenerator done", flush=True)
 
         print("Qwen 14B loaded")
 
     def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
         settings = ExLlamaV2Sampler.Settings()
-        settings.temperature = 0.7
-        settings.top_p = 0.9
-        settings.top_k = 50
+        # Greedy decoding for reproducible experiments. With temperature=0
+        # and top_k=1 the sampler always picks the argmax token, so two
+        # identical prompts produce byte-identical outputs. This eliminates
+        # sampler variance as a confounding factor when comparing prompt
+        # variants or RAG strategies in the evaluation harness.
+        settings.temperature = 1.0  # ignored when top_k=1, kept neutral
+        settings.top_p = 1.0
+        settings.top_k = 1
 
         output = self.generator.generate_simple(
             prompt,

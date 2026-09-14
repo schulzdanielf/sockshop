@@ -23,7 +23,6 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
 
-
 DEFAULT_METRICS = {
     "qps_total": 'sum(rate(request_duration_seconds_count{route!="metrics"}[1m]))',
     "qps_2xx": 'sum(rate(request_duration_seconds_count{route!="metrics",status_code=~"2.."}[1m]))',
@@ -49,7 +48,9 @@ def read_metrics_config(metrics_file: Optional[str]) -> Dict[str, str]:
         payload = json.load(f)
 
     if not isinstance(payload, dict) or not payload:
-        raise ValueError("Metrics config must be a non-empty JSON object: {name: promql}")
+        raise ValueError(
+            "Metrics config must be a non-empty JSON object: {name: promql}"
+        )
 
     for key, value in payload.items():
         if not isinstance(key, str) or not isinstance(value, str):
@@ -92,7 +93,9 @@ def _parse_vector_or_scalar(payload: dict) -> Optional[float]:
     return None
 
 
-def query_prometheus_at(prom_url: str, promql: str, when_epoch: float, timeout: int) -> Optional[float]:
+def query_prometheus_at(
+    prom_url: str, promql: str, when_epoch: float, timeout: int
+) -> Optional[float]:
     endpoint = prom_url.rstrip("/") + "/api/v1/query"
     query = urllib.parse.urlencode({"query": promql, "time": f"{when_epoch:.3f}"})
     url = endpoint + "?" + query
@@ -165,7 +168,9 @@ def query_prometheus_range(
     return out
 
 
-def run_locust_round(args: argparse.Namespace, run_total_seconds: int) -> subprocess.CompletedProcess[str]:
+def run_locust_round(
+    args: argparse.Namespace, run_total_seconds: int
+) -> subprocess.CompletedProcess[str]:
     cmd = shlex.split(args.locust_cmd) + [
         "-f",
         args.locust_file,
@@ -247,7 +252,9 @@ def run(args: argparse.Namespace) -> Path:
                 timeout=args.prom_timeout_seconds,
             )
 
-        ts_points = list(range(int(round_start), int(data_end) + 1, args.sample_interval_seconds))
+        ts_points = list(
+            range(int(round_start), int(data_end) + 1, args.sample_interval_seconds)
+        )
         for ts in ts_points:
             row: Dict[str, object] = {
                 "timestamp_utc": utc_iso_from_epoch(ts),
@@ -323,16 +330,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run multi-round locust experiments and export Prometheus metrics to CSV"
     )
-    parser.add_argument("--prom-url", default="http://localhost:9090", help="Prometheus base URL")
-    parser.add_argument("--prom-timeout-seconds", type=int, default=10, help="Prometheus request timeout")
-    parser.add_argument("--metrics-file", default=None, help="JSON map: metric_name -> promql")
-    parser.add_argument("--output-csv", default="experiment/data/experiment.csv", help="Output CSV path")
+    parser.add_argument(
+        "--prom-url", default="http://localhost:9090", help="Prometheus base URL"
+    )
+    parser.add_argument(
+        "--prom-timeout-seconds",
+        type=int,
+        default=10,
+        help="Prometheus request timeout",
+    )
+    parser.add_argument(
+        "--metrics-file", default=None, help="JSON map: metric_name -> promql"
+    )
+    parser.add_argument(
+        "--output-csv", default="experiment/data/experiment.csv", help="Output CSV path"
+    )
 
     parser.add_argument("--rounds", type=int, default=3, help="Number of rounds")
-    parser.add_argument("--disabled-seconds", type=int, default=0, help="Idle time before warmup")
-    parser.add_argument("--warmup-seconds", type=int, default=60, help="Warmup duration")
-    parser.add_argument("--run-seconds", type=int, default=300, help="Experiment duration after warmup")
-    parser.add_argument("--sample-interval-seconds", type=int, default=15, help="Prometheus range step")
+    parser.add_argument(
+        "--disabled-seconds", type=int, default=0, help="Idle time before warmup"
+    )
+    parser.add_argument(
+        "--warmup-seconds", type=int, default=60, help="Warmup duration"
+    )
+    parser.add_argument(
+        "--run-seconds", type=int, default=300, help="Experiment duration after warmup"
+    )
+    parser.add_argument(
+        "--sample-interval-seconds", type=int, default=15, help="Prometheus range step"
+    )
 
     parser.add_argument(
         "--locust-cmd",
@@ -342,9 +368,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--locust-file", required=True, help="Path to locustfile.py")
     parser.add_argument("--locust-host", required=True, help="Target host for load")
     parser.add_argument("--users", type=int, default=20, help="Concurrent users")
-    parser.add_argument("--spawn-rate", type=float, default=5.0, help="User growth rate")
+    parser.add_argument(
+        "--spawn-rate", type=float, default=5.0, help="User growth rate"
+    )
     parser.add_argument("--locust-extra-args", default="", help="Extra locust CLI args")
-    parser.add_argument("--locust-grace-seconds", type=int, default=30, help="Extra timeout buffer")
+    parser.add_argument(
+        "--locust-grace-seconds", type=int, default=30, help="Extra timeout buffer"
+    )
     parser.add_argument(
         "--fail-on-locust-error",
         action="store_true",

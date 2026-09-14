@@ -1,13 +1,10 @@
 kind: Workflow
 apiVersion: argoproj.io/v1alpha1
 metadata:
-  name: user-memory-hog
+  name: catalogue-io-stress
   namespace: litmus
   labels:
-    infra_id: f21787ba-08ee-4649-ab66-c880492636dc
-    revision_id: 4e799cbb-c2a5-43ba-8a02-0182c0ab094f
     subject: sock-shop_kube-proxy
-    workflow_id: 71751ae8-18d2-4169-8cbf-0aa84d0d7dbd
     workflows.argoproj.io/controller-instanceid: f21787ba-08ee-4649-ab66-c880492636dc
 spec:
   templates:
@@ -29,71 +26,84 @@ spec:
       inputs:
         artifacts:
           - name: install-chaos-faults
-            path: /tmp/pod-memory-hog.yaml
+            path: /tmp/pod-io-stress.yaml
             raw:
-              data: >
+              data: |
                 apiVersion: litmuschaos.io/v1alpha1
-
                 description:
                   message: |
-                    Injects memory consumption on pods belonging to an app deployment
+                    IO stress on the application pods belonging to an app deployment
                 kind: ChaosExperiment
-
                 metadata:
-                  name: pod-memory-hog
+                  name: pod-io-stress
+                  labels:
+                    name: pod-io-stress
                 spec:
                   definition:
                     scope: Namespaced
                     permissions:
-                      - apiGroups:
-                          - ""
-                          - "batch"
-                          - "litmuschaos.io"
-                        resources:
-                          - "jobs"
-                          - "pods"
-                          - "pods/log"
-                          - "events"
-                          - "chaosengines"
-                          - "chaosexperiments"
-                          - "chaosresults"
-                        verbs:
-                          - "create"
-                          - "list"
-                          - "get"
-                          - "patch"
-                          - "update"
-                          - "delete"
+                      - apiGroups: [""]
+                        resources: ["pods"]
+                        verbs: ["create","delete","get","list","patch","update","deletecollection"]
+                      - apiGroups: [""]
+                        resources: ["events"]
+                        verbs: ["create","get","list","patch","update"]
+                      - apiGroups: [""]
+                        resources: ["configmaps"]
+                        verbs: ["get","list"]
+                      - apiGroups: [""]
+                        resources: ["pods/log"]
+                        verbs: ["get","list","watch"]
+                      - apiGroups: [""]
+                        resources: ["pods/exec"]
+                        verbs: ["get","list","create"]
+                      - apiGroups: ["apps"]
+                        resources: ["deployments","statefulsets","replicasets","daemonsets"]
+                        verbs: ["list","get"]
+                      - apiGroups: ["batch"]
+                        resources: ["jobs"]
+                        verbs: ["create","list","get","delete","deletecollection"]
+                      - apiGroups: ["litmuschaos.io"]
+                        resources: ["chaosengines","chaosexperiments","chaosresults"]
+                        verbs: ["create","list","get","patch","update","delete"]
                     image: "litmuschaos.docker.scarf.sh/litmuschaos/go-runner:3.28.0"
+                    imagePullPolicy: Always
                     args:
                     - -c
-                    - ./experiments -name pod-memory-hog
+                    - ./experiments -name pod-io-stress
                     command:
                     - /bin/bash
                     env:
-                      - name: TOTAL_CHAOS_DURATION
-                        value: '30'
-
-                      - name: CHAOS_INTERVAL
-                        value: '10'
-
-                      ## enter the amount of memory in megabytes to be consumed by the application pod
-                      - name: MEMORY_CONSUMPTION
-                        value: '60'
-
-                      ## percentage of total pods to target
-                      - name: PODS_AFFECTED_PERC
-                        value: ''
-
-                      ## Period to wait before and after injection of chaos in sec
-                      - name: RAMP_TIME
-                        value: ''
-
-                      - name: TARGET_POD
-                        value: ''
-
+                    - name: TOTAL_CHAOS_DURATION
+                      value: '120'
+                    - name: FILESYSTEM_UTILIZATION_PERCENTAGE
+                      value: '10'
+                    - name: FILESYSTEM_UTILIZATION_BYTES
+                      value: ''
+                    - name: NUMBER_OF_WORKERS
+                      value: '4'
+                    - name: PODS_AFFECTED_PERC
+                      value: ''
+                    - name: VOLUME_MOUNT_PATH
+                      value: ''
+                    - name: TARGET_CONTAINER
+                      value: ''
+                    - name: TARGET_PODS
+                      value: ''
+                    - name: RAMP_TIME
+                      value: ''
+                    - name: LIB_IMAGE
+                      value: 'litmuschaos.docker.scarf.sh/litmuschaos/go-runner:3.28.0'
+                    - name: DEFAULT_HEALTH_CHECK
+                      value: 'false'
+                    - name: CONTAINER_RUNTIME
+                      value: 'docker'
+                    - name: SOCKET_PATH
+                      value: '/var/run/docker.sock'
+                    - name: SEQUENCE
+                      value: 'parallel'
                     labels:
-                      name: pod-memory-hog
+                      name: pod-io-stress
       outputs: {}
       metadata: {}
       container:
@@ -103,7 +113,7 @@ spec:
           - sh
           - -c
         args:
-          - kubectl apply -f /tmp/pod-memory-hog.yaml -n
+          - kubectl apply -f /tmp/pod-io-stress.yaml -n
             {{workflow.parameters.adminModeNamespace}}
         resources: {}
     - name: run-chaos
@@ -112,48 +122,41 @@ spec:
           - name: run-chaos
             path: /tmp/chaosengine-run-chaos.yaml
             raw:
-              data: >
+              data: |
                 apiVersion: litmuschaos.io/v1alpha1
-
                 kind: ChaosEngine
-
                 metadata:
                   namespace: "{{workflow.parameters.adminModeNamespace}}"
                   labels:
                     context: sock-shop_kube-proxy
                     workflow_run_id: "{{ workflow.uid }}"
-                    workflow_name: user-memory-hog
-                  annotations:
+                    workflow_name: catalogue-io-stress
                   generateName: run-chaos
                 spec:
                   appinfo:
                     appns: sock-shop
-                    applabel: name=user
+                    applabel: name=catalogue
                     appkind: deployment
                   jobCleanUpPolicy: retain
                   engineState: active
                   chaosServiceAccount: litmus-admin
                   experiments:
-                    - name: pod-memory-hog
+                    - name: pod-io-stress
                       spec:
                         components:
                           env:
                             - name: TARGET_CONTAINER
-                              value: user
+                              value: catalogue
+                            - name: FILESYSTEM_UTILIZATION_PERCENTAGE
+                              value: "10"
+                            - name: NUMBER_OF_WORKERS
+                              value: "4"
+                            - name: TOTAL_CHAOS_DURATION
+                              value: "120"
                             - name: CONTAINER_RUNTIME
                               value: docker
                             - name: SOCKET_PATH
                               value: /var/run/docker.sock
-                            - name: MEMORY_CONSUMPTION
-                              value: "500"
-                            - name: TOTAL_CHAOS_DURATION
-                              value: "60"
-                            - name: CHAOS_KILL_COMMAND
-                              value: >-
-                                kill -9 $(ps afx | grep "[dd] if /dev/zero" | awk '{print $1}' |
-                                tr '
-
-                                ' ' ')
       outputs: {}
       metadata:
         labels:

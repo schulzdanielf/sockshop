@@ -1,3 +1,10 @@
+"""Litmus/Argo chaos provider adapter.
+
+``LitmusChaosPlugin`` implements :class:`ports.ChaosProviderPort` by
+cloning and launching pre-generated Argo Workflows in the ``litmus``
+namespace (via ``kubectl``) to inject faults into target services.
+"""
+
 from __future__ import annotations
 
 import json
@@ -18,7 +25,9 @@ class LitmusChaosPlugin:
                 "is required when manifest_path is not set"
             )
 
-    def prepare(self, context: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    def prepare(
+        self, context: Dict[str, Any], config: Dict[str, Any]
+    ) -> Dict[str, Any]:
         return {"ok": True}
 
     def inject(self, context: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
@@ -47,10 +56,10 @@ class LitmusChaosPlugin:
         return {
             "provider": "litmus",
             "mode": "argo_workflow",
-            "namespace": "litmus",           # Argo Workflow lives in litmus ns
-            "target_namespace": namespace,   # app target (e.g. sock-shop)
+            "namespace": "litmus",  # Argo Workflow lives in litmus ns
+            "target_namespace": namespace,  # app target (e.g. sock-shop)
             "workflow_template": workflow_template,
-            "workflow_name": created_name,   # actual name, e.g. delete-user-ab3x9
+            "workflow_name": created_name,  # actual name, e.g. delete-user-ab3x9
             "chaos_engine": None,
             "chaos_result": None,
             "manifest_path": None,
@@ -116,12 +125,16 @@ class LitmusChaosPlugin:
             text=True,
         )
         if create_proc.returncode != 0:
-            raise RuntimeError(f"Failed to submit Argo Workflow: {create_proc.stderr.strip()}")
+            raise RuntimeError(
+                f"Failed to submit Argo Workflow: {create_proc.stderr.strip()}"
+            )
 
         # Output: "workflow.argoproj.io/delete-user-ab3x9 created"
         m = re.search(r"/(\S+)\s+created", create_proc.stdout)
         if not m:
-            raise RuntimeError(f"Could not parse created workflow name from: {create_proc.stdout!r}")
+            raise RuntimeError(
+                f"Could not parse created workflow name from: {create_proc.stdout!r}"
+            )
         return m.group(1)
 
     def stop(self, context: Dict[str, Any], handle: Dict[str, Any]) -> Dict[str, Any]:
@@ -129,8 +142,13 @@ class LitmusChaosPlugin:
         workflow_name = handle.get("workflow_name")
         if workflow_name and handle.get("mode") == "argo_workflow":
             cmd = [
-                "kubectl", "delete", "workflow.argoproj.io",
-                "-n", "litmus", workflow_name, "--ignore-not-found=true",
+                "kubectl",
+                "delete",
+                "workflow.argoproj.io",
+                "-n",
+                "litmus",
+                workflow_name,
+                "--ignore-not-found=true",
             ]
             proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
             return {"deleted": proc.returncode == 0, "workflow_name": workflow_name}
@@ -138,19 +156,38 @@ class LitmusChaosPlugin:
         # Local manifest mode
         manifest_path = handle.get("manifest_path")
         if manifest_path:
-            cmd = ["kubectl", "delete", "-f", str(manifest_path), "--ignore-not-found=true"]
+            cmd = [
+                "kubectl",
+                "delete",
+                "-f",
+                str(manifest_path),
+                "--ignore-not-found=true",
+            ]
             proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-            return {"deleted": proc.returncode == 0, "stdout": proc.stdout, "stderr": proc.stderr}
+            return {
+                "deleted": proc.returncode == 0,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
 
-        return {"deleted": False, "reason": "no workflow_name or manifest_path configured"}
+        return {
+            "deleted": False,
+            "reason": "no workflow_name or manifest_path configured",
+        }
 
     def status(self, context: Dict[str, Any], handle: Dict[str, Any]) -> Dict[str, Any]:
         # ── Argo Workflow mode ────────────────────────────────────────────────
         workflow_name = handle.get("workflow_name")
         if workflow_name and handle.get("mode") == "argo_workflow":
             cmd = [
-                "kubectl", "get", "workflow.argoproj.io",
-                "-n", "litmus", workflow_name, "-o", "json",
+                "kubectl",
+                "get",
+                "workflow.argoproj.io",
+                "-n",
+                "litmus",
+                workflow_name,
+                "-o",
+                "json",
             ]
             proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
             if proc.returncode != 0:
@@ -165,20 +202,36 @@ class LitmusChaosPlugin:
             chaos_phase: Optional[str] = None
             if wf_uid:
                 cr_proc = subprocess.run(
-                    ["kubectl", "get", "chaosresults", "-n", "litmus",
-                     "-l", f"workflow_run_id={wf_uid}", "-o", "json"],
-                    check=False, capture_output=True, text=True,
+                    [
+                        "kubectl",
+                        "get",
+                        "chaosresults",
+                        "-n",
+                        "litmus",
+                        "-l",
+                        f"workflow_run_id={wf_uid}",
+                        "-o",
+                        "json",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
                 if cr_proc.returncode == 0:
                     cr_items = json.loads(cr_proc.stdout).get("items", [])
                     if cr_items:
-                        exp_st = cr_items[0].get("status", {}).get("experimentStatus", {})
+                        exp_st = (
+                            cr_items[0].get("status", {}).get("experimentStatus", {})
+                        )
                         chaos_verdict = exp_st.get("verdict")
                         chaos_phase = exp_st.get("phase")
 
             state_map = {
-                "Running": "running", "Pending": "running",
-                "Succeeded": "completed", "Failed": "failed", "Error": "failed",
+                "Running": "running",
+                "Pending": "running",
+                "Succeeded": "completed",
+                "Failed": "failed",
+                "Error": "failed",
             }
             return {
                 "state": state_map.get(phase or "", "pending"),
@@ -192,9 +245,21 @@ class LitmusChaosPlugin:
         chaos_result = handle.get("chaos_result")
         namespace = handle.get("namespace")
         if not chaos_result or not namespace:
-            return {"state": "unknown", "reason": "chaos_result or namespace not configured"}
+            return {
+                "state": "unknown",
+                "reason": "chaos_result or namespace not configured",
+            }
 
-        cmd = ["kubectl", "-n", str(namespace), "get", "chaosresult", str(chaos_result), "-o", "json"]
+        cmd = [
+            "kubectl",
+            "-n",
+            str(namespace),
+            "get",
+            "chaosresult",
+            str(chaos_result),
+            "-o",
+            "json",
+        ]
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if proc.returncode != 0:
             return {"state": "pending", "reason": proc.stderr.strip()}
@@ -203,26 +268,38 @@ class LitmusChaosPlugin:
         exp_st = data.get("status", {}).get("experimentStatus", {})
         verdict = exp_st.get("verdict")
         phase = exp_st.get("phase")
-        state = "completed" if verdict == "Pass" else "failed" if verdict == "Fail" else "running"
+        state = (
+            "completed"
+            if verdict == "Pass"
+            else "failed"
+            if verdict == "Fail"
+            else "running"
+        )
         return {"state": state, "phase": phase, "verdict": verdict}
 
-    def collect_artifacts(self, context: Dict[str, Any], handle: Dict[str, Any]) -> Dict[str, Any]:
+    def collect_artifacts(
+        self, context: Dict[str, Any], handle: Dict[str, Any]
+    ) -> Dict[str, Any]:
         base = {
             "provider": "litmus",
             "mode": handle.get("mode"),
             "namespace": handle.get("namespace"),
         }
         if handle.get("mode") == "argo_workflow":
-            base.update({
-                "workflow_template": handle.get("workflow_template"),
-                "workflow_name": handle.get("workflow_name"),
-                "litmus_ui_url": f"http://localhost:9091",
-            })
+            base.update(
+                {
+                    "workflow_template": handle.get("workflow_template"),
+                    "workflow_name": handle.get("workflow_name"),
+                    "litmus_ui_url": "http://localhost:9091",
+                }
+            )
         else:
-            base.update({
-                "chaos_engine": handle.get("chaos_engine"),
-                "chaos_result": handle.get("chaos_result"),
-            })
+            base.update(
+                {
+                    "chaos_engine": handle.get("chaos_engine"),
+                    "chaos_result": handle.get("chaos_result"),
+                }
+            )
         return base
 
     def list_catalog(self, namespaces: List[str] | None = None) -> List[Dict[str, Any]]:
@@ -237,9 +314,13 @@ class LitmusChaosPlugin:
 
         target_ns = namespaces[0] if namespaces else "litmus"
         cmd = [
-            "kubectl", "get", "workflows.argoproj.io",
-            "-n", target_ns,
-            "-o", "json",
+            "kubectl",
+            "get",
+            "workflows.argoproj.io",
+            "-n",
+            target_ns,
+            "-o",
+            "json",
         ]
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -280,9 +361,13 @@ class LitmusChaosPlugin:
                     for line in raw.splitlines():
                         line = line.strip()
                         if line.startswith("workflow_name:"):
-                            engine_info["workflow_name"] = line.split(":", 1)[-1].strip().strip("'\"")
+                            engine_info["workflow_name"] = (
+                                line.split(":", 1)[-1].strip().strip("'\"")
+                            )
                         elif line.startswith("appns:"):
-                            engine_info["app_namespace"] = line.split(":", 1)[-1].strip()
+                            engine_info["app_namespace"] = line.split(":", 1)[
+                                -1
+                            ].strip()
                         elif line.startswith("applabel:"):
                             engine_info["app_label"] = line.split(":", 1)[-1].strip()
                         elif line.startswith("generateName:"):
@@ -291,6 +376,7 @@ class LitmusChaosPlugin:
                     try:
                         # Attempt YAML parse if pyyaml available, else regex
                         import yaml  # type: ignore[import]
+
                         eng = yaml.safe_load(raw)
                         exps = [
                             e.get("name")
@@ -299,7 +385,9 @@ class LitmusChaosPlugin:
                         ]
                         engine_info["experiment_types"] = exps
                     except Exception:
-                        exp_matches = re.findall(r"^\s*-\s+name:\s+(.+)$", raw, re.MULTILINE)
+                        exp_matches = re.findall(
+                            r"^\s*-\s+name:\s+(.+)$", raw, re.MULTILINE
+                        )
                         engine_info["experiment_types"] = exp_matches
                     break
             results.append(engine_info)

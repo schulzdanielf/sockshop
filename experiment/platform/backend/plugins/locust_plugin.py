@@ -1,3 +1,10 @@
+"""Locust load-generation provider adapter.
+
+``LocustLoadPlugin`` implements :class:`ports.LoadProviderPort`, shelling
+out to Locust to drive synthetic traffic against the system under test
+for the duration of an experiment.
+"""
+
 from __future__ import annotations
 
 import os
@@ -15,12 +22,18 @@ class LocustLoadPlugin:
             if not config.get(required):
                 raise ValueError(f"load_profile.{required} is required")
 
-    def prepare(self, context: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    def prepare(
+        self, context: Dict[str, Any], config: Dict[str, Any]
+    ) -> Dict[str, Any]:
         return {"ok": True}
 
-    def start_load(self, context: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    def start_load(
+        self, context: Dict[str, Any], config: Dict[str, Any]
+    ) -> Dict[str, Any]:
         run_time_seconds = int(config["run_time_seconds"])
-        base_cmd = config.get("command", "kubectl -n loadtest exec deploy/locust-web -- locust")
+        base_cmd = config.get(
+            "command", "kubectl -n loadtest exec deploy/locust-web -- locust"
+        )
         cmd = shlex.split(base_cmd) + [
             "-f",
             str(config["locust_file"]),
@@ -38,7 +51,9 @@ class LocustLoadPlugin:
         if isinstance(extra_args, list):
             cmd.extend(str(x) for x in extra_args)
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
         return {
             "provider": "locust",
             "pid": process.pid,
@@ -62,7 +77,9 @@ class LocustLoadPlugin:
         state = "running" if self._is_running(pid) else "completed"
         return {"state": state, "exit_code": None}
 
-    def stop_load(self, context: Dict[str, Any], handle: Dict[str, Any]) -> Dict[str, Any]:
+    def stop_load(
+        self, context: Dict[str, Any], handle: Dict[str, Any]
+    ) -> Dict[str, Any]:
         pid = int(handle["pid"])
         try:
             os.kill(pid, 15)
@@ -70,7 +87,9 @@ class LocustLoadPlugin:
         except Exception as exc:
             return {"stopped": False, "error": str(exc)}
 
-    def collect_summary(self, context: Dict[str, Any], handle: Dict[str, Any]) -> Dict[str, Any]:
+    def collect_summary(
+        self, context: Dict[str, Any], handle: Dict[str, Any]
+    ) -> Dict[str, Any]:
         return {
             "provider": "locust",
             "pid": handle.get("pid"),

@@ -1,3 +1,10 @@
+"""Prometheus metrics provider backed by the MCP server.
+
+``MCPPrometheusMetricsPlugin`` implements :class:`ports.MetricsProviderPort`,
+querying Prometheus through the MCP observability server and summarising
+the results (baseline vs. fault statistics) for downstream analysis.
+"""
+
 from __future__ import annotations
 
 import statistics
@@ -26,7 +33,9 @@ def _stats(values: List[float]) -> Dict[str, Any]:
 class MCPPrometheusMetricsPlugin:
     def validate(self, config: Dict[str, Any]) -> None:
         if config.get("provider") not in {"mcp-prometheus", "prometheus"}:
-            raise ValueError("observability.metrics.provider must be 'mcp-prometheus' or 'prometheus'")
+            raise ValueError(
+                "observability.metrics.provider must be 'mcp-prometheus' or 'prometheus'"
+            )
         if not config.get("mcp_sse_url"):
             raise ValueError("observability.metrics.mcp_sse_url is required")
 
@@ -154,7 +163,11 @@ class MCPPrometheusMetricsPlugin:
             return None
 
         points = sorted(
-            ((ts, val) for ts, val, _ in self._iter_points(payload) if fault_end <= ts <= window_end),
+            (
+                (ts, val)
+                for ts, val, _ in self._iter_points(payload)
+                if fault_end <= ts <= window_end
+            ),
             key=lambda p: p[0],
         )
 
@@ -265,13 +278,15 @@ class MCPPrometheusMetricsPlugin:
                 fault_mean = statistics.fmean(fault_vals)
                 base_mean = statistics.fmean(base_vals) if base_vals else 0.0
                 fault_p95 = sorted(fault_vals)[int(0.95 * (len(fault_vals) - 1))]
-                rows.append({
-                    "label": label,
-                    "baseline_mean": round(base_mean, 4),
-                    "fault_mean": round(fault_mean, 4),
-                    "fault_p95": round(fault_p95, 4),
-                    "delta_abs": round(fault_mean - base_mean, 4),
-                })
+                rows.append(
+                    {
+                        "label": label,
+                        "baseline_mean": round(base_mean, 4),
+                        "fault_mean": round(fault_mean, 4),
+                        "fault_p95": round(fault_p95, 4),
+                        "delta_abs": round(fault_mean - base_mean, 4),
+                    }
+                )
             # Rank by absolute fault-vs-baseline deviation (descending) and
             # truncate. Negative deltas (metric DROPPED during fault, e.g.
             # traffic collapse) are still meaningful — keep them by magnitude.

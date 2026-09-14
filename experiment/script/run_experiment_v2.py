@@ -57,8 +57,13 @@ EXPERIMENT_METRICS: List[MetricSpec] = [
     MetricSpec(
         column_name="tempo_resposta_medio",
         source="golden",
-        aliases=["Latency Mean", "Latency Average", "Response Time Mean", "Response Time Average"],
-        fallback_query='sum(rate(request_duration_seconds_sum[5m])) by (name) / sum(rate(request_duration_seconds_count[5m])) by (name)',
+        aliases=[
+            "Latency Mean",
+            "Latency Average",
+            "Response Time Mean",
+            "Response Time Average",
+        ],
+        fallback_query="sum(rate(request_duration_seconds_sum[5m])) by (name) / sum(rate(request_duration_seconds_count[5m])) by (name)",
     ),
     MetricSpec(
         column_name="tempo_resposta_p95",
@@ -98,7 +103,7 @@ def now_epoch() -> float:
 
 def normalize_service_name(label_value: str) -> Optional[str]:
     """Extract service name from pod label or use name directly.
-    
+
     Examples:
     - 'front' -> 'front'
     - 'front-5f65464684-6fhlt' -> 'front'
@@ -106,7 +111,7 @@ def normalize_service_name(label_value: str) -> Optional[str]:
     """
     if not isinstance(label_value, str):
         return None
-    
+
     # Try to match known services
     for service in SERVICES_TO_CAPTURE:
         if label_value == service:
@@ -114,7 +119,7 @@ def normalize_service_name(label_value: str) -> Optional[str]:
         # Check if it starts with service- (pod name pattern)
         if label_value.startswith(service + "-"):
             return service
-    
+
     return None
 
 
@@ -207,9 +212,13 @@ class MCPToolClient:
         )
         with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
             if response.status >= 400:
-                raise RuntimeError(f"SSE endpoint retornou status HTTP {response.status}")
+                raise RuntimeError(
+                    f"SSE endpoint retornou status HTTP {response.status}"
+                )
 
-    async def _call_tool_async(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
+    async def _call_tool_async(
+        self, name: str, arguments: Optional[Dict[str, Any]] = None
+    ) -> Any:
         async with sse_client(
             self.sse_url,
             timeout=self.timeout_seconds,
@@ -223,12 +232,16 @@ class MCPToolClient:
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
         return asyncio.run(self._call_tool_async(name, arguments))
 
-    def call_tool_json(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
+    def call_tool_json(
+        self, name: str, arguments: Optional[Dict[str, Any]] = None
+    ) -> Any:
         raw = self.call_tool(name, arguments)
         return _extract_mcp_payload(raw)
 
 
-def _metric_catalog_index(items: List[Dict[str, Any]], key_field: str) -> Dict[str, Dict[str, Any]]:
+def _metric_catalog_index(
+    items: List[Dict[str, Any]], key_field: str
+) -> Dict[str, Dict[str, Any]]:
     indexed: Dict[str, Dict[str, Any]] = {}
     for item in items:
         name = item.get(key_field)
@@ -294,7 +307,7 @@ def query_mcp_range_by_service(
     step_seconds: int,
 ) -> Dict[int, Dict[str, Optional[float]]]:
     """Query Prometheus and extract metrics by service.
-    
+
     Returns: Dict[timestamp, Dict[service_name, value]]
     """
     payload = client.call_tool_json(
@@ -317,16 +330,18 @@ def query_mcp_range_by_service(
 
     # Group by service, then by timestamp
     by_service_ts: Dict[int, Dict[str, float]] = {}
-    
+
     for series in result:
         # Extract service name from metric labels (name or pod)
         metric_labels = series.get("metric", {})
         service_name = metric_labels.get("name") or metric_labels.get("pod")
-        
-        normalized_service = normalize_service_name(service_name) if service_name else None
+
+        normalized_service = (
+            normalize_service_name(service_name) if service_name else None
+        )
         if not normalized_service:
             continue
-        
+
         values = series.get("values", [])
         for item in values:
             try:
@@ -334,19 +349,19 @@ def query_mcp_range_by_service(
                 val = float(item[1])
             except (TypeError, ValueError, IndexError):
                 continue
-            
+
             if ts not in by_service_ts:
                 by_service_ts[ts] = {}
             # Store value for this service (overwrite if duplicate, or sum if needed)
             by_service_ts[ts][normalized_service] = val
-    
+
     # Build output with all services for each timestamp
     out: Dict[int, Dict[str, Optional[float]]] = {}
     for ts in range(int(start_epoch), int(end_epoch) + 1, step_seconds):
         out[ts] = {}
         for service in SERVICES_TO_CAPTURE:
             out[ts][service] = by_service_ts.get(ts, {}).get(service)
-    
+
     return out
 
 
@@ -393,7 +408,9 @@ def query_mcp_range(
     return out
 
 
-def run_locust_round(args: argparse.Namespace, run_total_seconds: int) -> subprocess.CompletedProcess[str]:
+def run_locust_round(
+    args: argparse.Namespace, run_total_seconds: int
+) -> subprocess.CompletedProcess[str]:
     cmd = shlex.split(args.locust_cmd) + [
         "-f",
         args.locust_file,
@@ -476,7 +493,9 @@ def run(args: argparse.Namespace) -> Path:
                 step_seconds=args.sample_interval_seconds,
             )
 
-        ts_points = list(range(int(round_start), int(data_end) + 1, args.sample_interval_seconds))
+        ts_points = list(
+            range(int(round_start), int(data_end) + 1, args.sample_interval_seconds)
+        )
         for ts in ts_points:
             row: Dict[str, object] = {
                 "timestamp_utc": utc_iso_from_epoch(ts),
@@ -538,17 +557,17 @@ def run(args: argparse.Namespace) -> Path:
         "round_end_utc",
         "locust_exit_code",
     ]
-    
+
     # Add aggregate columns (for ready_row compatibility)
     aggregate_headers = metric_names
-    
+
     # Add per-service columns
     service_headers = [
         f"{metric_name}_{service}"
         for metric_name in metric_names
         for service in SERVICES_TO_CAPTURE
     ]
-    
+
     headers = base_headers + aggregate_headers + service_headers
 
     with out_path.open("w", newline="", encoding="utf-8") as f:
@@ -564,27 +583,58 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run multi-round locust experiments and export MCP-backed metrics to CSV"
     )
-    parser.add_argument("--mcp-sse-url", default="http://127.0.0.1:18080/sse", help="MCP SSE endpoint URL")
-    parser.add_argument("--mcp-timeout-seconds", type=int, default=10, help="MCP connection/tool timeout")
-    parser.add_argument("--output-csv", default="experiment/data/experiment.csv", help="Output CSV path")
+    parser.add_argument(
+        "--mcp-sse-url",
+        default="http://127.0.0.1:18080/sse",
+        help="MCP SSE endpoint URL",
+    )
+    parser.add_argument(
+        "--mcp-timeout-seconds",
+        type=int,
+        default=10,
+        help="MCP connection/tool timeout",
+    )
+    parser.add_argument(
+        "--output-csv", default="experiment/data/experiment.csv", help="Output CSV path"
+    )
 
     parser.add_argument("--rounds", type=int, default=3, help="Number of rounds")
-    parser.add_argument("--disabled-seconds", type=int, default=0, help="Idle time before warmup")
-    parser.add_argument("--warmup-seconds", type=int, default=60, help="Warmup duration")
-    parser.add_argument("--run-seconds", type=int, default=300, help="Experiment duration after warmup")
-    parser.add_argument("--sample-interval-seconds", type=int, default=15, help="Prometheus range step")
+    parser.add_argument(
+        "--disabled-seconds", type=int, default=0, help="Idle time before warmup"
+    )
+    parser.add_argument(
+        "--warmup-seconds", type=int, default=60, help="Warmup duration"
+    )
+    parser.add_argument(
+        "--run-seconds", type=int, default=300, help="Experiment duration after warmup"
+    )
+    parser.add_argument(
+        "--sample-interval-seconds", type=int, default=15, help="Prometheus range step"
+    )
 
     parser.add_argument(
         "--locust-cmd",
         default="kubectl -n loadtest exec deploy/locust-web -- locust",
         help="Comando para executar o Locust via Kubernetes (default: deploy/locust-web)",
     )
-    parser.add_argument("--locust-file", default="deploy/kubernetes/manifests-loadtest/locust.py", help="Path to locustfile.py")
-    parser.add_argument("--locust-host", default="http://front-end", help="Target host for load")
+    parser.add_argument(
+        "--locust-file",
+        default="deploy/kubernetes/manifests-loadtest/locust.py",
+        help="Path to locustfile.py",
+    )
+    parser.add_argument(
+        "--locust-host", default="http://front-end", help="Target host for load"
+    )
     parser.add_argument("--users", type=int, default=20, help="Concurrent users")
-    parser.add_argument("--spawn-rate", type=float, default=5.0, help="User growth rate")
-    parser.add_argument("--locust-web-host", default="0.0.0.0", help="Locust Web UI host")
-    parser.add_argument("--locust-web-port", type=int, default=8089, help="Locust Web UI port")
+    parser.add_argument(
+        "--spawn-rate", type=float, default=5.0, help="User growth rate"
+    )
+    parser.add_argument(
+        "--locust-web-host", default="0.0.0.0", help="Locust Web UI host"
+    )
+    parser.add_argument(
+        "--locust-web-port", type=int, default=8089, help="Locust Web UI port"
+    )
     parser.add_argument(
         "--locust-autoquit-seconds",
         type=int,
@@ -592,7 +642,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait before Locust exits after run-time in Web UI mode",
     )
     parser.add_argument("--locust-extra-args", default="", help="Extra locust CLI args")
-    parser.add_argument("--locust-grace-seconds", type=int, default=30, help="Extra timeout buffer")
+    parser.add_argument(
+        "--locust-grace-seconds", type=int, default=30, help="Extra timeout buffer"
+    )
     parser.add_argument(
         "--fail-on-locust-error",
         action="store_true",

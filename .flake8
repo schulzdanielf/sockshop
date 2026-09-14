@@ -1,0 +1,26 @@
+# flake8 configuration — kept in sync with [tool.black] in pyproject.toml.
+#
+# black is the single source of truth for formatting/line length (88 cols). It
+# wraps code automatically but intentionally leaves long string/data literals
+# (embedded YAML, SQL, PromQL, URLs) untouched. So we let black own line length
+# and disable flake8's E501 to avoid false positives on those literals, while
+# keeping all the valuable correctness checks (pyflakes F*, E7xx, E9xx, etc.).
+#
+# E203 (whitespace before ':') and W503 (line break before binary operator)
+# are disabled because they conflict with black.
+[flake8]
+max-line-length = 88
+extend-ignore = E203, W503, E501
+exclude =
+    .git,
+    .venv,
+    node_modules,
+    __pycache__,
+    build,
+    dist,
+    *.egg-info,
+    experiment/eval/memory_hog/out,
+    experiment/eval/memory_hog/out-mini
+# Allow unused imports in package __init__ files (re-exports).
+per-file-ignores =
+    __init__.py: F401

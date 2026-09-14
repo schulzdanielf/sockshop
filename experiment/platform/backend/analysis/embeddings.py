@@ -21,7 +21,6 @@ from typing import Iterable, List, Optional, Protocol, Sequence
 
 import numpy as np
 
-
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:@/-]+")
 
 
@@ -61,6 +60,7 @@ def anonymize_services(text: str, services: Sequence[str]) -> str:
     def _first_pos(svc: str) -> int:
         m = re.search(rf"\b{re.escape(svc)}\b", text, flags=re.IGNORECASE)
         return m.start() if m else 10**9
+
     candidates.sort(key=_first_pos)
 
     out = text
@@ -79,8 +79,11 @@ class EmbeddingProvider(Protocol):
     name: str
     dim: int
 
-    def embed(self, text: str) -> np.ndarray: ...
-    def embed_batch(self, texts: Sequence[str]) -> np.ndarray: ...
+    def embed(self, text: str) -> np.ndarray:
+        ...
+
+    def embed_batch(self, texts: Sequence[str]) -> np.ndarray:
+        ...
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -210,7 +213,5 @@ def vector_to_blob(vec: np.ndarray) -> bytes:
 def blob_to_vector(blob: bytes, dim: int) -> np.ndarray:
     arr = np.frombuffer(blob, dtype=np.float32)
     if arr.size != dim:
-        raise ValueError(
-            f"embedding dim mismatch: blob has {arr.size}, expected {dim}"
-        )
+        raise ValueError(f"embedding dim mismatch: blob has {arr.size}, expected {dim}")
     return arr

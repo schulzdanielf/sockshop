@@ -1,6 +1,0 @@
-phase,chaos_type,service,replica_idx,chaos_target,experiment_id,run_id,status,started_at,ended_at,notes
-train,memory-hog,catalogue,0,catalogue,memhog-catalogue-r0-20260526-212928,run-96516d24def1,completed,2026-05-26T21:29:28.596735+00:00,2026-05-26T21:33:31.164639+00:00,
-train,cpu-hog,orders,0,orders,cpuhog-orders-r0-20260526-213441,run-466890f7f5d6,completed,2026-05-26T21:34:41.230651+00:00,2026-05-26T21:38:48.235042+00:00,
-train,pod-delete,carts,0,carts,poddel-carts-r0-20260526-214008,run-1207401eb090,completed,2026-05-26T21:40:08.863171+00:00,2026-05-26T21:44:15.830358+00:00,
-test,memory-hog,user,0,user,memhog-user-r0-20260526-214536,run-78bb2b56d58c,completed,2026-05-26T21:45:36.503162+00:00,2026-05-26T21:49:41.154761+00:00,
-test,pod-delete,shipping,0,shipping,poddel-shipping-r0-20260526-215104,run-d3f8758be89d,completed,2026-05-26T21:51:04.219347+00:00,2026-05-26T21:55:10.232382+00:00,

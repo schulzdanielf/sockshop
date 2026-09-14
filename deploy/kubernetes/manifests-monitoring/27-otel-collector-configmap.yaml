@@ -86,6 +86,10 @@ data:
               - set(attributes["error_fingerprint"], "timeout_error") where attributes["error_fingerprint"] == nil and IsMatch(body, "(?i)timeout")
               - set(attributes["error_fingerprint"], "generic_exception") where attributes["error_fingerprint"] == nil and IsMatch(body, "(?i)exception")
               - set(attributes["error_fingerprint"], "generic_error") where attributes["error_fingerprint"] == nil and IsMatch(body, "(?i)error")
+              - set(attributes["run_id"], ExtractPatterns(body, "\"run_id\":\\s*\"(?P<val>[^\"]+)\"")["val"]) where IsMatch(body, "\"run_id\"")
+              - set(attributes["eval_target"], ExtractPatterns(body, "\"eval_target\":\\s*\"(?P<val>[^\"]+)\"")["val"]) where IsMatch(body, "\"eval_target\"")
+              - set(attributes["eval_fault"], ExtractPatterns(body, "\"eval_fault\":\\s*\"(?P<val>[^\"]+)\"")["val"]) where IsMatch(body, "\"eval_fault\"")
+              - set(attributes["eval_strategy"], ExtractPatterns(body, "\"eval_strategy\":\\s*\"(?P<val>[^\"]+)\"")["val"]) where IsMatch(body, "\"eval_strategy\"")
       attributes/loki_format:
         actions:
           - action: upsert
@@ -95,7 +99,7 @@ data:
         actions:
           - action: upsert
             key: loki.attribute.labels
-            value: log_source,namespace,pod,container,service,level,error_type,error_fingerprint
+            value: log_source,namespace,pod,container,service,level,error_type,error_fingerprint,run_id,eval_target,eval_fault,eval_strategy
       transform/db_peer_service:
         trace_statements:
           - context: span

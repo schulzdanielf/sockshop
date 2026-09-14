@@ -34,7 +34,6 @@ import statistics
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-
 _SHAPE_PRIORITY = {
     "persistent": 4,
     "oscillating": 3,
@@ -276,7 +275,7 @@ def compute_temporal_features(
             continue
 
         # Threshold preference: SLO threshold if known, else baseline*tol.
-        slo = (slo_thresholds or {})
+        slo = slo_thresholds or {}
         if metric_id == "error_rate":
             violation_threshold: Optional[float] = slo.get("error_rate")
         elif metric_id == "latency_p95":
@@ -287,7 +286,9 @@ def compute_temporal_features(
                 float(base) * (1.0 + tolerance_pct) if base is not None else None
             )
 
-        time_violation = _time_to_first_violation(fault_pts, violation_threshold, fault_lo)
+        time_violation = _time_to_first_violation(
+            fault_pts, violation_threshold, fault_lo
+        )
         time_peak, peak_value = _time_to_peak(fault_pts, fault_lo)
         max_deriv = _max_abs_derivative(fault_pts)
         cv = _coef_of_variation([v for _, v in fault_pts])
@@ -312,7 +313,9 @@ def compute_temporal_features(
             ),
             "time_to_peak_s": round(time_peak, 2) if time_peak is not None else None,
             "peak_value": round(peak_value, 4) if peak_value is not None else None,
-            "max_abs_derivative": round(max_deriv, 6) if max_deriv is not None else None,
+            "max_abs_derivative": round(max_deriv, 6)
+            if max_deriv is not None
+            else None,
             "coefficient_of_variation_fault": (
                 round(cv, 4) if cv is not None else None
             ),

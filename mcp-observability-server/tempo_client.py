@@ -1,7 +1,8 @@
 """Tempo client for searching and retrieving traces."""
-import httpx
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
+
+import httpx
 from config import settings
 
 
@@ -16,14 +17,16 @@ def _ago_unix(minutes: int = 60) -> int:
 class TempoClient:
     """Client for querying Tempo traces."""
 
-    def __init__(self, base_url: str = settings.tempo_url, timeout: int = settings.tempo_timeout):
+    def __init__(
+        self, base_url: str = settings.tempo_url, timeout: int = settings.tempo_timeout
+    ):
         """Initialize Tempo client.
 
         Args:
             base_url: Tempo base URL
             timeout: Request timeout in seconds
         """
-        self.base_url = base_url.rstrip('/')
+        self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.client = httpx.Client(timeout=timeout)
 
@@ -58,8 +61,20 @@ class TempoClient:
         """
         params: Dict[str, Any] = {
             "limit": limit,
-            "start": int(start) if start and str(start).isdigit() else (int(datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp()) if start else _ago_unix(last_minutes)),
-            "end":   int(end)   if end   and str(end).isdigit()   else (int(datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp())   if end   else _now_unix()),
+            "start": int(start)
+            if start and str(start).isdigit()
+            else (
+                int(datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp())
+                if start
+                else _ago_unix(last_minutes)
+            ),
+            "end": int(end)
+            if end and str(end).isdigit()
+            else (
+                int(datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp())
+                if end
+                else _now_unix()
+            ),
         }
 
         if min_duration_ms is not None:

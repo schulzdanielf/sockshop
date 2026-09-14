@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Python tooling configuration (black / isort / pytest)
+#
+# Scope: the experiment platform, evaluation harness, MCP observability server
+# and model helpers. Infrastructure assets (Kubernetes manifests, Terraform,
+# the Node OpenAPI tooling, the vendored .venv, etc.) are excluded below.
+#
+# flake8 does not read pyproject.toml — its configuration lives in `.flake8`.
+# Keep `line-length`/`max-line-length` in sync between the two files.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+extend-exclude = '''
+/(
+    \.venv
+  | \.git
+  | node_modules
+  | __pycache__
+  | experiment/eval/memory_hog/out
+  | experiment/eval/memory_hog/out-mini
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+skip_gitignore = true
+skip = [".venv", "node_modules"]
+known_first_party = ["experiment"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = [
+    "experiment/platform/tests",
+    "experiment/eval/memory_hog/tests",
+    "mcp-observability-server/tests",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

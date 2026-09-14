@@ -1,3 +1,9 @@
+"""Lightweight role-based access control for API endpoints.
+
+Provides :func:`require_roles`, a FastAPI dependency factory that gates a
+route behind a set of allowed operator roles supplied via request header.
+"""
+
 from __future__ import annotations
 
 from typing import Callable, Iterable
