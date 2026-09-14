@@ -4,19 +4,32 @@ Supports both the legacy ``POST /generate`` endpoint and an OpenAI-style
 ``POST /v1/chat/completions`` surface so the platform can evolve toward
 multi-agent orchestration without changing its call sites.
 """
+
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import os
+import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
+
+from pydantic import BaseModel, Field
 
 DEFAULT_LLM_URL = os.environ.get("LLM_URL", "http://localhost:8001/generate")
 DEFAULT_LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "120"))
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "qwen-14b")
 DEFAULT_LLM_API_STYLE = os.environ.get("LLM_API_STYLE", "auto")
+DEFAULT_GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "0"))
+DEFAULT_GEMINI_RETRY_DELAY = float(os.environ.get("GEMINI_RETRY_DELAY", "2"))
+DEFAULT_GEMINI_RETRY_RATE_LIMITS = os.environ.get(
+    "GEMINI_RETRY_RATE_LIMITS", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_GEMINI_ALLOW_MODEL_FALLBACK = os.environ.get(
+    "GEMINI_ALLOW_MODEL_FALLBACK", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_GEMINI_THINKING_BUDGET = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))
 
 
 def _get_api_key(override: Optional[str] = None) -> Optional[str]:
@@ -29,6 +42,7 @@ def _get_api_key(override: Optional[str] = None) -> Optional[str]:
         or os.environ.get("GITHUB_TOKEN")
         or os.environ.get("COPILOT_API_KEY")
     )
+
 
 _OTEL_SPEC = importlib.util.find_spec("opentelemetry")
 if _OTEL_SPEC is not None:
@@ -109,7 +123,9 @@ def _request_json(
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         err_body = exc.read().decode("utf-8", errors="replace")
-        raise LLMClientError(f"LLM HTTP {exc.code} from {url}: {err_body[:500]}") from exc
+        raise LLMClientError(
+            f"LLM HTTP {exc.code} from {url}: {err_body[:500]}"
+        ) from exc
     except urllib.error.URLError as exc:
         raise LLMClientError(f"LLM unreachable at {url}: {exc}") from exc
     try:
@@ -160,22 +176,123 @@ def call_llm_messages(
     key = _get_api_key(api_key)
 
     if style == "gemini":
-        target_url = url
-        # Automatically append API key parameter if needed
-        if key and "key=" not in target_url:
-            delimiter = "&" if "?" in target_url else "?"
-            target_url = f"{target_url}{delimiter}key={key}"
-        
+        key = _get_api_key(api_key)
+        if not key:
+            raise LLMClientError(
+                "GEMINI_API_KEY environment variable or api_key parameter is missing."
+            )
+
+        target_model = (
+            model if model and "gemini" in model.lower() else "gemini-2.5-flash"
+        )
         prompt = _messages_to_prompt(messages)
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": int(max_new_tokens),
-                "responseMimeType": "application/json",
-            },
-        }
-        data = _request_json(target_url, payload, timeout, api_key=None, send_auth_header=False)
-        return _extract_gemini_text(data)
+
+        from google import genai
+        from google.genai import types
+        from google.genai.errors import APIError
+
+        client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(timeout=max(1, int(timeout * 1000))),
+        )
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=int(max_new_tokens),
+            response_mime_type="application/json",
+            response_schema=RcaAnalysisResponse,
+            thinking_config=types.ThinkingConfig(
+                include_thoughts=False,
+                thinking_budget=DEFAULT_GEMINI_THINKING_BUDGET,
+            ),
+        )
+
+        models_to_try = [target_model]
+        if DEFAULT_GEMINI_ALLOW_MODEL_FALLBACK and target_model != "gemini-2.5-flash":
+            models_to_try.append("gemini-2.5-flash")
+
+        last_error = None
+        max_retries = max(0, DEFAULT_GEMINI_MAX_RETRIES)
+        for m in models_to_try:
+            for attempt in range(max_retries + 1):
+                try:
+                    response = client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                        config=config,
+                    )
+                    if response.text:
+                        text_content = response.text.strip()
+                        # Clean up markdown code blocks (```json ... ```) if returned
+                        if text_content.startswith("```"):
+                            lines = text_content.splitlines()
+                            if lines[0].startswith("```"):
+                                lines = lines[1:]
+                            if lines and lines[-1].startswith("```"):
+                                lines = lines[:-1]
+                            text_content = "\n".join(lines).strip()
+                        return text_content
+                    raise LLMClientError("Gemini returned an empty response")
+                except APIError as exc:
+                    last_error = exc
+                    clean_msg = str(getattr(exc, "message", exc) or exc).replace(
+                        key, "[REDACTED]"
+                    )
+                    code = getattr(exc, "code", None)
+                    rate_limited = (
+                        code == 429
+                        or "429" in clean_msg
+                        or "quota" in clean_msg.lower()
+                        or "resource_exhausted" in clean_msg.lower()
+                    )
+                    retryable = (
+                        rate_limited
+                        or code in {500, 502, 503}
+                        or "overloaded" in clean_msg.lower()
+                    )
+                    if rate_limited and not DEFAULT_GEMINI_RETRY_RATE_LIMITS:
+                        raise LLMClientError(
+                            "Gemini rate limit or quota exhausted; not retrying. "
+                            "Set GEMINI_RETRY_RATE_LIMITS=true to opt in. "
+                            f"Original error: {clean_msg}"
+                        ) from exc
+                    if retryable and attempt < max_retries:
+                        delay = min(DEFAULT_GEMINI_RETRY_DELAY * (2**attempt), 8.0)
+                        time.sleep(delay)
+                        continue
+                    raise LLMClientError(
+                        f"Gemini APIError {getattr(exc, 'code', 'error')}: {clean_msg}"
+                    ) from exc
+                except Exception as exc:
+                    last_error = exc
+                    clean_msg = str(exc).replace(key, "[REDACTED]")
+                    rate_limited = (
+                        "429" in clean_msg
+                        or "quota" in clean_msg.lower()
+                        or "resource_exhausted" in clean_msg.lower()
+                    )
+                    retryable = (
+                        rate_limited
+                        or "overloaded" in clean_msg.lower()
+                        or "503" in clean_msg
+                    )
+                    if rate_limited and not DEFAULT_GEMINI_RETRY_RATE_LIMITS:
+                        raise LLMClientError(
+                            "Gemini rate limit or quota exhausted; not retrying. "
+                            "Set GEMINI_RETRY_RATE_LIMITS=true to opt in. "
+                            f"Original error: {clean_msg}"
+                        ) from exc
+                    if retryable and attempt < max_retries:
+                        delay = min(DEFAULT_GEMINI_RETRY_DELAY * (2**attempt), 8.0)
+                        time.sleep(delay)
+                        continue
+                    raise LLMClientError(f"Gemini error: {clean_msg}") from exc
+
+        clean_last_err = (
+            str(last_error).replace(key, "[REDACTED]")
+            if last_error
+            else "unknown error"
+        )
+        raise LLMClientError(f"Gemini failed after retries: {clean_last_err}")
 
     if style == "openai":
         payload_openai: Dict[str, Any] = {
@@ -275,17 +392,15 @@ def _extract_first_json_object(text: str) -> Optional[str]:
     return None
 
 
-from typing import Any, Dict, Iterable, List, Optional, Literal
-from pydantic import BaseModel, Field
-
-
 # ── Pydantic Schema para validação sintática e contratual da resposta RCA ────
 class RcaAnalysisResponse(BaseModel):
     reasoning: str = Field(
         ...,
-        description="Análise passo a passo da telemetria, métricas e logs",
+        description="Resumo conciso das evidências usadas, em até duas frases",
     )
-    verdict: Optional[Literal["resilient", "degraded_recoverable", "degraded_persistent"]] = Field(
+    verdict: Optional[
+        Literal["resilient", "degraded_recoverable", "degraded_persistent"]
+    ] = Field(
         default=None,
         description="Veredito de resiliência da plataforma",
     )
@@ -352,7 +467,9 @@ def parse_verdict_response(text: str) -> Dict[str, Any]:
         out["reasoning"] = validated.reasoning.strip()
         out["verdict"] = validated.verdict
         out["rca"] = validated.rca.strip() if validated.rca else None
-        out["fault_category"] = validated.fault_category.strip() if validated.fault_category else None
+        out["fault_category"] = (
+            validated.fault_category.strip() if validated.fault_category else None
+        )
         out["confidence"] = validated.confidence
         out["citations"] = validated.citations
         out["follow_ups"] = validated.follow_ups

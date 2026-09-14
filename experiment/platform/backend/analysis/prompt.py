@@ -15,6 +15,7 @@ Token accounting is intentionally a cheap heuristic (chars/4) — Qwen's
 real tokenizer lives in a different process and we just need to stay
 safely under the 4k context window with headroom for ``max_new_tokens``.
 """
+
 from __future__ import annotations
 
 import re
@@ -91,7 +92,7 @@ SYSTEM_PROMPT = (
 
 ANSWER_SCHEMA = (
     "{\n"
-    '  "reasoning": "Step-by-step analysis of telemetry, metrics, and logs...",\n'
+    '  "reasoning": "Concise evidence summary, max two sentences.",\n'
     '  "verdict": "resilient|degraded_recoverable|degraded_persistent",\n'
     '  "rca": "<service name from allowed_rca_targets>",\n'
     '  "fault_category": "<value from allowed_fault_categories>",\n'

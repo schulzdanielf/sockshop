@@ -35,6 +35,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 import sys
@@ -55,6 +56,10 @@ ROOT = HERE.parents[2]
 CONFIG_PATH = HERE / "config.yaml"
 
 TERMINAL_STATUSES = {"completed", "failed"}
+DEFAULT_EVAL_LLM_REQUEST_TIMEOUT_SECONDS = int(
+    os.environ.get("EVAL_LLM_REQUEST_TIMEOUT_SECONDS", "180")
+)
+DEFAULT_GEMINI_MAX_NEW_TOKENS = int(os.environ.get("GEMINI_MAX_NEW_TOKENS", "512"))
 
 
 # ── Tiny HTTP helper (no `requests` dep needed) ────────────────────────────
@@ -92,12 +97,18 @@ class ApiClient:
             )
         return self._req("GET", path)
 
-    def post(self, path: str, body: Optional[dict] = None, **q: Any) -> Any:
+    def post(
+        self,
+        path: str,
+        body: Optional[dict] = None,
+        request_timeout: Optional[int] = None,
+        **q: Any,
+    ) -> Any:
         if q:
             path += "?" + urllib.parse.urlencode(
                 {k: v for k, v in q.items() if v is not None}
             )
-        return self._req("POST", path, body=body, timeout=600)
+        return self._req("POST", path, body=body, timeout=request_timeout or 600)
 
 
 # ── Chaos-type lookup ────────────────────────────────────────────────────
@@ -269,8 +280,9 @@ def build_spec(
     fault_category = ct.get("fault_category", "unknown")
     pretty = ct.get("name", chaos_type)
 
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
-    exp_id = f"{short}-{service}-r{replica_idx}-{stamp}"
+    # Keep the corpus boundary stable across TRAIN/TEST and repeated runs.
+    # Database version and run_id still distinguish individual executions.
+    exp_id = str(cfg.get("experiment_campaign_id") or "multi-chaos-eval-v1")
     chaos_engine = f"{service}-{suffix}"  # Argo workflow template name
     return {
         "schema_version": "1.0.0",
@@ -357,6 +369,46 @@ def build_spec(
                         "query": (
                             "histogram_quantile(0.99, sum(rate("
                             "request_duration_seconds_bucket[5m])) by (le,name))"
+                        ),
+                    },
+                    # ── Network signals ─────────────────────────────────
+                    # Interface-level counters are collected by cAdvisor and
+                    # grouped by pod in per_label_hotspots. They are kept
+                    # target-agnostic so they cannot leak the injected service.
+                    {
+                        "id": "network_receive_bytes_rate",
+                        "query": (
+                            "sum(rate(container_network_receive_bytes_total[1m]))"
+                        ),
+                    },
+                    {
+                        "id": "network_transmit_bytes_rate",
+                        "query": (
+                            "sum(rate(container_network_transmit_bytes_total[1m]))"
+                        ),
+                    },
+                    {
+                        "id": "network_receive_errors_rate",
+                        "query": (
+                            "sum(rate(container_network_receive_errors_total[1m]))"
+                        ),
+                    },
+                    {
+                        "id": "network_transmit_errors_rate",
+                        "query": (
+                            "sum(rate(container_network_transmit_errors_total[1m]))"
+                        ),
+                    },
+                    {
+                        "id": "network_receive_dropped_rate",
+                        "query": (
+                            "sum(rate(container_network_receive_packets_dropped_total[1m]))"
+                        ),
+                    },
+                    {
+                        "id": "network_transmit_dropped_rate",
+                        "query": (
+                            "sum(rate(container_network_transmit_packets_dropped_total[1m]))"
                         ),
                     },
                     # ── Saturation: CPU ──
@@ -589,6 +641,8 @@ class StrategyResult:
     confidence: Optional[float]
     fault_category: Optional[str]  # predicted fault_category from LLM
     prompt_tokens: Optional[int]
+    prompt_sha256: Optional[str]
+    backend_timing_ms: Optional[str]
     neighbours_used: Optional[int]
     rag_mode: Optional[str]
     system_card_id: Optional[str]
@@ -635,15 +689,37 @@ def evaluate_strategy(
     older evaluation.csv consumers (notebooks, etc.).
     """
     name = strategy["name"]
+    max_new_tokens = int(strategy.get("max_new_tokens", 512))
+    request_timeout = int(
+        os.environ.get(
+            "EVAL_LLM_REQUEST_TIMEOUT_SECONDS",
+            str(DEFAULT_EVAL_LLM_REQUEST_TIMEOUT_SECONDS),
+        )
+    )
+    if llm_provider and "gemini" in llm_provider.lower():
+        gemini_token_cap = int(
+            os.environ.get("GEMINI_MAX_NEW_TOKENS", str(DEFAULT_GEMINI_MAX_NEW_TOKENS))
+        )
+        max_new_tokens = min(max_new_tokens, gemini_token_cap)
+    print(
+        "         request "
+        f"provider={llm_provider or 'default'} model={llm_model or 'default'} "
+        f"mode={strategy['mode']} limit={strategy['limit']} "
+        f"budget_tokens={strategy['budget_tokens']} max_new_tokens={max_new_tokens} "
+        f"timeout={request_timeout}s",
+        flush=True,
+    )
+    started = time.monotonic()
     try:
         resp = api.post(
             f"/api/runs/{run.run_id}/llm-analysis",
+            request_timeout=request_timeout,
             force="true",
             limit=strategy["limit"],
             mode=strategy["mode"],
             system_id=strategy["system_id"],
             budget_tokens=strategy["budget_tokens"],
-            max_new_tokens=strategy.get("max_new_tokens", 512),
+            max_new_tokens=max_new_tokens,
             provider=llm_provider,
             model=llm_model,
             eval_target=run.chaos_target,
@@ -651,6 +727,8 @@ def evaluate_strategy(
             eval_strategy=name,
         )
     except Exception as exc:  # pragma: no cover - network/LLM failures
+        elapsed = time.monotonic() - started
+        print(f"         failed after {elapsed:.1f}s: {exc}", flush=True)
         return StrategyResult(
             run_id=run.run_id or "",
             chaos_target=run.chaos_target,
@@ -664,11 +742,15 @@ def evaluate_strategy(
             confidence=None,
             fault_category=None,
             prompt_tokens=None,
+            prompt_sha256=None,
+            backend_timing_ms=None,
             neighbours_used=None,
             rag_mode=None,
             system_card_id=None,
             raw_error=str(exc)[:500],
         )
+    elapsed = time.monotonic() - started
+    print(f"         response after {elapsed:.1f}s", flush=True)
 
     analysis = resp.get("analysis", {}) if isinstance(resp, dict) else {}
     predicted = _safe_get(analysis, "rca")
@@ -694,6 +776,14 @@ def evaluate_strategy(
 
         correct_fault = norm(predicted_fault) == norm(expected_fault)
     correct_full = bool(correct_target and correct_fault)
+    timing_meta = _safe_get(analysis, "timing_meta", default={}) or {}
+    backend_timing_ms = None
+    if isinstance(timing_meta, dict) and timing_meta:
+        backend_timing_ms = ",".join(
+            f"{key}={timing_meta.get(key)}"
+            for key in ("rag_ms", "prompt_ms", "llm_ms", "parse_ms", "total_ms")
+        )
+        print(f"         backend_timing {backend_timing_ms}", flush=True)
 
     return StrategyResult(
         run_id=run.run_id or "",
@@ -708,6 +798,8 @@ def evaluate_strategy(
         confidence=_safe_get(analysis, "confidence"),
         fault_category=predicted_fault,
         prompt_tokens=_safe_get(analysis, "prompt_meta", "prompt_tokens_estimate"),
+        prompt_sha256=_safe_get(analysis, "prompt_meta", "prompt_sha256"),
+        backend_timing_ms=backend_timing_ms,
         neighbours_used=_safe_get(analysis, "prompt_meta", "neighbours_used"),
         rag_mode=_safe_get(analysis, "rag_mode"),
         system_card_id=_safe_get(analysis, "prompt_meta", "system_card_id"),
@@ -749,6 +841,8 @@ EVAL_FIELDS = [
     "correct_full",
     "confidence",
     "prompt_tokens",
+    "prompt_sha256",
+    "backend_timing_ms",
     "neighbours_used",
     "rag_mode",
     "system_card_id",
@@ -771,6 +865,13 @@ def _write_csv(path: Path, rows: List[Dict[str, Any]], fields: List[str]) -> Non
         w.writeheader()
         for row in rows:
             w.writerow({k: row.get(k, "") for k in fields})
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _load_runs_csv(path: Path) -> List[RunRecord]:
@@ -903,9 +1004,9 @@ def phase_chaos(
         prior = _load_runs_csv(runs_csv)
         for rec in prior:
             if rec.status == "completed" and rec.run_id:
-                completed[
-                    (rec.phase, rec.chaos_type, rec.service, rec.replica_idx)
-                ] = rec
+                completed[(rec.phase, rec.chaos_type, rec.service, rec.replica_idx)] = (
+                    rec
+                )
         print(
             f"[retry-failed] keeping {len(completed)} completed cell(s) "
             f"from previous run"
@@ -936,7 +1037,7 @@ def phase_chaos(
         all_records,
         runs_csv,
     )
-    print(f"Wrote {len(all_records)} run records to {runs_csv.relative_to(ROOT)}")
+    print(f"Wrote {len(all_records)} run records to {_display_path(runs_csv)}")
     return all_records
 
 
@@ -983,6 +1084,10 @@ def phase_eval(
             )
             run.chaos_target = gt_service_persisted
         for strategy in cfg["strategies"]:
+            if llm_provider and "gemini" in llm_provider.lower():
+                delay_s = float(os.environ.get("GEMINI_EVAL_DELAY_SECONDS", "0"))
+                if delay_s > 0:
+                    time.sleep(delay_s)
             print(
                 f"  [EVAL ] run={run.run_id} target={run.chaos_target} "
                 f"fault={expected_fault} strategy={strategy['name']}"
@@ -1005,10 +1110,11 @@ def phase_eval(
                     f"target_ok={res.correct_target} "
                     f"fault_ok={res.correct_fault} "
                     f"full_ok={res.correct_full} "
-                    f"conf={res.confidence} tokens={res.prompt_tokens}"
+                    f"conf={res.confidence} tokens={res.prompt_tokens} "
+                    f"prompt_sha={res.prompt_sha256 or 'n/a'}"
                 )
     _write_csv(eval_csv, [r.__dict__ for r in results], EVAL_FIELDS)
-    print(f"Wrote {len(results)} evaluation rows to {eval_csv.relative_to(ROOT)}")
+    print(f"Wrote {len(results)} evaluation rows to {_display_path(eval_csv)}")
     _print_summary(results, cfg)
     return results
 
@@ -1102,17 +1208,31 @@ def _print_accuracy_table(
             final_scores = []
             for r in rows:
                 _, score = _compute_prediction_scores(
-                    raw_rca=r.localizer_original_rca if r.localizer_fired else r.predicted_rca,
-                    raw_fault_category=r.validator_original_fault if r.validator_fired else r.fault_category,
+                    raw_rca=(
+                        r.localizer_original_rca
+                        if r.localizer_fired
+                        else r.predicted_rca
+                    ),
+                    raw_fault_category=(
+                        r.validator_original_fault
+                        if r.validator_fired
+                        else r.fault_category
+                    ),
                     final_rca=r.predicted_rca,
                     final_fault_category=r.fault_category,
                     chaos_target=r.chaos_target,
                     expected_fault_category=r.expected_fault_category,
                 )
                 final_scores.append(score)
-            acc_target = sum(1 for s in final_scores if s["correct_target"]) / n if n else 0.0
-            acc_fault = sum(1 for s in final_scores if s["correct_fault"]) / n if n else 0.0
-            acc_full = sum(1 for s in final_scores if s["correct_full"]) / n if n else 0.0
+            acc_target = (
+                sum(1 for s in final_scores if s["correct_target"]) / n if n else 0.0
+            )
+            acc_fault = (
+                sum(1 for s in final_scores if s["correct_fault"]) / n if n else 0.0
+            )
+            acc_full = (
+                sum(1 for s in final_scores if s["correct_full"]) / n if n else 0.0
+            )
         avg_tok = (
             (sum((r.prompt_tokens or 0) for r in valid) / len(valid)) if valid else 0.0
         )

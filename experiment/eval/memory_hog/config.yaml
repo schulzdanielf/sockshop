@@ -22,6 +22,10 @@ cluster:
   litmus_namespace: "litmus"
   argo_controller_instanceid: "f21787ba-08ee-4649-ab66-c880492636dc"
 
+# Stable corpus boundary for repeated executions of this evaluation campaign.
+# TRAIN and TEST runs share this ID; the database version/run_id distinguish them.
+experiment_campaign_id: "multi-chaos-eval-v2"
+
 # ── Chaos types (one entry per fault injected by the harness) ──────────────
 # Each entry maps to a generated Argo Workflow template named
 # "<service>-<template_suffix>" (e.g. ``carts-cpu-hog``).

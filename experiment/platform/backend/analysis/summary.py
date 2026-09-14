@@ -41,6 +41,61 @@ def _phase_line(metric_id: str, phase_stats: Dict[str, Any]) -> str:
     return f"- {metric_id}: " + " | ".join(parts)
 
 
+def _metric_change_score(phase_stats: Dict[str, Any]) -> float:
+    """Estimate how discriminative a metric is between baseline and fault."""
+    baseline = (phase_stats.get("baseline") or {}).get("mean")
+    fault = (phase_stats.get("fault") or {}).get("mean")
+    try:
+        baseline_value = float(baseline)
+        fault_value = float(fault)
+    except (TypeError, ValueError):
+        return 0.0
+    if baseline_value != baseline_value or fault_value != fault_value:
+        return 0.0
+    delta = abs(fault_value - baseline_value)
+    denominator = max(abs(baseline_value), 1e-9)
+    return delta / denominator if delta else 0.0
+
+
+def _select_prompt_metrics(
+    phase_metrics: Dict[str, Any],
+    violations: List[Dict[str, Any]],
+    *,
+    max_changed: int = 8,
+    max_controls: int = 3,
+) -> List[str]:
+    """Select discriminative L1 metrics for the compact L2 prompt.
+
+    Raw metrics remain fully persisted. This selector only reduces prompt
+    volume: changed metrics and SLO metrics are retained, plus a few stable
+    controls that help the model reject competing hypotheses.
+    """
+    if not phase_metrics:
+        return []
+
+    violation_ids = {str(v.get("metric")) for v in violations if v.get("metric")}
+    ranked = sorted(
+        (
+            (_metric_change_score(stats), metric_id)
+            for metric_id, stats in phase_metrics.items()
+            if isinstance(stats, dict)
+        ),
+        reverse=True,
+    )
+    changed = [
+        metric_id
+        for score, metric_id in ranked
+        if score > 0.10 or metric_id in violation_ids
+    ][:max_changed]
+
+    controls = [
+        metric_id
+        for score, metric_id in ranked
+        if metric_id not in changed and score <= 0.10
+    ][:max_controls]
+    return changed + controls
+
+
 def _render_pod_health(features: Dict[str, Any]) -> List[str]:
     """Convert OOMKilled / pod_restarts_total hotspots into explicit
     English sentences.
@@ -154,6 +209,23 @@ def build_summary_tags(features: Dict[str, Any]) -> List[str]:
         phase = v.get("phase")
         if metric and phase:
             tags.append(f"violation:{metric}@{phase}")
+    network_metric_ids = (
+        "network_receive_errors_rate",
+        "network_transmit_errors_rate",
+        "network_receive_dropped_rate",
+        "network_transmit_dropped_rate",
+    )
+    network_hotspots = features.get("metric_hotspots") or {}
+    if any(
+        any(
+            isinstance(row, dict)
+            and (abs(float(row.get("delta_abs") or 0.0)) > 1e-6)
+            for row in (network_hotspots.get(metric, {}).get("top") or [])
+        )
+        for metric in network_metric_ids
+        if isinstance(network_hotspots.get(metric), dict)
+    ):
+        tags.append("network:signal")
     rt = features.get("recovery_time_seconds")
     if rt is None:
         tags.append("recovery:none")
@@ -256,10 +328,51 @@ def build_run_summary_l2(
 
     # Per-phase metrics
     if phase_metrics:
+        selected_metric_ids = _select_prompt_metrics(phase_metrics, violations)
         lines.append("\n## Per-phase metrics")
-        for metric_id, phase_stats in list(phase_metrics.items())[:8]:
+        lines.append(
+            "Only metrics with material fault-vs-baseline change, SLO violations, "
+            "or a small negative-control set are shown below; the complete raw "
+            "metric collection remains persisted in L1 artifacts."
+        )
+        network_metric_ids = {
+            "network_receive_bytes_rate",
+            "network_transmit_bytes_rate",
+            "network_receive_errors_rate",
+            "network_transmit_errors_rate",
+            "network_receive_dropped_rate",
+            "network_transmit_dropped_rate",
+        }
+        for metric_id in selected_metric_ids:
+            if metric_id in network_metric_ids:
+                continue
+            phase_stats = phase_metrics.get(metric_id)
             if isinstance(phase_stats, dict):
                 lines.append(_phase_line(metric_id, phase_stats))
+
+        network_metric_ids_ordered = (
+            "network_receive_bytes_rate",
+            "network_transmit_bytes_rate",
+            "network_receive_errors_rate",
+            "network_transmit_errors_rate",
+            "network_receive_dropped_rate",
+            "network_transmit_dropped_rate",
+        )
+        network_phase_lines = [
+            _phase_line(metric_id, phase_metrics[metric_id])
+            for metric_id in network_metric_ids_ordered
+            if metric_id in selected_metric_ids
+            if metric_id in phase_metrics
+            and isinstance(phase_metrics[metric_id], dict)
+        ]
+        if network_phase_lines:
+            lines.append("\n## Network phase signals")
+            lines.append(
+                "Host/interface-level signals from Prometheus; these indicate "
+                "network pressure or packet handling anomalies but do not identify "
+                "a service by themselves."
+            )
+            lines.extend(network_phase_lines)
 
     # ── Service hotspots — per-label localisation signal ─────────────────
     # Two subsections separating SYMPTOM metrics (RED — cascading effects
@@ -280,8 +393,17 @@ def build_run_summary_l2(
             "memory_working_set_bytes",
             "cpu_usage_cores",
         )
+        _NETWORK_METRICS = (
+            "network_receive_bytes_rate",
+            "network_transmit_bytes_rate",
+            "network_receive_errors_rate",
+            "network_transmit_errors_rate",
+            "network_receive_dropped_rate",
+            "network_transmit_dropped_rate",
+        )
         symptom_lines = _render_hotspot_lines(hotspots, _SYMPTOM_METRICS)
         causal_lines = _render_hotspot_lines(hotspots, _CAUSAL_METRICS)
+        network_lines = _render_hotspot_lines(hotspots, _NETWORK_METRICS)
         if symptom_lines or causal_lines:
             lines.append("\n## Service hotspots")
             lines.append(
@@ -296,6 +418,13 @@ def build_run_summary_l2(
             if causal_lines:
                 lines.append("\n### Resource saturation hotspots")
                 lines.extend(causal_lines)
+            if network_lines:
+                lines.append("\n### Network hotspots")
+                lines.append(
+                    "Interface-level network signals; compare these with RED "
+                    "metrics to distinguish network faults from resource exhaustion."
+                )
+                lines.extend(network_lines)
 
     # ── Pod health events — discrete counts, not continuous Δs ───────────
     # The hotspot block above is great for continuous metrics (saturation,

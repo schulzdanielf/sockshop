@@ -80,6 +80,9 @@ _MEM_SAT_FAULT_MIN = 90.0
 _LATENCY_FAULT_MIN = 0.30
 _LATENCY_DELTA_MIN = 0.10
 
+# Explicit packet-drop signal for network-loss when cAdvisor exposes it.
+_NETWORK_DROP_DELTA_MIN = 0.01
+
 # HTTP failures usually show up as a jump in 5xx / request error rate.
 # The threshold is intentionally modest to avoid overfitting to a single
 # run while still catching the kinds of failures seen in the experiment.
@@ -301,6 +304,19 @@ def _check_network_latency(
     return True, evidence
 
 
+def _check_network_loss(
+    hotspots: Dict[str, Any],
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """Detect packet-loss faults from interface packet-drop counters."""
+    rows = _top_rows(hotspots, "network_receive_dropped_rate")
+    rows += _top_rows(hotspots, "network_transmit_dropped_rate")
+    if not rows:
+        return False, []
+    if _max_delta(rows) <= _NETWORK_DROP_DELTA_MIN:
+        return False, []
+    return True, _summarise_evidence("network_receive_dropped_rate", rows)
+
+
 def _check_http_error(
     hotspots: Dict[str, Any],
 ) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -369,6 +385,7 @@ def validate_fault_category(
         ("memory-exhaustion", _check_memory_exhaustion),
         ("cpu-exhaustion", _check_cpu_exhaustion),
         ("pod-failure", _check_pod_failure),
+        ("network-loss", _check_network_loss),
         ("network-latency", _check_network_latency),
         ("http-error", _check_http_error),
     ):
@@ -391,6 +408,7 @@ def validate_fault_category(
             "mem_sat_fault_min": _MEM_SAT_FAULT_MIN,
             "latency_fault_min": _LATENCY_FAULT_MIN,
             "latency_delta_min": _LATENCY_DELTA_MIN,
+            "network_drop_delta_min": _NETWORK_DROP_DELTA_MIN,
             "http_error_rate_min": _HTTP_ERROR_RATE_MIN,
             "http_error_delta_min": _HTTP_ERROR_DELTA_MIN,
             "oom_restart_delta_min": _OOM_RESTART_DELTA_MIN,

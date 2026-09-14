@@ -497,7 +497,15 @@ class OrchestratorEngine:
 
     # Known fault-type suffixes in descending specificity order so that the
     # most precise match wins (e.g. "pod-delete" before a hypothetical "delete").
-    _KNOWN_FAULT_TYPES = ("memory-hog", "cpu-hog", "pod-delete")
+    _KNOWN_FAULT_TYPES = (
+        "network-latency",
+        "network-loss",
+        "http-status-code",
+        "container-kill",
+        "memory-hog",
+        "cpu-hog",
+        "pod-delete",
+    )
 
     @staticmethod
     def _chaos_type(spec: Dict[str, Any]) -> Optional[str]:

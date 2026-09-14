@@ -9,6 +9,7 @@ HTTP requests into domain operations and serialises domain state back out.
 from __future__ import annotations
 
 import os
+import hashlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,7 @@ from opentelemetry.trace import Status, StatusCode
 from .adapters.noop_notifier import NoopNotificationAdapter
 from .analysis import (
     DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_TIMEOUT,
     DEFAULT_LLM_URL,
     LLMClientError,
     assemble_prompt,
@@ -269,7 +271,6 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="summary not found")
 
         target_experiment_id = target.get("experiment_id")
-        target_experiment_version = target.get("experiment_version")
 
         # Phase F1 — hybrid mode: cosine(embedding) + propagation-graph similarity.
         if mode == "hybrid":
@@ -286,7 +287,6 @@ def create_app() -> FastAPI:
                     provider=target_emb["provider"],
                     chaos_type=chaos_type,
                     experiment_id=target_experiment_id,
-                    experiment_version=target_experiment_version,
                     limit=1000,
                     include_features=True,
                 )
@@ -360,7 +360,6 @@ def create_app() -> FastAPI:
                 provider=target_emb["provider"],
                 chaos_type=chaos_type,
                 experiment_id=target_experiment_id,
-                experiment_version=target_experiment_version,
                 limit=1000,
             )
             candidates = []
@@ -378,7 +377,6 @@ def create_app() -> FastAPI:
         else:
             candidates = storage.list_run_summaries(
                 experiment_id=target_experiment_id,
-                experiment_version=target_experiment_version,
                 chaos_type=chaos_type or target.get("chaos_type"),
                 verdict=verdict,
                 limit=500,
@@ -418,6 +416,8 @@ def create_app() -> FastAPI:
         if target is None:
             raise HTTPException(status_code=404, detail="summary not found")
 
+        target_experiment_id = target.get("experiment_id")
+
         # Phase F1 — hybrid retrieval blends embedding cosine + propagation graph.
         if mode == "hybrid":
             target_emb = storage.get_run_embedding(run_id)
@@ -428,8 +428,7 @@ def create_app() -> FastAPI:
                 target_vec = blob_to_vector(target_emb["blob"], target_emb["dim"])
                 rows = storage.iter_run_embeddings(
                     provider=target_emb["provider"],
-                    experiment_id=target.get("experiment_id"),
-                    experiment_version=target.get("experiment_version"),
+                    experiment_id=target_experiment_id,
                     limit=1000,
                     include_features=True,
                 )
@@ -484,8 +483,7 @@ def create_app() -> FastAPI:
             target_vec = blob_to_vector(target_emb["blob"], target_emb["dim"])
             rows = storage.iter_run_embeddings(
                 provider=target_emb["provider"],
-                experiment_id=target.get("experiment_id"),
-                experiment_version=target.get("experiment_version"),
+                experiment_id=target_experiment_id,
                 limit=1000,
             )
             candidates = []
@@ -501,8 +499,7 @@ def create_app() -> FastAPI:
             used_mode = "embedding"
         else:
             cand = storage.list_run_summaries(
-                experiment_id=target.get("experiment_id"),
-                experiment_version=target.get("experiment_version"),
+                experiment_id=target_experiment_id,
                 limit=500,
             )
             ranked = rank_similar_runs(
@@ -614,13 +611,28 @@ def create_app() -> FastAPI:
                 return text
             return text[:limit] + "...[truncated]"
 
+        def _log(message: str) -> None:
+            strategy = eval_strategy or "n/a"
+            print(
+                f"[llm-analysis] run={run_id} strategy={strategy} {message}",
+                flush=True,
+            )
+
         # Resolve LLM target URL and model name for this request.
         # Fall back to environment defaults (Qwen local) if not explicitly passed.
         prov = (provider or "").strip().lower()
-        if prov in {"gemini", "gemini-flash", "gemini-1.5-flash", "gemini-2.5-flash", "google"}:
+        target_timeout = DEFAULT_LLM_TIMEOUT
+        if prov in {
+            "gemini",
+            "gemini-flash",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash",
+            "google",
+        }:
             target_model = model or "gemini-2.5-flash"
             target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
             target_api_style = "gemini"
+            target_timeout = float(os.environ.get("GEMINI_LLM_TIMEOUT_SECONDS", "60"))
         elif prov in {"gpt", "gpt-4o-mini", "openai", "github"}:
             env_url = os.environ.get("LLM_URL")
             if env_url and "localhost" not in env_url and "127.0.0.1" not in env_url:
@@ -641,6 +653,22 @@ def create_app() -> FastAPI:
             target_url = DEFAULT_LLM_URL
             target_model = model or DEFAULT_LLM_MODEL
             target_api_style = None
+
+        _log(
+            "start "
+            f"provider={provider or 'default'} style={target_api_style or 'auto'} "
+            f"model={target_model} mode={mode} limit={limit} "
+            f"budget_tokens={budget_tokens} max_new_tokens={max_new_tokens} "
+            f"llm_timeout={target_timeout}s force={force}"
+        )
+        request_started = time.monotonic()
+        timing_meta = {
+            "rag_ms": None,
+            "prompt_ms": None,
+            "llm_ms": None,
+            "parse_ms": None,
+            "total_ms": None,
+        }
 
         tracer = get_tracer()
         llm_sys = "qwen" if "qwen" in target_model.lower() else "llm"
@@ -682,8 +710,14 @@ def create_app() -> FastAPI:
 
             # ── RAG retrieval ────────────────────────────────────────────
             with tracer.start_as_current_span("rag.retrieve") as span:
+                stage_started = time.monotonic()
                 rag = _build_rag_context(run_id, limit, mode)
                 neighbours = rag.get("neighbours") or []
+                timing_meta["rag_ms"] = int((time.monotonic() - stage_started) * 1000)
+                _log(
+                    f"rag.done elapsed={timing_meta['rag_ms'] / 1000:.2f}s "
+                    f"effective_mode={rag.get('mode') or mode} neighbours={len(neighbours)}"
+                )
                 span.set_attribute(GenAI.RAG_MODE, rag.get("mode") or mode)
                 span.set_attribute("rca.rag.neighbours_returned", len(neighbours))
                 span.set_attribute("rca.rag.empty", not neighbours)
@@ -697,6 +731,7 @@ def create_app() -> FastAPI:
 
             # ── Prompt assembly ──────────────────────────────────────────
             with tracer.start_as_current_span("prompt.assemble") as span:
+                stage_started = time.monotonic()
                 prompt, meta = assemble_prompt(
                     rag,
                     budget_tokens=budget_tokens,
@@ -713,6 +748,24 @@ def create_app() -> FastAPI:
                 span.set_attribute(
                     "rca.system_card_id", str(meta.get("system_card_id") or system_id)
                 )
+                prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+                meta["prompt_sha256"] = prompt_sha
+                timing_meta["prompt_ms"] = int(
+                    (time.monotonic() - stage_started) * 1000
+                )
+                _log(
+                    f"prompt.done elapsed={timing_meta['prompt_ms'] / 1000:.2f}s "
+                    f"tokens_est={int(meta.get('prompt_tokens_estimate') or 0)} "
+                    f"neighbours={int(meta.get('neighbour_count') or 0)} "
+                    f"sha256={prompt_sha}"
+                )
+                if os.environ.get("RCA_PRINT_PROMPT", "false").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    _log(f"prompt.content\n{prompt}")
                 if capture_content():
                     span.set_attribute(GenAI.PROMPT, prompt)
 
@@ -738,6 +791,7 @@ def create_app() -> FastAPI:
                         "prompt": _trim_for_span(prompt),
                     },
                 )
+                _log("llm.call.start attempt=1")
                 try:
                     raw = call_llm(
                         prompt,
@@ -746,6 +800,7 @@ def create_app() -> FastAPI:
                         model=target_model,
                         api_style=target_api_style,
                         api_key=api_key,
+                        timeout=target_timeout,
                     )
                 except LLMClientError as exc:
                     record_llm_io(
@@ -767,6 +822,9 @@ def create_app() -> FastAPI:
                         },
                     )
                     span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    _log(
+                        f"llm.call.error attempt=1 error={_trim_for_span(str(exc), 500)}"
+                    )
                     raise HTTPException(status_code=502, detail=str(exc)) from exc
                 if capture_content():
                     span.set_attribute(GenAI.COMPLETION, raw)
@@ -780,8 +838,20 @@ def create_app() -> FastAPI:
                 )
 
             llm_latency_ms = int((time.time() - t_call_start) * 1000)
+            timing_meta["llm_ms"] = llm_latency_ms
+            _log(
+                f"llm.call.done attempt=1 elapsed_ms={llm_latency_ms} raw_chars={len(raw)}"
+            )
             with tracer.start_as_current_span("response.parse") as span:
+                stage_started = time.monotonic()
                 parsed = parse_verdict_response(raw)
+                timing_meta["parse_ms"] = int((time.monotonic() - stage_started) * 1000)
+                _log(
+                    "parse.done attempt=1 "
+                    f"parse_error={parsed.get('parse_error') or ''} "
+                    f"rca={parsed.get('rca') or ''} "
+                    f"fault_category={parsed.get('fault_category') or ''}"
+                )
                 span.set_attribute("rca.parse_error", parsed.get("parse_error") or "")
                 span.set_attribute("rca.rca_present", bool(parsed.get("rca")))
                 span.add_event(
@@ -819,6 +889,7 @@ def create_app() -> FastAPI:
             retry_count = 0
             if not parsed.get("rca") or parsed.get("parse_error"):
                 retry_count = 1
+                _log("retry.start reason=parse_error_or_missing_rca")
                 with tracer.start_as_current_span("gen_ai.chat") as span:
                     span.set_attribute(GenAI.OPERATION_NAME, "chat")
                     span.set_attribute(GenAI.SYSTEM, llm_sys)
@@ -846,8 +917,15 @@ def create_app() -> FastAPI:
                             model=target_model,
                             api_style=target_api_style,
                             api_key=api_key,
+                            timeout=target_timeout,
                         )
                         parsed_retry = parse_verdict_response(raw_retry)
+                        _log(
+                            "parse.done attempt=2 "
+                            f"parse_error={parsed_retry.get('parse_error') or ''} "
+                            f"rca={parsed_retry.get('rca') or ''} "
+                            f"fault_category={parsed_retry.get('fault_category') or ''}"
+                        )
                         span.add_event(
                             "llm.response",
                             {
@@ -891,6 +969,7 @@ def create_app() -> FastAPI:
                             parsed = parsed_retry
                             raw = raw_retry
                             llm_latency_ms = int((time.time() - t_call_start) * 1000)
+                            timing_meta["llm_ms"] = llm_latency_ms
                     except LLMClientError as exc:
                         span.add_event(
                             "llm.response_error",
@@ -911,9 +990,19 @@ def create_app() -> FastAPI:
                             }
                         )
                         # Keep the original failure — don't mask the first error.
+                        _log(
+                            f"llm.call.error attempt=2 error={_trim_for_span(str(exc), 500)}"
+                        )
 
             root.set_attribute("rca.retry_count", retry_count)
             record_llm_metrics(duration_s=llm_latency_ms / 1000.0, model=target_model)
+            timing_meta["total_ms"] = int((time.monotonic() - request_started) * 1000)
+            _log(
+                f"analysis.done retry_count={retry_count} "
+                f"rag_ms={timing_meta['rag_ms']} prompt_ms={timing_meta['prompt_ms']} "
+                f"llm_ms={timing_meta['llm_ms']} parse_ms={timing_meta['parse_ms']} "
+                f"total_ms={timing_meta['total_ms']}"
+            )
 
             target = rag.get("target") or {}
             analysis = {
@@ -922,6 +1011,7 @@ def create_app() -> FastAPI:
                 "prompt_meta": meta,
                 "max_new_tokens": max_new_tokens,
                 "llm_latency_ms": llm_latency_ms,
+                "timing_meta": timing_meta,
                 "retry_count": retry_count,
             }
             # FaultCategoryValidator / ServiceLocalizerValidator —

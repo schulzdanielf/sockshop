@@ -1,4 +1,5 @@
 """L2 summary and retrieval utilities (RAG-ready)."""
+
 from .embeddings import (
     EmbeddingProvider,
     HashingEmbeddingProvider,
@@ -12,6 +13,7 @@ from .embeddings import (
 from .fault_category_validator import validate_fault_category
 from .llm_client import (
     DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_TIMEOUT,
     DEFAULT_LLM_URL,
     LLMClientError,
     call_llm,
@@ -62,6 +64,7 @@ __all__ = [
     "parse_verdict_response",
     "llm_health",
     "LLMClientError",
+    "DEFAULT_LLM_TIMEOUT",
     "compute_temporal_features",
     "load_system_card",
     "render_system_card",

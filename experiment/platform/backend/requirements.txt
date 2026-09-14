@@ -1,6 +1,7 @@
 fastapi>=0.115,<1
 uvicorn>=0.30,<1
 pydantic>=2.8,<3
+google-genai>=1.0,<2
 mcp>=1.0.0
 numpy>=1.26,<3
 # OpenTelemetry — distributed traces/metrics for the RCA decision pipeline.

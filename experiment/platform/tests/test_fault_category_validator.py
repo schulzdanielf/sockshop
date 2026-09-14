@@ -116,6 +116,19 @@ def test_network_latency_signal_overrides_to_network_latency():
     assert out["validator_meta"]["rule"] == "network-latency"
 
 
+def test_network_drop_signal_overrides_to_network_loss():
+    features = {
+        "metric_hotspots": _hotspots(
+            network_receive_dropped_rate=[_row("shipping", 0.0, 0.25)],
+        )
+    }
+    analysis = {"fault_category": "memory-exhaustion"}
+    out = validate_fault_category(analysis, features)
+
+    assert out["fault_category"] == "network-loss"
+    assert out["validator_meta"]["rule"] == "network-loss"
+
+
 def test_http_error_signal_overrides_to_http_error():
     features = {
         "metric_hotspots": _hotspots(
