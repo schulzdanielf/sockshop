@@ -1,0 +1,157 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-9a8c1a8f54d7",
+  "experiment_id": "netloss-carts-r0-20260629-230030",
+  "status": "failed",
+  "verdict": null,
+  "chaos_type": null,
+  "ground_truth": {
+    "service": null,
+    "fault_category": null
+  },
+  "timings": {},
+  "timeline": [
+    {
+      "ts": "2026-06-29T23:00:30.086225+00:00",
+      "event_type": "run_created",
+      "payload": {
+        "status": "pending",
+        "initiated_by": "multi-chaos-harness"
+      }
+    },
+    {
+      "ts": "2026-06-29T23:00:30.104444+00:00",
+      "event_type": "run_started",
+      "payload": {
+        "at": "2026-06-29T23:00:30.104228+00:00"
+      }
+    },
+    {
+      "ts": "2026-06-29T23:00:30.119905+00:00",
+      "event_type": "baseline_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-06-29T23:01:00.125494+00:00",
+      "event_type": "baseline_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-06-29T23:01:00.129959+00:00",
+      "event_type": "warmup_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-06-29T23:01:30.134467+00:00",
+      "event_type": "warmup_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-06-29T23:01:30.674777+00:00",
+      "event_type": "run_failed",
+      "payload": {
+        "error": "No Argo Workflow found for template 'carts-network-loss'. Run the experiment at least once from the Litmus UI to create the template."
+      }
+    }
+  ],
+  "artifacts": {
+    "expected": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "present": [],
+    "missing": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "extra": []
+  },
+  "quality": {
+    "schema_version": "1.0",
+    "run_id": "run-9a8c1a8f54d7",
+    "experiment_id": "netloss-carts-r0-20260629-230030",
+    "status": "failed",
+    "usable": false,
+    "weak_signal": false,
+    "gaps": [
+      "artifacts_missing_or_empty",
+      "missing_ground_truth",
+      "missing_phase_timestamps"
+    ],
+    "gates": [
+      {
+        "gate": "collection_completeness",
+        "status": "fail",
+        "blocking": true,
+        "reason": "artifacts_missing_or_empty",
+        "evidence": {
+          "missing": [
+            "metrics_raw",
+            "traces_raw",
+            "load_summary",
+            "chaos_artifacts"
+          ],
+          "empty": []
+        }
+      },
+      {
+        "gate": "window_sanity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "missing_phase_timestamps",
+        "evidence": {
+          "missing": [
+            "t_start",
+            "t_fault_start",
+            "t_fault_end"
+          ]
+        }
+      },
+      {
+        "gate": "label_consistency",
+        "status": "fail",
+        "blocking": true,
+        "reason": "missing_ground_truth",
+        "evidence": {
+          "missing": [
+            "ground_truth_service",
+            "ground_truth_fault_category"
+          ]
+        }
+      },
+      {
+        "gate": "graph_connectivity",
+        "status": "skip",
+        "blocking": true,
+        "reason": "no_propagation_graph",
+        "evidence": {}
+      },
+      {
+        "gate": "feature_sanity",
+        "status": "skip",
+        "blocking": true,
+        "reason": "no_metric_hotspots",
+        "evidence": {}
+      },
+      {
+        "gate": "symptom_presence",
+        "status": "skip",
+        "blocking": false,
+        "reason": "no_metric_hotspots",
+        "evidence": {}
+      }
+    ]
+  }
+}

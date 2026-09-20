@@ -517,6 +517,10 @@ def build_spec(
                 "provider": "mcp-tempo",
                 "mcp_sse_url": "http://127.0.0.1:18080/sse",
                 "timeout_seconds": 20,
+                # Give Tempo a short ingestion grace period before phase-scoped
+                # service graph collection; immediate graph queries can race
+                # span indexing and miss the fault window.
+                "graph_settle_seconds": 10,
                 # Namespace-scoped query (NOT service-scoped). In production
                 # RCA the operator does NOT know which service is the culprit
                 # — that's what we're trying to predict. Filtering traces by

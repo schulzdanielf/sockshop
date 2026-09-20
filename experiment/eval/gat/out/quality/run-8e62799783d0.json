@@ -1,0 +1,84 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-8e62799783d0",
+  "experiment_id": "cpuhog-orders-r0-20260911-165709",
+  "status": "completed",
+  "usable": false,
+  "weak_signal": false,
+  "gaps": [
+    "artifacts_missing_or_empty",
+    "graph_too_sparse",
+    "non_finite_features"
+  ],
+  "gates": [
+    {
+      "gate": "collection_completeness",
+      "status": "fail",
+      "blocking": true,
+      "reason": "artifacts_missing_or_empty",
+      "evidence": {
+        "missing": [],
+        "empty": [
+          {
+            "artifact": "traces_raw",
+            "count": 0
+          }
+        ]
+      }
+    },
+    {
+      "gate": "window_sanity",
+      "status": "pass",
+      "blocking": true,
+      "reason": "",
+      "evidence": {
+        "min_phase_points": 4
+      }
+    },
+    {
+      "gate": "label_consistency",
+      "status": "pass",
+      "blocking": true,
+      "reason": "",
+      "evidence": {
+        "ground_truth_service": "orders"
+      }
+    },
+    {
+      "gate": "graph_connectivity",
+      "status": "fail",
+      "blocking": true,
+      "reason": "graph_too_sparse",
+      "evidence": {
+        "node_count": 0,
+        "edge_count": 0
+      }
+    },
+    {
+      "gate": "feature_sanity",
+      "status": "fail",
+      "blocking": true,
+      "reason": "non_finite_features",
+      "evidence": {
+        "bad": [
+          "latency_p50:fault_mean",
+          "latency_p50:delta_abs",
+          "latency_p95:fault_mean",
+          "latency_p95:delta_abs",
+          "latency_p99:fault_mean",
+          "latency_p99:delta_abs"
+        ]
+      }
+    },
+    {
+      "gate": "symptom_presence",
+      "status": "pass",
+      "blocking": false,
+      "reason": "",
+      "evidence": {
+        "strongest_delta": 38448566.8571,
+        "strongest_metric": "memory_working_set_bytes"
+      }
+    }
+  ]
+}

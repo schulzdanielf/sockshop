@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-9ca18c6f017e",
+  "experiment_id": "ckill-user-r0-20260629-234116",
+  "status": "failed",
+  "usable": false,
+  "weak_signal": false,
+  "gaps": [
+    "artifacts_missing_or_empty",
+    "missing_ground_truth",
+    "missing_phase_timestamps"
+  ],
+  "gates": [
+    {
+      "gate": "collection_completeness",
+      "status": "fail",
+      "blocking": true,
+      "reason": "artifacts_missing_or_empty",
+      "evidence": {
+        "missing": [
+          "metrics_raw",
+          "traces_raw",
+          "load_summary",
+          "chaos_artifacts"
+        ],
+        "empty": []
+      }
+    },
+    {
+      "gate": "window_sanity",
+      "status": "fail",
+      "blocking": true,
+      "reason": "missing_phase_timestamps",
+      "evidence": {
+        "missing": [
+          "t_start",
+          "t_fault_start",
+          "t_fault_end"
+        ]
+      }
+    },
+    {
+      "gate": "label_consistency",
+      "status": "fail",
+      "blocking": true,
+      "reason": "missing_ground_truth",
+      "evidence": {
+        "missing": [
+          "ground_truth_service",
+          "ground_truth_fault_category"
+        ]
+      }
+    },
+    {
+      "gate": "graph_connectivity",
+      "status": "skip",
+      "blocking": true,
+      "reason": "no_propagation_graph",
+      "evidence": {}
+    },
+    {
+      "gate": "feature_sanity",
+      "status": "skip",
+      "blocking": true,
+      "reason": "no_metric_hotspots",
+      "evidence": {}
+    },
+    {
+      "gate": "symptom_presence",
+      "status": "skip",
+      "blocking": false,
+      "reason": "no_metric_hotspots",
+      "evidence": {}
+    }
+  ]
+}

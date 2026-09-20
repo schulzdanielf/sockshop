@@ -1,0 +1,188 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-b775965c8adc",
+  "experiment_id": "poddel-shipping-r0-20260909-094239",
+  "status": "completed",
+  "verdict": "degraded_recoverable",
+  "chaos_type": "pod-delete",
+  "ground_truth": {
+    "service": "shipping",
+    "fault_category": "pod-failure"
+  },
+  "timings": {
+    "t_start": "2026-09-09T09:42:39.206103+00:00",
+    "t_load_start": "2026-09-09T09:42:39.206103+00:00",
+    "t_warmup_start": "2026-09-09T09:43:09.224895+00:00",
+    "t_warmup_end": "2026-09-09T09:43:39.230296+00:00",
+    "t_fault_start": "2026-09-09T09:43:39.235442+00:00",
+    "t_fault_end": "2026-09-09T09:45:09.890379+00:00",
+    "t_recovery_observed": "2026-09-09T09:48:10.019304+00:00",
+    "baseline_seconds": 30,
+    "warmup_time_seconds": 30,
+    "fault_injection_duration_seconds": 90,
+    "experiment_total_duration_seconds": 332.865034,
+    "post_recovery_observation_seconds": 180,
+    "recovery_time_seconds": 4.3156211376190186
+  },
+  "timeline": [
+    {
+      "ts": "2026-09-09T09:42:39.195382+00:00",
+      "event_type": "run_created",
+      "payload": {
+        "status": "pending",
+        "initiated_by": "multi-chaos-harness"
+      }
+    },
+    {
+      "ts": "2026-09-09T09:42:39.206182+00:00",
+      "event_type": "run_started",
+      "payload": {
+        "at": "2026-09-09T09:42:39.206103+00:00"
+      }
+    },
+    {
+      "ts": "2026-09-09T09:42:39.212857+00:00",
+      "event_type": "baseline_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-09T09:43:09.218266+00:00",
+      "event_type": "baseline_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-09T09:43:09.224928+00:00",
+      "event_type": "warmup_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-09T09:43:39.230335+00:00",
+      "event_type": "warmup_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-09T09:43:39.884380+00:00",
+      "event_type": "fault_started",
+      "payload": {
+        "seconds": 90
+      }
+    },
+    {
+      "ts": "2026-09-09T09:45:09.999258+00:00",
+      "event_type": "fault_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-09T09:45:10.009359+00:00",
+      "event_type": "recovery_observation_started",
+      "payload": {
+        "seconds": 180
+      }
+    },
+    {
+      "ts": "2026-09-09T09:48:12.075791+00:00",
+      "event_type": "run_completed",
+      "payload": {
+        "verdict": "degraded_recoverable"
+      }
+    }
+  ],
+  "artifacts": {
+    "expected": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "present": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "missing": [],
+    "extra": []
+  },
+  "quality": {
+    "schema_version": "1.0",
+    "run_id": "run-b775965c8adc",
+    "experiment_id": "poddel-shipping-r0-20260909-094239",
+    "status": "completed",
+    "usable": false,
+    "weak_signal": false,
+    "gaps": [
+      "artifacts_missing_or_empty",
+      "graph_too_sparse"
+    ],
+    "gates": [
+      {
+        "gate": "collection_completeness",
+        "status": "fail",
+        "blocking": true,
+        "reason": "artifacts_missing_or_empty",
+        "evidence": {
+          "missing": [],
+          "empty": [
+            {
+              "artifact": "traces_raw",
+              "count": 0
+            }
+          ]
+        }
+      },
+      {
+        "gate": "window_sanity",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {
+          "min_phase_points": 4
+        }
+      },
+      {
+        "gate": "label_consistency",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {
+          "ground_truth_service": "shipping"
+        }
+      },
+      {
+        "gate": "graph_connectivity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "graph_too_sparse",
+        "evidence": {
+          "node_count": 0,
+          "edge_count": 0
+        }
+      },
+      {
+        "gate": "feature_sanity",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {}
+      },
+      {
+        "gate": "symptom_presence",
+        "status": "pass",
+        "blocking": false,
+        "reason": "",
+        "evidence": {
+          "strongest_delta": 167034459.8974,
+          "strongest_metric": "memory_working_set_bytes"
+        }
+      }
+    ]
+  }
+}

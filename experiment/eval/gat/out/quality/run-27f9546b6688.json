@@ -1,0 +1,74 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-27f9546b6688",
+  "experiment_id": "multi-chaos-eval-v2",
+  "status": "completed",
+  "usable": false,
+  "weak_signal": false,
+  "gaps": [
+    "artifacts_missing_or_empty",
+    "graph_too_sparse"
+  ],
+  "gates": [
+    {
+      "gate": "collection_completeness",
+      "status": "fail",
+      "blocking": true,
+      "reason": "artifacts_missing_or_empty",
+      "evidence": {
+        "missing": [],
+        "empty": [
+          {
+            "artifact": "traces_raw",
+            "count": 0
+          }
+        ]
+      }
+    },
+    {
+      "gate": "window_sanity",
+      "status": "pass",
+      "blocking": true,
+      "reason": "",
+      "evidence": {
+        "min_phase_points": 4
+      }
+    },
+    {
+      "gate": "label_consistency",
+      "status": "pass",
+      "blocking": true,
+      "reason": "",
+      "evidence": {
+        "ground_truth_service": "user"
+      }
+    },
+    {
+      "gate": "graph_connectivity",
+      "status": "fail",
+      "blocking": true,
+      "reason": "graph_too_sparse",
+      "evidence": {
+        "node_count": 0,
+        "edge_count": 0
+      }
+    },
+    {
+      "gate": "feature_sanity",
+      "status": "pass",
+      "blocking": true,
+      "reason": "",
+      "evidence": {}
+    },
+    {
+      "gate": "symptom_presence",
+      "status": "pass",
+      "blocking": false,
+      "reason": "",
+      "evidence": {
+        "strongest_delta": 13305400.8889,
+        "strongest_metric": "memory_working_set_bytes"
+      }
+    }
+  ]
+}

@@ -298,6 +298,42 @@ class OrchestratorEngine:
                 fault_end_iso=fault_end,
                 recovery_end_iso=recovery_end,
             )
+
+            # Phase-scoped service graph delta — optional evidence for WHERE.
+            # The payload is intentionally model-facing but safe: it contains
+            # only window timestamps, service-to-service deltas and first
+            # degraded signals. It never includes chaos target, fault label,
+            # experiment tags, or ground truth fields.
+            graph_method = getattr(self.traces, "collect_phase_graphs", None)
+            if callable(graph_method):
+                try:
+                    settle_s = int(traces_cfg.get("graph_settle_seconds", 0) or 0)
+                    if settle_s > 0:
+                        self._event(
+                            run_id,
+                            "service_graph_delta_waiting",
+                            {"seconds": settle_s},
+                        )
+                        time.sleep(settle_s)
+                    phase_payload = [
+                        {"name": name, "start": start, "end": end}
+                        for name, start, end in phases
+                        if name in {"baseline", "fault", "post"}
+                    ]
+                    service_graph_delta = graph_method(
+                        context,
+                        traces_cfg,
+                        phase_payload,
+                    )
+                    if isinstance(service_graph_delta, dict) and service_graph_delta:
+                        features["service_graph_delta"] = service_graph_delta
+                except Exception as exc:  # pragma: no cover - best effort
+                    self._event(
+                        run_id,
+                        "service_graph_delta_failed",
+                        {"error": str(exc)[:500]},
+                    )
+
             features_path = self.storage.save_artifact(run_id, "run_features", features)
 
             # ── L2: deterministic, RAG-ready summary + tags ─────────────────
@@ -596,11 +632,13 @@ class OrchestratorEngine:
                             "slo": label,
                             "threshold": threshold,
                             "observed": round(float(observed), 4),
-                            "delta_pct": round(
-                                (float(observed) - threshold) / threshold * 100.0, 1
-                            )
-                            if threshold
-                            else None,
+                            "delta_pct": (
+                                round(
+                                    (float(observed) - threshold) / threshold * 100.0, 1
+                                )
+                                if threshold
+                                else None
+                            ),
                         }
                     )
 

@@ -1,0 +1,192 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-679b9e58235d",
+  "experiment_id": "multi-chaos-eval-v2",
+  "status": "completed",
+  "verdict": "degraded_recoverable",
+  "chaos_type": "memory-hog",
+  "ground_truth": {
+    "service": "catalogue",
+    "fault_category": "memory-exhaustion"
+  },
+  "timings": {
+    "t_start": "2026-09-13T20:33:25.842994+00:00",
+    "t_load_start": "2026-09-13T20:33:25.842994+00:00",
+    "t_warmup_start": "2026-09-13T20:33:55.862470+00:00",
+    "t_warmup_end": "2026-09-13T20:34:25.873777+00:00",
+    "t_fault_start": "2026-09-13T20:34:25.892239+00:00",
+    "t_fault_end": "2026-09-13T20:35:56.593080+00:00",
+    "t_recovery_observed": "2026-09-13T20:38:56.760759+00:00",
+    "baseline_seconds": 30,
+    "warmup_time_seconds": 30,
+    "fault_injection_duration_seconds": 90,
+    "experiment_total_duration_seconds": 334.113985,
+    "post_recovery_observation_seconds": 180,
+    "recovery_time_seconds": 4.24891996383667
+  },
+  "timeline": [
+    {
+      "ts": "2026-09-13T20:33:25.828003+00:00",
+      "event_type": "run_created",
+      "payload": {
+        "status": "pending",
+        "initiated_by": "multi-chaos-harness"
+      }
+    },
+    {
+      "ts": "2026-09-13T20:33:25.843107+00:00",
+      "event_type": "run_started",
+      "payload": {
+        "at": "2026-09-13T20:33:25.842994+00:00"
+      }
+    },
+    {
+      "ts": "2026-09-13T20:33:25.849792+00:00",
+      "event_type": "baseline_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-13T20:33:55.857210+00:00",
+      "event_type": "baseline_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-13T20:33:55.862510+00:00",
+      "event_type": "warmup_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-13T20:34:25.873891+00:00",
+      "event_type": "warmup_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-13T20:34:26.581941+00:00",
+      "event_type": "fault_started",
+      "payload": {
+        "seconds": 90
+      }
+    },
+    {
+      "ts": "2026-09-13T20:35:56.750434+00:00",
+      "event_type": "fault_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-13T20:35:56.754993+00:00",
+      "event_type": "recovery_observation_started",
+      "payload": {
+        "seconds": 180
+      }
+    },
+    {
+      "ts": "2026-09-13T20:38:59.961334+00:00",
+      "event_type": "run_completed",
+      "payload": {
+        "verdict": "degraded_recoverable"
+      }
+    }
+  ],
+  "artifacts": {
+    "expected": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "present": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "missing": [],
+    "extra": []
+  },
+  "quality": {
+    "schema_version": "1.0",
+    "run_id": "run-679b9e58235d",
+    "experiment_id": "multi-chaos-eval-v2",
+    "status": "completed",
+    "usable": false,
+    "weak_signal": false,
+    "gaps": [
+      "artifacts_missing_or_empty",
+      "graph_too_sparse",
+      "insufficient_phase_points"
+    ],
+    "gates": [
+      {
+        "gate": "collection_completeness",
+        "status": "fail",
+        "blocking": true,
+        "reason": "artifacts_missing_or_empty",
+        "evidence": {
+          "missing": [],
+          "empty": [
+            {
+              "artifact": "traces_raw",
+              "count": 0
+            }
+          ]
+        }
+      },
+      {
+        "gate": "window_sanity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "insufficient_phase_points",
+        "evidence": {
+          "thin": [
+            "error_rate@baseline=0"
+          ],
+          "min": 4
+        }
+      },
+      {
+        "gate": "label_consistency",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {
+          "ground_truth_service": "catalogue"
+        }
+      },
+      {
+        "gate": "graph_connectivity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "graph_too_sparse",
+        "evidence": {
+          "node_count": 0,
+          "edge_count": 0
+        }
+      },
+      {
+        "gate": "feature_sanity",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {}
+      },
+      {
+        "gate": "symptom_presence",
+        "status": "pass",
+        "blocking": false,
+        "reason": "",
+        "evidence": {
+          "strongest_delta": 64440320.0,
+          "strongest_metric": "memory_working_set_bytes"
+        }
+      }
+    ]
+  }
+}

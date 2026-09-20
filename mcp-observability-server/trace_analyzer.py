@@ -1,5 +1,6 @@
 """Trace feature extractor: critical path, exclusive latency, failure signatures,
 dependency map, fanout patterns, semantic compression and RCA hypotheses."""
+
 from __future__ import annotations
 
 import re
@@ -108,6 +109,22 @@ def _endpoint_from_message(message: str) -> Optional[str]:
     """Extract IP:port from an error message string."""
     m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d+)", message)
     return m.group(1) if m else None
+
+
+def _service_label_from_endpoint(endpoint: Optional[str]) -> Optional[str]:
+    """Normalise an OTel endpoint/host to a Kubernetes service-style label."""
+    if not endpoint:
+        return None
+    value = str(endpoint).strip()
+    if "://" in value:
+        value = value.split("://", 1)[1]
+    value = value.split("/", 1)[0]
+    value = value.split(":", 1)[0]
+    if ".svc.cluster.local" in value:
+        value = value.split(".svc.cluster.local", 1)[0]
+    if "." in value:
+        value = value.split(".", 1)[0]
+    return value or None
 
 
 # ---------------------------------------------------------------------------
@@ -681,20 +698,27 @@ def extract_features(trace_data: Dict) -> Dict:
         cat = _classify_span(span)
         if cat in ("OUTBOUND_HTTP", "OUTBOUND_TCP", "OUTBOUND_CALL", "RPC_CALL"):
             remote = _extract_remote_endpoint(span)
-            if remote:
-                key = (span["service"], remote)
+            remote_service = _service_label_from_endpoint(remote)
+            if remote_service:
+                key = (span["service"], remote_service)
                 if key not in edge_details:
                     edge_details[key] = {
                         "from": span["service"],
-                        "to": remote,
+                        "to": remote_service,
                         "operation": span["name"],
+                        "duration_ms": span["duration_ms"],
                         "is_error": span["is_error"],
                     }
-                elif span["is_error"]:
-                    edge_details[key]["is_error"] = True
+                else:
+                    edge_details[key]["duration_ms"] = max(
+                        float(edge_details[key].get("duration_ms") or 0.0),
+                        float(span.get("duration_ms") or 0.0),
+                    )
+                    if span["is_error"]:
+                        edge_details[key]["is_error"] = True
 
     dependency_map = [{"from": f, "to": t} for f, t in sorted(edges)]
-    # Merge OTel-derived edges (may include endpoint-level detail)
+    # Merge OTel-derived edges (normalised to service-level targets)
     for (src, dst), detail in sorted(edge_details.items()):
         if (src, dst) not in edges:
             dependency_map.append(detail)

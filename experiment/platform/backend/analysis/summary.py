@@ -3,6 +3,7 @@
 The output target is ~400-700 tokens so it fits comfortably inside a
 4k-context window together with several retrieved neighbours.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
@@ -218,8 +219,7 @@ def build_summary_tags(features: Dict[str, Any]) -> List[str]:
     network_hotspots = features.get("metric_hotspots") or {}
     if any(
         any(
-            isinstance(row, dict)
-            and (abs(float(row.get("delta_abs") or 0.0)) > 1e-6)
+            isinstance(row, dict) and (abs(float(row.get("delta_abs") or 0.0)) > 1e-6)
             for row in (network_hotspots.get(metric, {}).get("top") or [])
         )
         for metric in network_metric_ids
@@ -362,8 +362,7 @@ def build_run_summary_l2(
             _phase_line(metric_id, phase_metrics[metric_id])
             for metric_id in network_metric_ids_ordered
             if metric_id in selected_metric_ids
-            if metric_id in phase_metrics
-            and isinstance(phase_metrics[metric_id], dict)
+            if metric_id in phase_metrics and isinstance(phase_metrics[metric_id], dict)
         ]
         if network_phase_lines:
             lines.append("\n## Network phase signals")
@@ -373,6 +372,37 @@ def build_run_summary_l2(
                 "a service by themselves."
             )
             lines.extend(network_phase_lines)
+
+    # Phase graph delta — compact baseline→fault service-graph evidence.
+    # Keep this early in the summary so prompt truncation does not cut off
+    # the highest-value WHERE evidence before hotspots/temporal details.
+    service_graph_lines: List[str] = []
+    graph_delta = features.get("service_graph_delta") or {}
+    delta = graph_delta.get("delta") or {}
+    if delta:
+        service_graph_lines.append("\n## Service graph delta")
+        top_edges = delta.get("top_edge_deltas") or []
+        for e in top_edges[:2]:
+            if not isinstance(e, dict):
+                continue
+            service_graph_lines.append(
+                f"- {e.get('from')} → {e.get('to')}: "
+                f"Δerror_rate={_fmt_num(e.get('error_rate_delta'), 3)}, "
+                f"Δp95={_fmt_num(e.get('latency_p95_ms_delta'), 0)}ms"
+            )
+        path = delta.get("suspected_propagation_path") or []
+        if path:
+            service_graph_lines.append(f"Propagation path: {' -> '.join(path[:4])}")
+        first = delta.get("first_degraded_services") or []
+        if first:
+            chain = ", ".join(
+                f"{c.get('service')}:{c.get('signal')}@{_fmt_num(c.get('t_offset_s'), 2)}s"
+                for c in first[:2]
+                if isinstance(c, dict)
+            )
+            service_graph_lines.append(f"First degraded signals: {chain}")
+    if service_graph_lines:
+        lines.extend(service_graph_lines)
 
     # ── Service hotspots — per-label localisation signal ─────────────────
     # Two subsections separating SYMPTOM metrics (RED — cascading effects

@@ -44,6 +44,9 @@ _AFFECTED_SERVICES_RE = re.compile(r",\s*affected_services=\[[^\]]*\]")
 # Regex that removes whole H2 sections that name services directly:
 #   - "## Top failure signatures" — each line cites the affected service.
 #   - "## Propagation graph"      — cascade order + edges expose RCA.
+# "## Service graph delta" is intentionally NOT masked: it is compact telemetry
+# derived from traces across baseline/fault/post windows, and evaluating whether
+# the model can use that evidence is part of the experiment.
 # Matches from the H2 header to (but not including) the next H2 or EOF.
 _SERVICE_SECTIONS_RE = re.compile(
     r"\n## (?:Top failure signatures|Propagation graph)\n[\s\S]*?(?=\n## |\Z)"
@@ -67,6 +70,9 @@ def _mask_target_summary(text: str) -> str:
        affected service by name.
     5. ``## Propagation graph`` section — cascade order + edges expose the
        epicentre service and full topology.
+
+    ``## Service graph delta`` is left intact because it is a compact
+    telemetry-derived delta, not experiment metadata or a ground-truth label.
     """
     text = _CHAOS_TYPE_RE.sub("", text)
     text = _EXPERIMENT_ID_RE.sub("", text)

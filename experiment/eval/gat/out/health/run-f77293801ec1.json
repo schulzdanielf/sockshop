@@ -1,0 +1,198 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-f77293801ec1",
+  "experiment_id": "cpuhog-orders-r0-20260527-110312",
+  "status": "completed",
+  "verdict": "degraded_recoverable",
+  "chaos_type": "cpu-hog",
+  "ground_truth": {
+    "service": "orders",
+    "fault_category": "cpu-exhaustion"
+  },
+  "timings": {
+    "t_start": "2026-05-27T11:03:12.726365+00:00",
+    "t_load_start": "2026-05-27T11:03:12.726365+00:00",
+    "t_warmup_start": "2026-05-27T11:03:42.743158+00:00",
+    "t_warmup_end": "2026-05-27T11:04:12.747434+00:00",
+    "t_fault_start": "2026-05-27T11:04:12.751824+00:00",
+    "t_fault_end": "2026-05-27T11:05:43.416420+00:00",
+    "t_recovery_observed": "2026-05-27T11:08:43.529271+00:00",
+    "baseline_seconds": 30,
+    "warmup_time_seconds": 30,
+    "fault_injection_duration_seconds": 90,
+    "experiment_total_duration_seconds": 332.783936,
+    "post_recovery_observation_seconds": 180,
+    "recovery_time_seconds": 84.30958008766174
+  },
+  "timeline": [
+    {
+      "ts": "2026-05-27T11:03:12.714887+00:00",
+      "event_type": "run_created",
+      "payload": {
+        "status": "pending",
+        "initiated_by": "multi-chaos-harness"
+      }
+    },
+    {
+      "ts": "2026-05-27T11:03:12.726415+00:00",
+      "event_type": "run_started",
+      "payload": {
+        "at": "2026-05-27T11:03:12.726365+00:00"
+      }
+    },
+    {
+      "ts": "2026-05-27T11:03:12.731919+00:00",
+      "event_type": "baseline_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-05-27T11:03:42.737123+00:00",
+      "event_type": "baseline_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-05-27T11:03:42.743189+00:00",
+      "event_type": "warmup_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-05-27T11:04:12.747472+00:00",
+      "event_type": "warmup_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-05-27T11:04:13.407060+00:00",
+      "event_type": "fault_started",
+      "payload": {
+        "seconds": 90
+      }
+    },
+    {
+      "ts": "2026-05-27T11:05:43.515397+00:00",
+      "event_type": "fault_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-05-27T11:05:43.521483+00:00",
+      "event_type": "recovery_observation_started",
+      "payload": {
+        "seconds": 180
+      }
+    },
+    {
+      "ts": "2026-05-27T11:08:45.515219+00:00",
+      "event_type": "run_completed",
+      "payload": {
+        "verdict": "degraded_recoverable"
+      }
+    }
+  ],
+  "artifacts": {
+    "expected": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "present": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "missing": [],
+    "extra": []
+  },
+  "quality": {
+    "schema_version": "1.0",
+    "run_id": "run-f77293801ec1",
+    "experiment_id": "cpuhog-orders-r0-20260527-110312",
+    "status": "completed",
+    "usable": false,
+    "weak_signal": false,
+    "gaps": [
+      "artifacts_missing_or_empty",
+      "graph_too_sparse",
+      "non_finite_features"
+    ],
+    "gates": [
+      {
+        "gate": "collection_completeness",
+        "status": "fail",
+        "blocking": true,
+        "reason": "artifacts_missing_or_empty",
+        "evidence": {
+          "missing": [],
+          "empty": [
+            {
+              "artifact": "traces_raw",
+              "count": 0
+            }
+          ]
+        }
+      },
+      {
+        "gate": "window_sanity",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {
+          "min_phase_points": 4
+        }
+      },
+      {
+        "gate": "label_consistency",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {
+          "ground_truth_service": "orders"
+        }
+      },
+      {
+        "gate": "graph_connectivity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "graph_too_sparse",
+        "evidence": {
+          "node_count": 0,
+          "edge_count": 0
+        }
+      },
+      {
+        "gate": "feature_sanity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "non_finite_features",
+        "evidence": {
+          "bad": [
+            "latency_p50:fault_mean",
+            "latency_p50:delta_abs",
+            "latency_p95:fault_mean",
+            "latency_p95:delta_abs",
+            "latency_p99:fault_mean",
+            "latency_p99:delta_abs"
+          ]
+        }
+      },
+      {
+        "gate": "symptom_presence",
+        "status": "pass",
+        "blocking": false,
+        "reason": "",
+        "evidence": {
+          "strongest_delta": 15655717.1966,
+          "strongest_metric": "memory_working_set_bytes"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,202 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-0089f6b50051",
+  "experiment_id": "multi-chaos-eval-v2",
+  "status": "completed",
+  "verdict": "resilient",
+  "chaos_type": "pod-delete",
+  "ground_truth": {
+    "service": "user",
+    "fault_category": "pod-failure"
+  },
+  "timings": {
+    "t_start": "2026-09-15T10:52:42.406838+00:00",
+    "t_load_start": "2026-09-15T10:52:42.406838+00:00",
+    "t_warmup_start": "2026-09-15T10:53:12.428636+00:00",
+    "t_warmup_end": "2026-09-15T10:53:42.433516+00:00",
+    "t_fault_start": "2026-09-15T10:53:42.437818+00:00",
+    "t_fault_end": "2026-09-15T10:55:13.157949+00:00",
+    "t_recovery_observed": "2026-09-15T10:58:13.281231+00:00",
+    "baseline_seconds": 30,
+    "warmup_time_seconds": 30,
+    "fault_injection_duration_seconds": 90,
+    "experiment_total_duration_seconds": 389.146186,
+    "post_recovery_observation_seconds": 180,
+    "recovery_time_seconds": 4.248050928115845
+  },
+  "timeline": [
+    {
+      "ts": "2026-09-15T10:52:42.391490+00:00",
+      "event_type": "run_created",
+      "payload": {
+        "status": "pending",
+        "initiated_by": "multi-chaos-harness"
+      }
+    },
+    {
+      "ts": "2026-09-15T10:52:42.406978+00:00",
+      "event_type": "run_started",
+      "payload": {
+        "at": "2026-09-15T10:52:42.406838+00:00"
+      }
+    },
+    {
+      "ts": "2026-09-15T10:52:42.416838+00:00",
+      "event_type": "baseline_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-15T10:53:12.424153+00:00",
+      "event_type": "baseline_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-15T10:53:12.428654+00:00",
+      "event_type": "warmup_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-15T10:53:42.433555+00:00",
+      "event_type": "warmup_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-15T10:53:43.147014+00:00",
+      "event_type": "fault_started",
+      "payload": {
+        "seconds": 90
+      }
+    },
+    {
+      "ts": "2026-09-15T10:55:13.269073+00:00",
+      "event_type": "fault_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-15T10:55:13.275628+00:00",
+      "event_type": "recovery_observation_started",
+      "payload": {
+        "seconds": 180
+      }
+    },
+    {
+      "ts": "2026-09-15T10:58:18.627259+00:00",
+      "event_type": "service_graph_delta_waiting",
+      "payload": {
+        "seconds": 10
+      }
+    },
+    {
+      "ts": "2026-09-15T10:59:11.518875+00:00",
+      "event_type": "service_graph_delta_failed",
+      "payload": {
+        "error": "unhandled errors in a TaskGroup (1 sub-exception)"
+      }
+    },
+    {
+      "ts": "2026-09-15T10:59:11.562316+00:00",
+      "event_type": "run_completed",
+      "payload": {
+        "verdict": "resilient"
+      }
+    }
+  ],
+  "artifacts": {
+    "expected": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "present": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "missing": [],
+    "extra": []
+  },
+  "quality": {
+    "schema_version": "1.0",
+    "run_id": "run-0089f6b50051",
+    "experiment_id": "multi-chaos-eval-v2",
+    "status": "completed",
+    "usable": false,
+    "weak_signal": false,
+    "gaps": [
+      "artifacts_missing_or_empty",
+      "graph_too_sparse"
+    ],
+    "gates": [
+      {
+        "gate": "collection_completeness",
+        "status": "fail",
+        "blocking": true,
+        "reason": "artifacts_missing_or_empty",
+        "evidence": {
+          "missing": [],
+          "empty": [
+            {
+              "artifact": "traces_raw",
+              "count": 0
+            }
+          ]
+        }
+      },
+      {
+        "gate": "window_sanity",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {
+          "min_phase_points": 4
+        }
+      },
+      {
+        "gate": "label_consistency",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {
+          "ground_truth_service": "user"
+        }
+      },
+      {
+        "gate": "graph_connectivity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "graph_too_sparse",
+        "evidence": {
+          "node_count": 0,
+          "edge_count": 0
+        }
+      },
+      {
+        "gate": "feature_sanity",
+        "status": "pass",
+        "blocking": true,
+        "reason": "",
+        "evidence": {}
+      },
+      {
+        "gate": "symptom_presence",
+        "status": "pass",
+        "blocking": false,
+        "reason": "",
+        "evidence": {
+          "strongest_delta": 25749276.4444,
+          "strongest_metric": "memory_working_set_bytes"
+        }
+      }
+    ]
+  }
+}

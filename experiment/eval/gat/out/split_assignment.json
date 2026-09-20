@@ -1,0 +1,2882 @@
+[
+  {
+    "run_id": "run-96516d24def1",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-466890f7f5d6",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-1207401eb090",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-78bb2b56d58c",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d3f8758be89d",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-732b6ff2d443",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-53c8c14e3921",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-f77293801ec1",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-00b1aad0b084",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-0b3cc6ba9bae",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-073ea9d78f22",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-20bde952aadf",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e563e48ca37c",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d8a0ca8178aa",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-c959c75d1c14",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-0cb9cfcecb95",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-11adce8462f3",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-a74ad5ba0275",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-a440cfd9eeff",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-da142215f79c",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-fd272b667c63",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6ad4e8f34815",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ff2c9afe9115",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-25c7f3046517",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-26a89230f1f9",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-dff8d2d02b70",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-a09cfddb8c94",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d65fdf5db84b",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-1c5c073559d9",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-c98d5efbaf2b",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-884da6703d7a",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e6cba6efa45f",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-710afca1a911",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-af7f80376336",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-7d79acbebfe7",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-82b832839337",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-a5d6f32e94a7",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-19400e22e43a",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-51d7ba8cdc97",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e8526d629558",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-3fa50892da30",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-8537452ada07",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ebf47e994e1b",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-fd1352ba3651",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-749e223537ee",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-37fde8064e4c",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-539a5ddf40aa",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d7d755a7cbc7",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-3f84f821d3bb",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-fa15d362ad02",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-8d55902c3635",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-fa48ee3a50e4",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d143bf1821f3",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-65d3ba95023e",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-569ea7434153",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-9dbfa104e3ec",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-af98bc60f918",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-2d0dc8749e6d",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6f937e9a55a8",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6021a9cd3203",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-f6ac5bf31bbe",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-3657fdce6364",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-1bd4980c3371",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-9b5ee7afcd7b",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ee3946e93577",
+    "is_training": true,
+    "chaos_type": "network-latency",
+    "service": "catalogue",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-308672cece60",
+    "is_training": true,
+    "chaos_type": "network-loss",
+    "service": "carts",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-de51f3911ac8",
+    "is_training": true,
+    "chaos_type": "http-status-code",
+    "service": "user",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-069c26ef06cf",
+    "is_training": true,
+    "chaos_type": "container-kill",
+    "service": "orders",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-694ed673f13b",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-18de1151e51d",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-a2736d6dfecd",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 9,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-08e4643e998f",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-c1ccd9f868a9",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6445f57d1abc",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-4a83a847d3ab",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-784de96a394c",
+    "is_training": false,
+    "chaos_type": "network-loss",
+    "service": "shipping",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 6,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-5e545a81c7e0",
+    "is_training": false,
+    "chaos_type": "http-status-code",
+    "service": "orders",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-388356703672",
+    "is_training": false,
+    "chaos_type": "container-kill",
+    "service": "user",
+    "replica_rank_in_cell": 0,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-1b3b49653fef",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6cd442a38739",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-30eab0210090",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-9d3cd3c19d50",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-cfedf1916ca0",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-af7b6324cd87",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-b775965c8adc",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 10,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-98d9c23a21af",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-263f051487bb",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-fd07c0c7453d",
+    "is_training": true,
+    "chaos_type": "network-latency",
+    "service": "catalogue",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-571275fa9eff",
+    "is_training": true,
+    "chaos_type": "network-loss",
+    "service": "carts",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-b8e23f96fdd5",
+    "is_training": true,
+    "chaos_type": "http-status-code",
+    "service": "user",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-2085ddfb6c5d",
+    "is_training": true,
+    "chaos_type": "container-kill",
+    "service": "orders",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-dd9f1d3cdec2",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-dbaa919738d7",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-12552e12adf8",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 11,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ef6b87682d22",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-625a967748cc",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-f7e0e99aab0d",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-72862b7ebe6d",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e67e9de523ec",
+    "is_training": false,
+    "chaos_type": "network-loss",
+    "service": "shipping",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 6,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-8902256745a6",
+    "is_training": false,
+    "chaos_type": "http-status-code",
+    "service": "orders",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-55932fd150a9",
+    "is_training": false,
+    "chaos_type": "container-kill",
+    "service": "user",
+    "replica_rank_in_cell": 1,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-dd5e467d56b3",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-c2277e770e4a",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-f445fc588117",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-55d9e98290a1",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6e41ad70fd5a",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 9,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-35aa9e2a11ba",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 9,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-8e62799783d0",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-cdfd7237729d",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-db15f5f22bf2",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ee37eec7008f",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6f0ac2b57011",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 12,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6fe96de1fad3",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-330400dc399a",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-2e4a307d2955",
+    "is_training": true,
+    "chaos_type": "network-latency",
+    "service": "catalogue",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6ac14ff7be1e",
+    "is_training": true,
+    "chaos_type": "network-loss",
+    "service": "carts",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-5e208dd02059",
+    "is_training": true,
+    "chaos_type": "http-status-code",
+    "service": "user",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-8aa5fd9c65fe",
+    "is_training": true,
+    "chaos_type": "container-kill",
+    "service": "orders",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-fb1fb9abc680",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-3f42c3a1b7de",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-c3edf9fdcd29",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 13,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-9491a96693e6",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-98e8c89e9693",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ee7dbb81eb60",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6241ce07ef28",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-4ca5da7d4867",
+    "is_training": false,
+    "chaos_type": "network-loss",
+    "service": "shipping",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 6,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e5067420ba50",
+    "is_training": false,
+    "chaos_type": "http-status-code",
+    "service": "orders",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-838460d9cead",
+    "is_training": false,
+    "chaos_type": "container-kill",
+    "service": "user",
+    "replica_rank_in_cell": 2,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-57ccc0712872",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-b56cd312d35b",
+    "is_training": false,
+    "chaos_type": "network-loss",
+    "service": "shipping",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 6,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-679b9e58235d",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 10,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-585256fe0977",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 10,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-57ba890cd198",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-f5d7dc092fed",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 11,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-a179cbc1f6b4",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 11,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-72718cffd5e7",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 9,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-8e8e9bce07c2",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-7b0c1f808170",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-df40fc465bf5",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d4bf65881f0f",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 14,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-0d82a1ba44fd",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d324bba1746f",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-90c3d8ef1bbd",
+    "is_training": true,
+    "chaos_type": "network-latency",
+    "service": "catalogue",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-7263c77382d5",
+    "is_training": true,
+    "chaos_type": "network-loss",
+    "service": "carts",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-2b184c6e424f",
+    "is_training": true,
+    "chaos_type": "http-status-code",
+    "service": "user",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-415b13b41026",
+    "is_training": true,
+    "chaos_type": "container-kill",
+    "service": "orders",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-1f9afa1913a3",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-4565a5d911fe",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-41abe3b46051",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 15,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-0780a28e7575",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e9513aa3fb7c",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-14f4033a3575",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-510ade01a44a",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-f141ce8363d3",
+    "is_training": false,
+    "chaos_type": "network-loss",
+    "service": "shipping",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 6,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-126a7ca8141f",
+    "is_training": false,
+    "chaos_type": "http-status-code",
+    "service": "orders",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-72819caed47f",
+    "is_training": false,
+    "chaos_type": "container-kill",
+    "service": "user",
+    "replica_rank_in_cell": 3,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-62c28dd2ca7a",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-61b8dea8eeca",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 6,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6a0b9ac68c61",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e03875a9f1dd",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-15df9be8bc77",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 12,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-cd80f0b616e5",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 12,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-7bd6d55c4339",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 10,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-7984a2064567",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-a8d0dc3c787e",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-0089f6b50051",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-9b9766367916",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 16,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-5c1b7c8c76ab",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ee9d5170e91b",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-7695e5c9ef5e",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "catalogue",
+    "replica_rank_in_cell": 13,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-1de067461114",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "carts",
+    "replica_rank_in_cell": 13,
+    "total_in_cell": 14,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-77fd29c6e31f",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 11,
+    "total_in_cell": 12,
+    "splits": {
+      "S1": "test",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-850b5d4d7e8b",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "test",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-b9cdc5a2c04f",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "payment",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "test",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-b17355a91b2b",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "user",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-3304265d1473",
+    "is_training": true,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 17,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "train",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-f509ca6e4f05",
+    "is_training": true,
+    "chaos_type": "memory-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-c6228c210f86",
+    "is_training": true,
+    "chaos_type": "cpu-hog",
+    "service": "front-end",
+    "replica_rank_in_cell": 8,
+    "total_in_cell": 9,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-976119d64914",
+    "is_training": true,
+    "chaos_type": "network-latency",
+    "service": "catalogue",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-6fd0b0d64bbf",
+    "is_training": true,
+    "chaos_type": "network-loss",
+    "service": "carts",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-e7cfe56d8e96",
+    "is_training": true,
+    "chaos_type": "http-status-code",
+    "service": "user",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-d5528f294fbc",
+    "is_training": true,
+    "chaos_type": "container-kill",
+    "service": "orders",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "test",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-09a085bbb8d9",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "user",
+    "replica_rank_in_cell": 9,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-27f9546b6688",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "user",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-eed20eaad8fd",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "shipping",
+    "replica_rank_in_cell": 18,
+    "total_in_cell": 19,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-ceaa4371b650",
+    "is_training": false,
+    "chaos_type": "cpu-hog",
+    "service": "queue-master",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-9b6f34686014",
+    "is_training": false,
+    "chaos_type": "pod-delete",
+    "service": "front-end",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "test",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-60f2e932072f",
+    "is_training": false,
+    "chaos_type": "memory-hog",
+    "service": "orders",
+    "replica_rank_in_cell": 7,
+    "total_in_cell": 8,
+    "splits": {
+      "S1": "test",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-0b677314fdcd",
+    "is_training": false,
+    "chaos_type": "network-latency",
+    "service": "payment",
+    "replica_rank_in_cell": 9,
+    "total_in_cell": 10,
+    "splits": {
+      "S1": "test",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-b251ffb65550",
+    "is_training": false,
+    "chaos_type": "network-loss",
+    "service": "shipping",
+    "replica_rank_in_cell": 5,
+    "total_in_cell": 6,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-99f7320f33ed",
+    "is_training": false,
+    "chaos_type": "http-status-code",
+    "service": "orders",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "test",
+      "S2": "test",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  },
+  {
+    "run_id": "run-bb2b6aa8d0ed",
+    "is_training": false,
+    "chaos_type": "container-kill",
+    "service": "user",
+    "replica_rank_in_cell": 4,
+    "total_in_cell": 5,
+    "splits": {
+      "S1": "test",
+      "S2": "train",
+      "S3": "train",
+      "S4": null
+    },
+    "rule": "S1:repetition;S2:held_out_service=('orders', 'payment');S3:held_out_fault=pod-delete"
+  }
+]

@@ -1,5 +1,7 @@
 """MCP Server for observability - Prometheus, Loki, Metrics and KPIs."""
+
 import json
+from typing import Any, Dict
 
 from config import settings
 from fastmcp import FastMCP
@@ -11,6 +13,7 @@ from investigators import get_cpu_saturation_top as _inv_cpu_top
 from investigators import get_memory_saturation_top as _inv_memory_top
 from loki_client import LokiClient
 from prometheus_client import PrometheusClient
+from service_graph import diff_graph_summaries, summarize_trace_graph
 from tempo_client import TempoClient
 from trace_analyzer import extract_features
 from trace_summarizer import summarize_trace
@@ -361,6 +364,195 @@ def tempo_search_and_analyze(
         analyzed.append({"trace_id": trace_id, "features": features})
 
     return json.dumps(analyzed, indent=2)
+
+
+def _tempo_analyzed_traces(
+    query: str = None,
+    service_name: str = None,
+    start: str = None,
+    end: str = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Fetch and analyze traces for a bounded Tempo window."""
+    if not tempo:
+        init_clients()
+    search = tempo.search_traces(
+        query=query,
+        service_name=service_name,
+        start=start,
+        end=end,
+        limit=limit,
+    )
+    if search.get("status") == "error":
+        return search
+
+    analyzed = []
+    for item in search.get("traces", []) or []:
+        trace_id = item.get("traceID") or item.get("traceId")
+        if not trace_id:
+            continue
+        trace_data = tempo.get_trace(trace_id)
+        features = (
+            extract_features(trace_data)
+            if trace_data.get("status") != "error"
+            else {"error": trace_data.get("error")}
+        )
+        analyzed.append(
+            {
+                "trace_id": trace_id,
+                "root_service": item.get("rootServiceName"),
+                "root_trace_name": item.get("rootTraceName"),
+                "start_time_unix_nano": item.get("startTimeUnixNano"),
+                "duration_ms": item.get("durationMs"),
+                "features": features,
+            }
+        )
+    return {"traces": analyzed, "search_count": len(search.get("traces", []) or [])}
+
+
+@mcp.tool()
+def tempo_service_graph_window(
+    start: str,
+    end: str,
+    query: str = None,
+    namespace: str = "sock-shop",
+    service_name: str = None,
+    limit: int = 50,
+    phase: str = "window",
+    top_k: int = 5,
+) -> str:
+    """Capture a compact service graph summary for a bounded time window.
+
+    The summary is model-oriented: top nodes/edges by errors and latency,
+    first degraded services, and a suspected propagation path. It deliberately
+    avoids raw trace payloads to keep the context small.
+
+    Args:
+        start: RFC3339 start of the window.
+        end: RFC3339 end of the window.
+        query: Optional TraceQL query. Defaults to a namespace-scoped query.
+        namespace: Kubernetes namespace used when query is omitted.
+        service_name: Optional service filter (avoid during RCA evals).
+        limit: Max traces to inspect (default 50).
+        phase: Human label for the window (baseline/fault/post).
+        top_k: Number of ranked nodes/edges to include.
+    """
+    trace_query = query or (
+        f'{{ resource.k8s.namespace.name = "{namespace}" && name !~ ".*health.*" '
+        '&& name !~ ".*metrics.*" }'
+    )
+    window = _tempo_analyzed_traces(
+        query=trace_query,
+        service_name=service_name,
+        start=start,
+        end=end,
+        limit=limit,
+    )
+    if window.get("status") == "error":
+        return json.dumps(window, indent=2)
+    summary = summarize_trace_graph(
+        window.get("traces") or [],
+        window_start=start,
+        window_end=end,
+        phase=phase,
+        top_k=top_k,
+    )
+    summary["query"] = trace_query
+    summary["limit"] = limit
+    summary["search_count"] = window.get("search_count")
+    return json.dumps(summary, indent=2)
+
+
+@mcp.tool()
+def tempo_service_graph_phases(
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    post_start: str = None,
+    post_end: str = None,
+    query: str = None,
+    namespace: str = "sock-shop",
+    limit: int = 50,
+    top_k: int = 5,
+) -> str:
+    """Capture baseline/fault[/post] windows and return a compact graph delta.
+
+    This is the preferred experiment-facing tool: it compares healthy vs
+    degraded topology/latency/error behaviour and returns only the changes most
+    likely to help identify where the fault propagated.
+    """
+    trace_query = query or (
+        f'{{ resource.k8s.namespace.name = "{namespace}" && name !~ ".*health.*" '
+        '&& name !~ ".*metrics.*" }'
+    )
+    baseline_raw = _tempo_analyzed_traces(
+        query=trace_query, start=baseline_start, end=baseline_end, limit=limit
+    )
+    fault_raw = _tempo_analyzed_traces(
+        query=trace_query, start=fault_start, end=fault_end, limit=limit
+    )
+    if baseline_raw.get("status") == "error":
+        return json.dumps(baseline_raw, indent=2)
+    if fault_raw.get("status") == "error":
+        return json.dumps(fault_raw, indent=2)
+
+    baseline = summarize_trace_graph(
+        baseline_raw.get("traces") or [],
+        window_start=baseline_start,
+        window_end=baseline_end,
+        phase="baseline",
+        top_k=top_k,
+    )
+    fault = summarize_trace_graph(
+        fault_raw.get("traces") or [],
+        window_start=fault_start,
+        window_end=fault_end,
+        phase="fault",
+        top_k=top_k,
+    )
+    post = None
+    if post_start and post_end:
+        post_raw = _tempo_analyzed_traces(
+            query=trace_query, start=post_start, end=post_end, limit=limit
+        )
+        if post_raw.get("status") == "error":
+            return json.dumps(post_raw, indent=2)
+        post = summarize_trace_graph(
+            post_raw.get("traces") or [],
+            window_start=post_start,
+            window_end=post_end,
+            phase="post",
+            top_k=top_k,
+        )
+
+    delta = diff_graph_summaries(baseline, fault, recovery=post, top_k=top_k)
+    result = {
+        "query": trace_query,
+        "namespace": namespace,
+        "limit": limit,
+        "phases": {"baseline": baseline, "fault": fault, "post": post},
+        "delta": delta,
+    }
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def tempo_graph_diff_from_summaries(
+    baseline: Dict[str, Any],
+    fault: Dict[str, Any],
+    post: Dict[str, Any] = None,
+    top_k: int = 5,
+) -> str:
+    """Compute a graph delta from previously captured window summaries.
+
+    Useful when the caller already stored phase summaries and wants to avoid
+    querying Tempo again.
+    """
+    return json.dumps(
+        diff_graph_summaries(baseline, fault, recovery=post, top_k=top_k),
+        indent=2,
+    )
 
 
 # ============================================================================

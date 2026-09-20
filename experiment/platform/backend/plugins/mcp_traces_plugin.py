@@ -85,6 +85,41 @@ class MCPTempoTracesPlugin:
             "count": len(analyzed),
         }
 
+    def collect_phase_graphs(
+        self,
+        context: Dict[str, Any],
+        config: Dict[str, Any],
+        phases: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Collect compact service-graph summaries for named time windows.
+
+        This is optional provider capability used by the engine for RCA
+        localisation evidence. It asks the MCP server to build phase-scoped
+        graph summaries and returns a baseline→fault delta. It never sends
+        experiment metadata or ground-truth tags to the observability server.
+        """
+        phase_map = {p.get("name"): p for p in phases if isinstance(p, dict)}
+        baseline = phase_map.get("baseline")
+        fault = phase_map.get("fault")
+        post = phase_map.get("post")
+        if not baseline or not fault:
+            return {}
+
+        args = {
+            "baseline_start": baseline.get("start"),
+            "baseline_end": baseline.get("end"),
+            "fault_start": fault.get("start"),
+            "fault_end": fault.get("end"),
+            "post_start": post.get("start") if post else None,
+            "post_end": post.get("end") if post else None,
+            "query": config.get("query"),
+            "namespace": config.get("namespace") or "sock-shop",
+            "limit": int(config.get("graph_limit", 80)),
+            "top_k": int(config.get("graph_top_k", 5)),
+        }
+        client = self._client(config)
+        return client.call_tool_json("tempo_service_graph_phases", args)
+
     def summarize(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         traces = raw.get("traces", []) if isinstance(raw, dict) else []
         durations: List[float] = []

@@ -1,0 +1,177 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-0ed2e0ff9f0a",
+  "experiment_id": "multi-chaos-eval-v2",
+  "status": "running",
+  "verdict": null,
+  "chaos_type": null,
+  "ground_truth": {
+    "service": null,
+    "fault_category": null
+  },
+  "timings": {},
+  "timeline": [
+    {
+      "ts": "2026-09-15T11:18:55.511991+00:00",
+      "event_type": "run_created",
+      "payload": {
+        "status": "pending",
+        "initiated_by": "multi-chaos-harness"
+      }
+    },
+    {
+      "ts": "2026-09-15T11:18:55.523791+00:00",
+      "event_type": "run_started",
+      "payload": {
+        "at": "2026-09-15T11:18:55.523719+00:00"
+      }
+    },
+    {
+      "ts": "2026-09-15T11:18:55.530539+00:00",
+      "event_type": "baseline_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-15T11:19:25.537177+00:00",
+      "event_type": "baseline_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-15T11:19:25.549202+00:00",
+      "event_type": "warmup_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-15T11:19:55.556832+00:00",
+      "event_type": "warmup_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-15T11:19:56.317390+00:00",
+      "event_type": "fault_started",
+      "payload": {
+        "seconds": 90
+      }
+    },
+    {
+      "ts": "2026-09-15T11:21:26.428251+00:00",
+      "event_type": "fault_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-15T11:21:26.435228+00:00",
+      "event_type": "recovery_observation_started",
+      "payload": {
+        "seconds": 180
+      }
+    },
+    {
+      "ts": "2026-09-15T11:24:32.276122+00:00",
+      "event_type": "service_graph_delta_waiting",
+      "payload": {
+        "seconds": 10
+      }
+    }
+  ],
+  "artifacts": {
+    "expected": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "present": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts"
+    ],
+    "missing": [
+      "run_features",
+      "run_summary_l2"
+    ],
+    "extra": []
+  },
+  "quality": {
+    "schema_version": "1.0",
+    "run_id": "run-0ed2e0ff9f0a",
+    "experiment_id": "multi-chaos-eval-v2",
+    "status": "running",
+    "usable": false,
+    "weak_signal": false,
+    "gaps": [
+      "artifacts_missing_or_empty",
+      "missing_ground_truth",
+      "missing_phase_timestamps"
+    ],
+    "gates": [
+      {
+        "gate": "collection_completeness",
+        "status": "fail",
+        "blocking": true,
+        "reason": "artifacts_missing_or_empty",
+        "evidence": {
+          "missing": [],
+          "empty": [
+            {
+              "artifact": "traces_raw",
+              "count": 0
+            }
+          ]
+        }
+      },
+      {
+        "gate": "window_sanity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "missing_phase_timestamps",
+        "evidence": {
+          "missing": [
+            "t_start",
+            "t_fault_start",
+            "t_fault_end"
+          ]
+        }
+      },
+      {
+        "gate": "label_consistency",
+        "status": "fail",
+        "blocking": true,
+        "reason": "missing_ground_truth",
+        "evidence": {
+          "missing": [
+            "ground_truth_service",
+            "ground_truth_fault_category"
+          ]
+        }
+      },
+      {
+        "gate": "graph_connectivity",
+        "status": "skip",
+        "blocking": true,
+        "reason": "no_propagation_graph",
+        "evidence": {}
+      },
+      {
+        "gate": "feature_sanity",
+        "status": "skip",
+        "blocking": true,
+        "reason": "no_metric_hotspots",
+        "evidence": {}
+      },
+      {
+        "gate": "symptom_presence",
+        "status": "skip",
+        "blocking": false,
+        "reason": "no_metric_hotspots",
+        "evidence": {}
+      }
+    ]
+  }
+}

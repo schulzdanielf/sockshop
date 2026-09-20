@@ -1,0 +1,176 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-8acdbca162d3",
+  "experiment_id": "multi-chaos-eval-v2",
+  "status": "failed",
+  "verdict": null,
+  "chaos_type": null,
+  "ground_truth": {
+    "service": null,
+    "fault_category": null
+  },
+  "timings": {},
+  "timeline": [
+    {
+      "ts": "2026-09-16T07:51:37.053423+00:00",
+      "event_type": "run_created",
+      "payload": {
+        "status": "pending",
+        "initiated_by": "multi-chaos-harness"
+      }
+    },
+    {
+      "ts": "2026-09-16T07:51:37.066085+00:00",
+      "event_type": "run_started",
+      "payload": {
+        "at": "2026-09-16T07:51:37.065993+00:00"
+      }
+    },
+    {
+      "ts": "2026-09-16T07:51:37.072334+00:00",
+      "event_type": "baseline_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-16T07:52:07.077315+00:00",
+      "event_type": "baseline_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-16T07:52:07.082248+00:00",
+      "event_type": "warmup_started",
+      "payload": {
+        "seconds": 30
+      }
+    },
+    {
+      "ts": "2026-09-16T07:52:37.120371+00:00",
+      "event_type": "warmup_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-16T07:52:40.892805+00:00",
+      "event_type": "fault_started",
+      "payload": {
+        "seconds": 90
+      }
+    },
+    {
+      "ts": "2026-09-16T07:54:11.180861+00:00",
+      "event_type": "fault_completed",
+      "payload": {}
+    },
+    {
+      "ts": "2026-09-16T07:54:11.188773+00:00",
+      "event_type": "recovery_observation_started",
+      "payload": {
+        "seconds": 180
+      }
+    },
+    {
+      "ts": "2026-09-16T07:57:34.035968+00:00",
+      "event_type": "run_failed",
+      "payload": {
+        "error": "unhandled errors in a TaskGroup (1 sub-exception)"
+      }
+    }
+  ],
+  "artifacts": {
+    "expected": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "present": [],
+    "missing": [
+      "metrics_raw",
+      "traces_raw",
+      "load_summary",
+      "chaos_artifacts",
+      "run_features",
+      "run_summary_l2"
+    ],
+    "extra": []
+  },
+  "quality": {
+    "schema_version": "1.0",
+    "run_id": "run-8acdbca162d3",
+    "experiment_id": "multi-chaos-eval-v2",
+    "status": "failed",
+    "usable": false,
+    "weak_signal": false,
+    "gaps": [
+      "artifacts_missing_or_empty",
+      "missing_ground_truth",
+      "missing_phase_timestamps"
+    ],
+    "gates": [
+      {
+        "gate": "collection_completeness",
+        "status": "fail",
+        "blocking": true,
+        "reason": "artifacts_missing_or_empty",
+        "evidence": {
+          "missing": [
+            "metrics_raw",
+            "traces_raw",
+            "load_summary",
+            "chaos_artifacts"
+          ],
+          "empty": []
+        }
+      },
+      {
+        "gate": "window_sanity",
+        "status": "fail",
+        "blocking": true,
+        "reason": "missing_phase_timestamps",
+        "evidence": {
+          "missing": [
+            "t_start",
+            "t_fault_start",
+            "t_fault_end"
+          ]
+        }
+      },
+      {
+        "gate": "label_consistency",
+        "status": "fail",
+        "blocking": true,
+        "reason": "missing_ground_truth",
+        "evidence": {
+          "missing": [
+            "ground_truth_service",
+            "ground_truth_fault_category"
+          ]
+        }
+      },
+      {
+        "gate": "graph_connectivity",
+        "status": "skip",
+        "blocking": true,
+        "reason": "no_propagation_graph",
+        "evidence": {}
+      },
+      {
+        "gate": "feature_sanity",
+        "status": "skip",
+        "blocking": true,
+        "reason": "no_metric_hotspots",
+        "evidence": {}
+      },
+      {
+        "gate": "symptom_presence",
+        "status": "skip",
+        "blocking": false,
+        "reason": "no_metric_hotspots",
+        "evidence": {}
+      }
+    ]
+  }
+}
