@@ -28,25 +28,25 @@ class KPI:
 GOLDEN_METRICS: List[GoldenMetric] = [
     GoldenMetric(
         name="Request Rate",
-        query="sum(rate(request_duration_seconds_count[1m])) by (name)",
+        query='sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (destination_workload)',
         description="Number of requests per second",
         unit="req/s",
     ),
     GoldenMetric(
         name="Error Rate",
-        query='100*sum(rate(request_duration_seconds_count{status_code=~"5.."}[1m])) by (name) / sum(rate(request_duration_seconds_count[1m])) by (name)',
+        query='100 * (sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown",response_code=~"5.."}[1m])) by (destination_workload) or on(destination_workload) 0 * sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (destination_workload)) / clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (destination_workload), 0.0001)',
         description="Proportion of requests that result in error",
         unit="%",
     ),
     GoldenMetric(
         name="Latency P95",
-        query="histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket[1m])) by (le, name))",
+        query='histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (le, destination_workload)) / 1000',
         description="95th percentile of request duration",
         unit="s",
     ),
     GoldenMetric(
         name="Latency P99",
-        query="histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket[1m])) by (le, name))",
+        query='histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (le, destination_workload)) / 1000',
         description="99th percentile of request duration",
         unit="s",
     ),
@@ -98,7 +98,7 @@ GOLDEN_METRICS: List[GoldenMetric] = [
 KPIS: List[KPI] = [
     KPI(
         name="Service Availability",
-        query='(1 - (sum(rate(request_duration_seconds_count{status_code=~"5.."}[1m])) by (name) / sum(rate(request_duration_seconds_count[1m])) by (name))) * 100',
+        query='100 - (100 * (sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown",response_code=~"5.."}[1m])) by (destination_workload) or on(destination_workload) 0 * sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (destination_workload)) / clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (destination_workload), 0.0001))',
         description="Percentage of successful requests",
         threshold=">= 99.9%",
         alert_condition="< 99",
@@ -112,7 +112,7 @@ KPIS: List[KPI] = [
     ),
     KPI(
         name="Error Budget Consumption",
-        query='sum(rate(request_duration_seconds_count{status_code=~"5.."}[1h])) by (name) / (0.001 * sum(rate(request_duration_seconds_count[1h])) by (name))',
+        query='(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown",response_code=~"5.."}[1h])) by (destination_workload) or on(destination_workload) 0 * sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1h])) by (destination_workload)) / (0.001 * clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1h])) by (destination_workload), 0.0001))',
         description="Percentage of error budget consumed",
         threshold="< 10%",
         alert_condition="> 50",
@@ -140,7 +140,7 @@ KPIS: List[KPI] = [
     ),
     KPI(
         name="Concurrency",
-        query="sum(rate(request_duration_seconds_count[1m])) by (name) * histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket[1m])) by (le, name))",
+        query='sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (destination_workload) * (histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])) by (le, destination_workload)) / 1000)',
         description="Estimated concurrent requests using request rate multiplied by P95 latency",
         threshold="< team-defined limit",
         alert_condition="> team-defined limit",

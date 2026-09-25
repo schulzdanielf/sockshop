@@ -34,7 +34,10 @@ from pydantic import BaseModel
 from model.openai_compat import (
     apply_stop_sequences,
     build_chat_completion_response,
+    parse_tool_call_output,
     render_chat_messages,
+    tool_choice_requires_call,
+    validate_tool_request,
 )
 
 faulthandler.enable()  # dumps Python traceback to stderr on SIGSEGV/SIGFPE
@@ -62,6 +65,15 @@ _resource = Resource.create(
         ResourceAttributes.SERVICE_NAME: "llm-qwen14b",
         ResourceAttributes.SERVICE_VERSION: "1.0.0",
         "deployment.environment": os.environ.get("DEPLOYMENT_ENV", "local"),
+        "gen_ai.model.name": "qwen-14b",
+        "gen_ai.model.provider": "local",
+        "gen_ai.provider.name": "custom",
+        "rca.model.runtime": "exllamav2",
+        "rca.model.model_dir": os.environ.get("MODEL_DIR", ""),
+        "rca.model.max_seq_len": os.environ.get("MAX_SEQ_LEN", "8192"),
+        "rca.model.quantization": os.environ.get("MODEL_QUANTIZATION", "exl2"),
+        "rca.model.tokenizer": os.environ.get("MODEL_TOKENIZER", "qwen14b"),
+        "rca.model.revision": os.environ.get("MODEL_REVISION", "unknown"),
     }
 )
 
@@ -151,9 +163,14 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     stop: Optional[Any] = None
     stream: bool = False
+    tools: Optional[list[dict[str, Any]]] = None
+    tool_choice: Any = "auto"
+    parallel_tool_calls: bool = False
 
 
-def _run_generation(prompt: str, max_new_tokens: int, request: Request) -> dict[str, Any]:
+def _run_generation(
+    prompt: str, max_new_tokens: int, request: Request, stop: Any = None
+) -> dict[str, Any]:
     """Generate a completion and capture telemetry metadata."""
     tokens_in = _count_tokens(prompt)
     ctx = extract(dict(request.headers))
@@ -161,6 +178,7 @@ def _run_generation(prompt: str, max_new_tokens: int, request: Request) -> dict[
 
     with _tracer.start_as_current_span("chat qwen-14b", context=ctx) as span:
         span.set_attribute("gen_ai.system", "qwen")
+        span.set_attribute("gen_ai.provider.name", "custom")
         span.set_attribute("gen_ai.operation.name", "chat")
         span.set_attribute("gen_ai.request.model", "qwen-14b")
         span.set_attribute("gen_ai.request.max_tokens", max_new_tokens)
@@ -170,19 +188,31 @@ def _run_generation(prompt: str, max_new_tokens: int, request: Request) -> dict[
             span.set_attribute("gen_ai.usage.input_tokens", tokens_in)
 
         t0 = time.perf_counter()
-        output = engine.generate(
+        output, generated_tokens = engine.generate_with_metadata(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
         )
+        output_before_stop = output
+        output = apply_stop_sequences(output, stop)
         duration = time.perf_counter() - t0
 
-        tokens_out = _count_tokens(output)
+        tokens_out = generated_tokens
+        visible_tokens_out = _count_tokens(output)
+        finish_reason = (
+            "stop"
+            if output != output_before_stop or generated_tokens < max_new_tokens
+            else "length"
+        )
         span.set_attribute("gen_ai.response.model", "qwen-14b")
         if capture:
             span.set_attribute("gen_ai.completion", output)
         span.set_attribute("gen_ai.client.operation.duration", round(duration, 3))
         if tokens_out >= 0:
             span.set_attribute("gen_ai.usage.output_tokens", tokens_out)
+        span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
+        span.set_attribute("rca.llm.visible_output_tokens", visible_tokens_out)
+        span.set_attribute("rca.llm.prefill_duration_available", False)
+        span.set_attribute("rca.llm.decode_duration_available", False)
 
     _attrs = {"gen_ai.system": "qwen", "gen_ai.request.model": "qwen-14b"}
     _hist_duration.record(duration, attributes=_attrs)
@@ -205,6 +235,8 @@ def _run_generation(prompt: str, max_new_tokens: int, request: Request) -> dict[
                 "gen_ai.completion": output if capture else None,
                 "gen_ai.usage.input_tokens": tokens_in,
                 "gen_ai.usage.output_tokens": tokens_out,
+                "gen_ai.response.finish_reasons": [finish_reason],
+                "rca.llm.visible_output_tokens": visible_tokens_out,
                 "gen_ai.client.operation.duration": round(duration, 3),
             }
         ),
@@ -220,6 +252,8 @@ def _run_generation(prompt: str, max_new_tokens: int, request: Request) -> dict[
         "output": output,
         "prompt_tokens": tokens_in,
         "completion_tokens": tokens_out,
+        "visible_completion_tokens": visible_tokens_out,
+        "finish_reason": finish_reason,
     }
 
 
@@ -249,7 +283,12 @@ def list_models():
 @app.post("/generate")
 def generate(req: GenerateRequest, request: Request):
     result = _run_generation(req.prompt, req.max_new_tokens, request)
-    return {"response": result["output"]}
+    return {
+        "response": result["output"],
+        "prompt_tokens": result["prompt_tokens"],
+        "completion_tokens": result["completion_tokens"],
+        "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -261,14 +300,63 @@ def chat_completions(req: ChatCompletionRequest, request: Request):
             status_code=400,
             detail=f"unsupported model: {req.model}",
         )
+    try:
+        validate_tool_request(req.tools, req.tool_choice)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    prompt = render_chat_messages(req.messages)
-    result = _run_generation(prompt, req.max_tokens, request)
-    content = apply_stop_sequences(result["output"], req.stop)
-    completion_tokens = _count_tokens(content)
-    return build_chat_completion_response(
-        content=content,
-        model="qwen-14b",
-        prompt_tokens=result["prompt_tokens"],
-        completion_tokens=completion_tokens,
+    prompt = render_chat_messages(
+        req.messages,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
+        parallel_tool_calls=req.parallel_tool_calls,
     )
+    result = _run_generation(prompt, req.max_tokens, request, stop=req.stop)
+    with _tracer.start_as_current_span("qwen.tool_call.translate") as span:
+        span.set_attribute("gen_ai.system", "qwen")
+        span.set_attribute("gen_ai.provider.name", "custom")
+        span.set_attribute("gen_ai.request.model", "qwen-14b")
+        span.set_attribute("rca.gen_ai.request.tools_count", len(req.tools or []))
+        span.set_attribute(
+            "rca.gen_ai.request.tool_choice",
+            req.tool_choice if isinstance(req.tool_choice, str) else "function",
+        )
+        span.set_attribute(
+            "rca.gen_ai.request.parallel_tool_calls", req.parallel_tool_calls
+        )
+        tool_calls = parse_tool_call_output(
+            result["output"],
+            req.tools,
+            tool_choice=req.tool_choice,
+            parallel_tool_calls=req.parallel_tool_calls,
+        )
+        if tool_choice_requires_call(req.tool_choice) and not tool_calls:
+            span.set_attribute("rca.gen_ai.response.tool_calls_count", 0)
+            span.set_attribute("rca.gen_ai.tool_call.translation_valid", False)
+            raise HTTPException(
+                status_code=502,
+                detail="model did not return a valid tool call for the requested tool_choice",
+            )
+        span.set_attribute(
+            "rca.gen_ai.response.tool_calls_count", len(tool_calls or [])
+        )
+        span.set_attribute("rca.gen_ai.tool_call.translation_valid", True)
+        finish_reason = "tool_calls" if tool_calls else result["finish_reason"]
+        span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
+        for tool_call in tool_calls or []:
+            function = tool_call.get("function") or {}
+            span.add_event(
+                "gen_ai.tool_call",
+                {
+                    "gen_ai.tool.name": str(function.get("name") or "unknown"),
+                    "gen_ai.tool.call.id": str(tool_call.get("id") or ""),
+                },
+            )
+        return build_chat_completion_response(
+            content=None if tool_calls else result["output"],
+            model="qwen-14b",
+            prompt_tokens=result["prompt_tokens"],
+            completion_tokens=result["completion_tokens"],
+            finish_reason=finish_reason,
+            tool_calls=tool_calls,
+        )

@@ -1,8 +1,7 @@
 """HTTP client + response parser for the local Qwen server.
 
-Supports both the legacy ``POST /generate`` endpoint and an OpenAI-style
-``POST /v1/chat/completions`` surface so the platform can evolve toward
-multi-agent orchestration without changing its call sites.
+Uses the OpenAI-compatible ``POST /v1/chat/completions`` contract by default.
+The legacy ``POST /generate`` contract remains available only for compatibility.
 """
 
 from __future__ import annotations
@@ -16,8 +15,13 @@ import urllib.request
 from typing import Any, Dict, Iterable, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+from opentelemetry.trace import Status, StatusCode
 
-DEFAULT_LLM_URL = os.environ.get("LLM_URL", "http://localhost:8001/generate")
+from ..observability.otel import GenAI, capture_content, get_tracer, record_llm_metrics
+
+DEFAULT_LLM_URL = os.environ.get(
+    "LLM_URL", "http://localhost:8001/v1/chat/completions"
+)
 DEFAULT_LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "120"))
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "qwen-14b")
 DEFAULT_LLM_API_STYLE = os.environ.get("LLM_API_STYLE", "auto")
@@ -93,7 +97,7 @@ def _resolve_api_style(url: str, api_style: Optional[str]) -> str:
     env_style = (DEFAULT_LLM_API_STYLE or "auto").strip().lower()
     if env_style in {"legacy", "openai", "gemini"}:
         return env_style
-    return "legacy"
+    return "openai"
 
 
 def _request_json(
@@ -135,15 +139,22 @@ def _request_json(
 
 
 def _extract_openai_text(data: Dict[str, Any]) -> str:
+    message = _extract_openai_message(data)
+    text = message.get("content")
+    if not isinstance(text, str):
+        raise LLMClientError(f"OpenAI-style payload missing message.content: {data}")
+    return text
+
+
+def _extract_openai_message(data: Dict[str, Any]) -> Dict[str, Any]:
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise LLMClientError(f"OpenAI-style payload missing 'choices': {data}")
     choice = choices[0] or {}
     message = choice.get("message") or {}
-    text = message.get("content")
-    if not isinstance(text, str):
-        raise LLMClientError(f"OpenAI-style payload missing message.content: {data}")
-    return text
+    if not isinstance(message, dict):
+        raise LLMClientError(f"OpenAI-style payload has invalid message: {data}")
+    return message
 
 
 def _extract_gemini_text(data: Dict[str, Any]) -> str:
@@ -170,6 +181,7 @@ def call_llm_messages(
     model: str = DEFAULT_LLM_MODEL,
     api_style: Optional[str] = None,
     api_key: Optional[str] = None,
+    usage: Optional[Dict[str, int]] = None,
 ) -> str:
     """Call the configured LLM using chat messages as the source input."""
     style = _resolve_api_style(url, api_style)
@@ -221,6 +233,22 @@ def call_llm_messages(
                         config=config,
                     )
                     if response.text:
+                        metadata = getattr(response, "usage_metadata", None) or {}
+                        if usage is not None:
+                            usage.update(
+                                {
+                                    "input_tokens": int(
+                                        metadata.get("prompt_token_count", 0)
+                                    ),
+                                    "output_tokens": int(
+                                        metadata.get("candidates_token_count", 0)
+                                    ),
+                                    "total_tokens": int(
+                                        metadata.get("total_token_count", 0)
+                                    ),
+                                    "source": "measured",
+                                }
+                            )
                         text_content = response.text.strip()
                         # Clean up markdown code blocks (```json ... ```) if returned
                         if text_content.startswith("```"):
@@ -307,6 +335,16 @@ def call_llm_messages(
             timeout,
             api_key=key,
         )
+        if usage is not None:
+            usage_data = data.get("usage") or {}
+            usage.update(
+                {
+                    "input_tokens": int(usage_data.get("prompt_tokens", 0)),
+                    "output_tokens": int(usage_data.get("completion_tokens", 0)),
+                    "total_tokens": int(usage_data.get("total_tokens", 0)),
+                    "source": "measured",
+                }
+            )
         return _extract_openai_text(data)
 
     prompt = _messages_to_prompt(messages)
@@ -323,7 +361,138 @@ def call_llm_messages(
     text = data.get("response")
     if not isinstance(text, str):
         raise LLMClientError(f"LLM payload missing 'response': {data}")
+    if usage is not None:
+        usage.update(
+            {
+                "input_tokens": int(data.get("prompt_tokens", 0)),
+                "output_tokens": int(data.get("completion_tokens", 0)),
+                "total_tokens": int(
+                    data.get(
+                        "total_tokens",
+                        int(data.get("prompt_tokens", 0))
+                        + int(data.get("completion_tokens", 0)),
+                    )
+                ),
+                "source": "measured" if "prompt_tokens" in data else "unavailable",
+            }
+        )
     return text
+
+
+def call_llm_tool_messages(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    *,
+    tool_choice: Any = "auto",
+    parallel_tool_calls: bool = False,
+    max_new_tokens: int = 2048,
+    url: str = DEFAULT_LLM_URL,
+    timeout: float = DEFAULT_LLM_TIMEOUT,
+    model: str = DEFAULT_LLM_MODEL,
+    api_style: Optional[str] = None,
+    api_key: Optional[str] = None,
+    usage: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """Call an OpenAI-compatible chat endpoint with tools and return its message."""
+    style = _resolve_api_style(url, api_style)
+    if style != "openai":
+        raise LLMClientError(
+            "Tool calling currently requires an OpenAI-compatible chat endpoint."
+        )
+
+    host = urllib.parse.urlparse(url).hostname or ""
+    provider_name = "openai" if host == "api.openai.com" else "custom"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": int(max_new_tokens),
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": parallel_tool_calls,
+    }
+    usage_data: Dict[str, Any] = {}
+    started = time.perf_counter()
+    with get_tracer().start_as_current_span("gen_ai.chat") as span:
+        span.set_attribute(GenAI.OPERATION_NAME, "chat")
+        span.set_attribute(GenAI.PROVIDER_NAME, provider_name)
+        span.set_attribute(GenAI.SYSTEM, "qwen" if "qwen" in model.lower() else provider_name)
+        span.set_attribute(GenAI.REQUEST_MODEL, model)
+        span.set_attribute(GenAI.REQUEST_MAX_TOKENS, int(max_new_tokens))
+        span.set_attribute("rca.gen_ai.request.tools_count", len(tools))
+        span.set_attribute("rca.gen_ai.request.tool_choice", str(tool_choice))
+        span.set_attribute(
+            "rca.gen_ai.request.parallel_tool_calls", parallel_tool_calls
+        )
+        if capture_content():
+            span.set_attribute(
+                GenAI.PROMPT,
+                json.dumps(
+                    {"messages": messages, "tools": tools}, ensure_ascii=False
+                ),
+            )
+        try:
+            data = _request_json(
+                url,
+                payload,
+                timeout,
+                api_key=_get_api_key(api_key),
+            )
+            message = _extract_openai_message(data)
+            usage_data = data.get("usage") or {}
+            input_tokens = int(usage_data.get("prompt_tokens", 0))
+            output_tokens = int(usage_data.get("completion_tokens", 0))
+            span.set_attribute(GenAI.RESPONSE_MODEL, data.get("model") or model)
+            if data.get("id"):
+                span.set_attribute(GenAI.RESPONSE_ID, str(data["id"]))
+            if input_tokens:
+                span.set_attribute(GenAI.USAGE_INPUT_TOKENS, input_tokens)
+            if output_tokens:
+                span.set_attribute(GenAI.USAGE_OUTPUT_TOKENS, output_tokens)
+
+            choices = data.get("choices") or []
+            finish_reason = choices[0].get("finish_reason") if choices else None
+            if finish_reason:
+                span.set_attribute(GenAI.RESPONSE_FINISH_REASONS, [finish_reason])
+            tool_calls = message.get("tool_calls") or []
+            span.set_attribute("rca.gen_ai.response.tool_calls_count", len(tool_calls))
+            for tool_call in tool_calls:
+                function = tool_call.get("function") or {}
+                span.add_event(
+                    "gen_ai.tool_call",
+                    {
+                        GenAI.TOOL_NAME: str(function.get("name") or "unknown"),
+                        GenAI.TOOL_CALL_ID: str(tool_call.get("id") or ""),
+                    },
+                )
+            if capture_content():
+                span.set_attribute(
+                    GenAI.COMPLETION,
+                    json.dumps(message, ensure_ascii=False, default=str),
+                )
+            if usage is not None:
+                usage.update(
+                    {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": int(
+                            usage_data.get("total_tokens", input_tokens + output_tokens)
+                        ),
+                        "source": "measured",
+                    }
+                )
+            return message
+        except LLMClientError as exc:
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR, str(exc)))
+            raise
+        finally:
+            duration = time.perf_counter() - started
+            record_llm_metrics(
+                duration_s=duration,
+                input_tokens=int(usage_data.get("prompt_tokens", 0)),
+                output_tokens=int(usage_data.get("completion_tokens", 0)),
+                model=model,
+            )
 
 
 def call_llm(
@@ -335,6 +504,7 @@ def call_llm(
     model: str = DEFAULT_LLM_MODEL,
     api_style: Optional[str] = None,
     api_key: Optional[str] = None,
+    usage: Optional[Dict[str, int]] = None,
 ) -> str:
     """Call the configured LLM and return the raw response text."""
     return call_llm_messages(
@@ -345,6 +515,7 @@ def call_llm(
         model=model,
         api_style=api_style,
         api_key=api_key,
+        usage=usage,
     )
 
 

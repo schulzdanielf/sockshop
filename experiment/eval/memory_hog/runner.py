@@ -141,6 +141,9 @@ def _fault_category_for(cfg: Dict[str, Any], chaos_type: str) -> str:
 # template ..." — which is exactly why they failed in both train and test.
 CHAOS_NAMESPACE = "litmus"
 _TS_SUFFIX_RE = re.compile(r"-\d{13}$")
+# These faults are applied as Kubernetes manifests by the platform and do not
+# require an Argo workflow template to be primed in the litmus namespace.
+MANIFEST_CHAOS_TYPES = {"http-status-code"}
 
 
 def _kubectl(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -205,6 +208,7 @@ def ensure_chaos_templates(cfg: Dict[str, Any]) -> None:
             (cell["service"], cell["chaos_type"])
             for key in ("train_experiments", "test_experiments")
             for cell in cfg.get(key, []) or []
+            if cell["chaos_type"] not in MANIFEST_CHAOS_TYPES
         }
     )
 
@@ -284,6 +288,23 @@ def build_spec(
     # Database version and run_id still distinguish individual executions.
     exp_id = str(cfg.get("experiment_campaign_id") or "multi-chaos-eval-v1")
     chaos_engine = f"{service}-{suffix}"  # Argo workflow template name
+
+    # http-status-code sob Istio: o pod-http-status-code (proxy) é contornado
+    # pelo Envoy (ERRO 2, erros-experimentos.md). Usamos um VirtualService de
+    # fault injection (manifest_path), que injeta o erro no próprio mesh.
+    manifests_dir = Path(cfg["output"]["manifests_dir"])
+    if not manifests_dir.is_absolute():
+        manifests_dir = ROOT / "experiment" / "eval" / "memory_hog" / "out" / manifests_dir.name
+    vs_manifest = manifests_dir / f"{service}-{suffix}.yaml"
+    use_virtualservice = chaos_type == "http-status-code" and vs_manifest.exists()
+
+    chaos_profile = {
+        "provider": "litmus",
+        "namespace": cfg["cluster"]["app_namespace"],
+        "manifest_path": str(vs_manifest) if use_virtualservice else None,
+        "chaos_engine": None if use_virtualservice else chaos_engine,
+        "chaos_result": None,
+    }
     return {
         "schema_version": "1.0.0",
         "experiment": {
@@ -316,13 +337,7 @@ def build_spec(
             **cfg["load_profile"],
             "extra_args": [],
         },
-        "chaos_profile": {
-            "provider": "litmus",
-            "namespace": cfg["cluster"]["app_namespace"],
-            "manifest_path": None,
-            "chaos_engine": chaos_engine,  # Argo workflow template (must exist)
-            "chaos_result": None,
-        },
+        "chaos_profile": chaos_profile,
         "observability": {
             "metrics": {
                 "provider": "mcp-prometheus",
@@ -339,36 +354,48 @@ def build_spec(
                     # ── Traffic ──
                     {
                         "id": "traffic",
-                        "query": "sum(rate(request_duration_seconds_count[5m])) by (name)",
+                        "query": (
+                            'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
+                            'destination_workload!="unknown"}[5m])) by (destination_workload)'
+                        ),
                     },
                     # ── Errors ──
                     {
                         "id": "error_rate",
                         "query": (
-                            "sum(rate(request_duration_seconds_count"
-                            '{status_code=~"5.."}[5m])) by (name)'
+                            '100 * ('
+                            'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
+                            'destination_workload!="unknown",response_code=~"5.."}[5m])) by (destination_workload)'
+                            ' or on(destination_workload) 0 * '
+                            'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
+                            'destination_workload!="unknown"}[5m])) by (destination_workload)'
+                            ') / clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
+                            'destination_workload!="unknown"}[5m])) by (destination_workload), 0.0001)'
                         ),
                     },
                     # ── Latency (RED) — three percentiles ──
                     {
                         "id": "latency_p50",
                         "query": (
-                            "histogram_quantile(0.50, sum(rate("
-                            "request_duration_seconds_bucket[5m])) by (le,name))"
+                            'histogram_quantile(0.50, sum(rate(istio_request_duration_milliseconds_bucket{'
+                            'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
+                            '[5m])) by (le,destination_workload))'
                         ),
                     },
                     {
                         "id": "latency_p95",
                         "query": (
-                            "histogram_quantile(0.95, sum(rate("
-                            "request_duration_seconds_bucket[5m])) by (le,name))"
+                            'histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{'
+                            'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
+                            '[5m])) by (le,destination_workload))'
                         ),
                     },
                     {
                         "id": "latency_p99",
                         "query": (
-                            "histogram_quantile(0.99, sum(rate("
-                            "request_duration_seconds_bucket[5m])) by (le,name))"
+                            'histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{'
+                            'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
+                            '[5m])) by (le,destination_workload))'
                         ),
                     },
                     # ── Network signals ─────────────────────────────────

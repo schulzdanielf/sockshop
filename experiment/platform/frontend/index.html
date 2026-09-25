@@ -125,6 +125,35 @@
         <div id="historyList"><span style="color:var(--muted);font-size:0.85rem;">Carregando…</span></div>
       </section>
 
+      <section class="panel telemetry-chat">
+        <div class="chat-header">
+          <div>
+            <p class="eyebrow">MCP / TELEMETRIA</p>
+            <h2>Ask the experiment</h2>
+            <p class="panel-copy">Pergunte sobre métricas, latência, erros, restarts e OOM dentro da janela do run selecionado.</p>
+          </div>
+          <span id="chatWindowBadge" class="window-badge">Nenhum run selecionado</span>
+        </div>
+        <div class="chat-toolbar">
+          <label>Experiment run
+            <select id="telemetryRunSelect"><option value="">Selecione um run concluído</option></select>
+          </label>
+          <button id="refreshTelemetryRunsBtn" class="btn-sm" title="Atualizar runs">⟳</button>
+        </div>
+        <div id="telemetryChatMessages" class="chat-messages" aria-live="polite">
+          <div class="chat-empty">Escolha um run concluído e faça uma pergunta sobre a telemetria.</div>
+        </div>
+        <form id="telemetryChatForm" class="chat-composer">
+          <input id="telemetryChatInput" autocomplete="off" placeholder="Qual serviço teve a maior taxa de erros?" disabled />
+          <button type="submit" id="telemetryChatSendBtn" disabled>Enviar</button>
+        </form>
+        <div class="chat-suggestions">
+          <button type="button" data-chat-question="Qual serviço teve a maior porcentagem de erros?">maior taxa de erros</button>
+          <button type="button" data-chat-question="Qual serviço teve a maior latência P95?">maior latência</button>
+          <button type="button" data-chat-question="Algum pod foi restartado ou sofreu OOM?">restarts / OOM</button>
+        </div>
+      </section>
+
       <section class="panel results">
         <h2>Results & Compare</h2>
         <div class="controls-inline">

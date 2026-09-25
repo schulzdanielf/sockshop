@@ -74,3 +74,54 @@ Aceitar o que existe: topologia conhecida da Sock Shop (arestas estáticas), fea
 ## Decisão (tomada)
 
 **Opção D — topologia estática + arestas `user→X` + node features.** Dataset v1 construído com o que já existe; `edge_source` por amostra permite medir o delta da telemetria forte no futuro.
+
+## Reavaliação Pixie (2026-09-20) — checagem de viabilidade antes de investir
+
+Após H001 ser refutada na Opção D (topologia estática prejudicial), o usuário
+decidiu investir na telemetria real via Pixie, mas pediu verificação de
+bloqueadores futuros antes de gastar tempo. Checagem empírica no cluster:
+
+| Requisito | Resultado |
+|---|---|
+| Recursos do node | 16 CPU, 36GB RAM, ~11GB livres — suficiente (Pixie ~3-4GB) |
+| DNS Pixie Cloud (`withpixie.ai`) | resolve (34.102.151.106) |
+| HTTPS ao Pixie Cloud | 307 (alcançável, TLS ok) |
+| Pod privilegiado + hostPID + hostPath | **agenda e roda** no docker-desktop |
+| BTF (`/sys/kernel/btf/vmlinux`) | presente (CO-RE, kernel-agnóstico) |
+| tracefs, kprobes | 62.978 funções kprobe-áveis |
+| Flags kernel | `CONFIG_BPF/BPF_SYSCALL/BPF_JIT/PERF_EVENTS/KPROBES/UPROBES/DEBUG_INFO_BTF` **todas =y** |
+
+**Veredito: luz verde técnica.** Todos os requisitos de eBPF do Pixie estão
+presentes e testados. `perf_event_paranoid=2` e `unprivileged_bpf_disabled=2` não
+afetam — os PEMs rodam privilegiados e contornam essas restrições.
+
+**Risco residual (baixo, honesto):** o kernel WSL2 (`6.6.87.2-microsoft-standard`)
+não está na lista oficialmente testada do Pixie. Mitigado por BTF+CO-RE (funciona
+em qualquer kernel com BTF). **Falha, se ocorrer, é rápida e barata:** o PEM ou
+carrega o eBPF e flui dado em ~5 min, ou falha no load — saberíamos em ~15 min, e
+como o Pixie **não toca nas imagens nem nos manifests do sock-shop**, não há nada a
+reverter. É a opção de menor arrependimento exatamente por isso.
+
+**Requisito operacional:** conta gratuita no Pixie Community Cloud (o CLI `px`
+exige login para deploy). É o único cadastro necessário.
+
+## Deploy do Pixie e resultado go/no-go (2026-09-20) — NÃO viável no WSL2
+
+Deploy executado (conta criada, deploy key + API key). Fluxo:
+- `px auth login --api_key --cloud_addr=withpixie.ai:443` (o default de cloud_addr estava errado — community cloud é `withpixie.ai:443`).
+- Check de kernel falhou por bug cosmético de parse (`patch number "87.2"`), contornado com `--check=false`. Kernel 6.6 >> 4.14 exigido.
+- Deploy completou: Vizier `CS_HEALTHY`, todos os pods Running, **PEM (agente eBPF) carregou** — perf_profiler capturou 40k stack traces.
+
+**Bloqueador definitivo:** o `socket_tracer` do Pixie (fonte de `http_events`/`conn_stats` = o service graph) **não instancia**:
+```
+Source Connector (socket_tracer) not instantiated:
+  Unable to attach kprobe for __x64_sys_connect using syscall__probe_entry_connect
+```
+Reproduzido 2× (deploy + PEM restart), determinístico. Diagnóstico:
+- `/sys/kernel/debug/tracing/kprobe_events` **é gravável** (testado: escrita manual de kprobe em `__x64_sys_connect` → WRITE_OK) e `CONFIG_KPROBE_EVENTS=y`.
+- Mas o Pixie/BCC anexa via `perf_event_open(PERF_TYPE_KPROBE)` — mecanismo **diferente** do write-legado do tracefs — e **esse caminho não funciona no kernel WSL2**. Prova: o `perf_profiler` (perf sampling comum) sobe; o `socket_tracer` (kprobes em syscalls) falha no 1º attach.
+- Não corrigível sem rebuildar o kernel WSL2; o Pixie não expõe o caminho legado de attach.
+
+**Custo real: ~40 min, zero toque no app.** Pixie removido 100% (`pl`, `px-operator`, `olm`, CRDs, clusterroles — todos deletados; sock-shop intacto; chaves temporárias apagadas). Rotacionar deploy/API keys no painel.
+
+**Conclusão:** telemetria eBPF de protocolo (edge features reais) **não é viável neste docker-desktop/WSL2**. Alternativas para o futuro, todas fora do WSL2: cluster Linux real (cloud/VM com kernel padrão) onde o Pixie funciona; ou service mesh (Istio) que gera métricas de aresta via sidecar sem depender de perf-kprobe. Por ora, **consolidar o MLP por-nó como resultado WHERE** (S3=0.86); a hipótese do GNN com edge features fica parada até um ambiente com kernel padrão.

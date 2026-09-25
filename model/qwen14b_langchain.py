@@ -1,7 +1,7 @@
 """LangChain LLM wrapper around the local Qwen-14B HTTP server.
 
-``Qwen14BAPI`` adapts the model server's ``/generate`` endpoint to the
-LangChain :class:`LLM` interface so the RCA agent can call it like any
+``Qwen14BAPI`` adapts the model server's OpenAI-compatible chat endpoint to
+the LangChain :class:`LLM` interface so the RCA agent can call it like any
 other LangChain model.
 """
 
@@ -16,7 +16,7 @@ class Qwen14BAPI(LLM):
     LangChain wrapper para sua API local FastAPI + ExLlamaV2
     """
 
-    api_url: str = "http://localhost:8001/generate"
+    api_url: str = "http://localhost:8001/v1/chat/completions"
 
     @property
     def _llm_type(self) -> str:
@@ -25,21 +25,20 @@ class Qwen14BAPI(LLM):
     def _call(
         self, prompt: str, stop: Optional[List[str]] = None, run_manager=None, **kwargs
     ) -> str:
-        max_tokens = kwargs.get("max_new_tokens", 512)
+        max_tokens = kwargs.get("max_tokens", kwargs.get("max_new_tokens", 512))
 
         response = requests.post(
             self.api_url,
-            json={"prompt": prompt, "max_new_tokens": max_tokens},
+            json={
+                "model": "qwen-14b",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "stop": stop,
+            },
             timeout=300,
         )
 
         response.raise_for_status()
 
-        text = response.json()["response"]
-
-        # LangChain stop handling simples
-        if stop:
-            for s in stop:
-                text = text.split(s)[0]
-
-        return text
+        payload = response.json()
+        return payload["choices"][0]["message"]["content"]

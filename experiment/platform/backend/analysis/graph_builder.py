@@ -3,9 +3,10 @@
 Constrói, por run, o grafo que alimenta o GAT:
 
 * **Nós** = serviços da Sock Shop. Features de nó = as 3 golden metrics
-  (request rate, latência, % erro) por serviço, codificadas como
-  **log-ratio** vs baseline, + ``span_count`` (confiança da janela).
-  Fonte: ``metrics_raw`` (séries por serviço no label ``name``).
+    (request rate, latência, % erro) por serviço, codificadas como
+    **log-ratio** vs baseline, + ``span_count`` (confiança da janela).
+    Fonte: ``metrics_raw`` (séries por serviço no label ``name`` ou no label
+    Istio ``destination_workload``).
 * **Arestas** = topologia estática conhecida da Sock Shop, bidirecionais
   com marcação de direção. Features de aresta: as golden metrics
   **``user → X``** do Prometheus (quando existem) + neutras nas internas.
@@ -46,8 +47,9 @@ STATIC_TOPOLOGY: List[Tuple[str, str]] = [
     ("user", "user-db"),
 ]
 
-# Golden metrics por nó, no label `name` do metrics_raw.
+# Golden metrics por nó, no label `name` ou `destination_workload` do metrics_raw.
 NODE_METRICS = ("traffic", "latency_p95", "error_rate")
+SERVICE_LABEL_KEYS = ("destination_workload", "name", "service", "source_workload")
 
 # Epsilon do log-ratio: resolve baseline de erro ≈ 0.
 EPSILON = 1e-6
@@ -62,7 +64,6 @@ CORE_SERVICES = (
     "payment",
     "shipping",
     "user",
-    "queue-master",
 )
 
 
@@ -76,8 +77,9 @@ def _series_by_service(metrics_raw: Dict[str, Any], metric_id: str) -> Dict[str,
     data = metrics_raw.get("data") or {}
     result = ((data.get(metric_id) or {}).get("data") or {}).get("result") or []
     for series in result:
-        name = (series.get("metric") or {}).get("name")
-        if not name:
+        labels = series.get("metric") or {}
+        name = next((str(labels[k]) for k in SERVICE_LABEL_KEYS if labels.get(k)), "")
+        if not name or name == "unknown":
             continue
         points: List[Tuple[float, float]] = []
         for ts, val in series.get("values") or []:
@@ -172,8 +174,12 @@ def build_gat_graph(
 
     # ── Arestas (topologia estática, bidirecionais) ─────────────────────
     # edge_source reflete a melhor evidência disponível neste run:
-    #   "user_only" se há métricas user→X no Prometheus-v3; senão "static".
-    edge_source = "user_only" if edge_metrics else "static"
+    #   "full"      — arestas reais via service mesh Istio (source→destination);
+    #   "user_only" — só métricas user→X do traces service-graph;
+    #   "static"    — topologia conhecida sem métricas por aresta.
+    edge_source = "static"
+    if edge_metrics:
+        edge_source = _detect_edge_source(edge_metrics)
     edges: List[Dict[str, Any]] = []
     for src_name, dst_name in STATIC_TOPOLOGY:
         # só cria aresta se ambos os nós existem no grafo (core services)
@@ -224,6 +230,14 @@ def build_gat_graph(
     }
 
 
+def _detect_edge_source(edge_metrics: Dict[str, Any]) -> str:
+    """Identifica a proveniência das métricas de aresta."""
+    keys = set(edge_metrics.keys())
+    if any(k.startswith("istio_") for k in keys):
+        return "full"  # service mesh Istio: arestas reais source→destination
+    return "user_only"  # traces service-graph: apenas user→X
+
+
 def _edge_features(
     edge_metrics: Optional[Dict[str, Any]],
     src: str,
@@ -235,27 +249,91 @@ def _edge_features(
 ) -> Dict[str, Optional[float]]:
     """Features de uma aresta A→B.
 
-    Com ``edge_metrics`` (séries ``traces_service_graph_*`` do
-    Prometheus-v3), calcula log-ratio das golden metrics da aresta
-    ``src → dst`` — que na prática só existe para ``user → X``. Sem elas,
-    retorna neutras (None), e o graph builder marca ``edge_source``.
+    Aceita dois formatos de ``edge_metrics``:
+
+    * **Istio** (``edge_source: full``): ``istio_requests_total``,
+      ``istio_request_duration_milliseconds_sum`` e erros derivados de
+      ``istio_requests_total`` filtrado por ``response_code`` 5xx.
+    * **Traces service-graph** (``user_only``): ``traces_service_graph_*`` do
+      Prometheus-v3 — na prática só existe para ``user → X``.
+
+    Sem métricas, retorna neutras (None).
     """
     if not edge_metrics:
         return {"req_rate_lr": None, "latency_lr": None, "error_lr": None, "call_count": None}
 
-    def _metric_lr(metric_name: str) -> Tuple[Optional[float], int]:
+    source = _detect_edge_source(edge_metrics)
+    if source == "full":
+        return _edge_features_istio(edge_metrics, src, dst, fault_start, fault_end, base_start, base_end)
+    return _edge_features_traces(edge_metrics, src, dst, fault_start, fault_end, base_start, base_end)
+
+
+def _edge_features_traces(
+    edge_metrics: Dict[str, Any],
+    src: str,
+    dst: str,
+    fault_start: float,
+    fault_end: float,
+    base_start: float,
+    base_end: float,
+) -> Dict[str, Optional[float]]:
+    """Golden metrics da aresta a partir das séries ``traces_service_graph_*``."""
+
+    def _lr(metric_name: str) -> Tuple[Optional[float], int]:
         series = _edge_series(edge_metrics, metric_name, src, dst)
         period_mean, count = _window_mean(series, fault_start, fault_end)
         base_mean, _ = _window_mean(series, base_start, base_end)
         return _log_ratio(period_mean, base_mean), count
 
-    req_lr, req_count = _metric_lr("traces_service_graph_request_total")
-    lat_lr, _ = _metric_lr("traces_service_graph_request_client_seconds_sum")
-    err_lr, _ = _metric_lr("traces_service_graph_request_failed_total")
+    req_lr, req_count = _lr("traces_service_graph_request_total")
+    lat_lr, _ = _lr("traces_service_graph_request_client_seconds_sum")
+    err_lr, _ = _lr("traces_service_graph_request_failed_total")
     return {
         "req_rate_lr": req_lr,
         "latency_lr": lat_lr,
         "error_lr": err_lr,
+        "call_count": float(req_count) if req_count else None,
+    }
+
+
+def _edge_features_istio(
+    edge_metrics: Dict[str, Any],
+    src: str,
+    dst: str,
+    fault_start: float,
+    fault_end: float,
+    base_start: float,
+    base_end: float,
+) -> Dict[str, Optional[float]]:
+    """Golden metrics da aresta a partir das séries Istio.
+
+    Erro% = taxa de 5xx / total por aresta. Latência = sum/count.
+    """
+    def _window_stats(metric_name: str, only_5xx: bool) -> Tuple[Optional[float], Optional[float], int]:
+        """Retorna (fault_mean, baseline_mean, count) já como RATE por segundo."""
+        series = _edge_series_istio(edge_metrics, metric_name, src, dst, only_5xx)
+        f_mean, f_count = _window_mean(series, fault_start, fault_end)
+        b_mean, _ = _window_mean(series, base_start, base_end)
+        return f_mean, b_mean, f_count
+
+    # request rate (req/s) — counter → rate implícito via janelas
+    req_f, req_b, req_count = _window_stats("istio_requests_total", only_5xx=False)
+    err_f, err_b, _ = _window_stats("istio_requests_total", only_5xx=True)
+    lat_sum_f, lat_sum_b, _ = _window_stats("istio_request_duration_milliseconds_sum", only_5xx=False)
+    lat_cnt_f, lat_cnt_b, _ = _window_stats("istio_request_duration_milliseconds_count", only_5xx=False)
+
+    # latência média = sum/count (ms)
+    lat_f = (lat_sum_f / lat_cnt_f) if lat_sum_f and lat_cnt_f else None
+    lat_b = (lat_sum_b / lat_cnt_b) if lat_sum_b and lat_cnt_b else None
+
+    # erro% = 5xx / total
+    err_rate_f = (err_f / req_f) if (err_f is not None and req_f) else (0.0 if req_f else None)
+    err_rate_b = (err_b / req_b) if (err_b is not None and req_b) else (0.0 if req_b else None)
+
+    return {
+        "req_rate_lr": _log_ratio(req_f, req_b),
+        "latency_lr": _log_ratio(lat_f, lat_b),
+        "error_lr": _log_ratio(err_rate_f, err_rate_b),
         "call_count": float(req_count) if req_count else None,
     }
 
@@ -279,3 +357,34 @@ def _edge_series(
                     continue
     points.sort(key=lambda p: p[0])
     return points
+
+
+def _edge_series_istio(
+    edge_metrics: Dict[str, Any],
+    metric_name: str,
+    src: str,
+    dst: str,
+    only_5xx: bool = False,
+) -> List[Tuple[float, float]]:
+    """Extrai [(ts, value)] de uma série Istio para (source_workload=src, destination_workload=dst).
+
+    Agrega séries que diferem apenas por ``response_code``/``reporter``. Com
+    ``only_5xx=True``, soma apenas séries cujo ``response_code`` começa com 5.
+    """
+    result = ((edge_metrics.get(metric_name) or {}).get("data") or {}).get("result") or []
+    by_ts: Dict[float, float] = {}
+    for series in result:
+        metric = series.get("metric") or {}
+        if metric.get("source_workload") != src or metric.get("destination_workload") != dst:
+            continue
+        if only_5xx:
+            code = str(metric.get("response_code") or "")
+            if not code.startswith("5"):
+                continue
+        for ts, val in series.get("values") or []:
+            try:
+                t, v = float(ts), float(val)
+            except (TypeError, ValueError):
+                continue
+            by_ts[t] = by_ts.get(t, 0.0) + v
+    return sorted(by_ts.items())

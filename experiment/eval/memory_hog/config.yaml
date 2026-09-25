@@ -184,12 +184,25 @@ train_experiments:
   - {service: shipping,  chaos_type: pod-delete}
   - {service: queue-master, chaos_type: memory-hog}
   - {service: front-end,   chaos_type: cpu-hog}
+  - {service: orders,      chaos_type: memory-hog}
   # Extended faults (runnable on docker-desktop WSL2 — see chaos_types notes).
   # network-* require `make chaos-enable-netem` (sch_netem) before running.
   - {service: catalogue, chaos_type: network-latency}
   - {service: carts,     chaos_type: network-loss}
   - {service: user,      chaos_type: http-status-code}   # port-80 service
   - {service: orders,    chaos_type: container-kill}
+  # Additional historical cells retained in the GAT corpus and eligible for retry.
+  - {service: carts,        chaos_type: container-kill}
+  - {service: shipping,     chaos_type: container-kill}
+  - {service: user,         chaos_type: container-kill}
+  - {service: catalogue,    chaos_type: http-status-code}
+  - {service: carts,        chaos_type: http-status-code}
+  - {service: payment,      chaos_type: http-status-code}
+  - {service: front-end,    chaos_type: network-latency}
+  - {service: orders,       chaos_type: network-latency}
+  - {service: shipping,     chaos_type: network-latency}
+  - {service: user,         chaos_type: network-latency}
+  - {service: payment,      chaos_type: network-loss}
 
 test_experiments:
   - {service: user,         chaos_type: memory-hog}
@@ -204,7 +217,7 @@ test_experiments:
   - {service: orders,       chaos_type: http-status-code}  # port-80 service
   - {service: user,         chaos_type: container-kill}
 
-replicas: 1                            # repetitions per (service, chaos_type)
+replicas: 3                            # repetitions per (service, chaos_type)
 
 # ── Evaluation strategies (held-out runs × every strategy) ─────────────────
 # All call POST /api/runs/{run_id}/llm-analysis?force=true with these params.

@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 
 from .analysis import (
     anonymize_services,
+    build_observability_summary,
     build_run_summary_l2,
     compute_temporal_features,
     get_embedding_provider,
@@ -39,6 +40,83 @@ def _parse_iso(value: str) -> datetime:
 
 def _duration_seconds(start_iso: str, end_iso: str) -> float:
     return (_parse_iso(end_iso) - _parse_iso(start_iso)).total_seconds()
+
+
+def _build_observation_window(
+    run_id: str,
+    experiment_id: str,
+    status: str,
+    timings: Dict[str, Any],
+    sampling_interval_seconds: int,
+) -> Dict[str, Any]:
+    """Build the compact, authoritative time contract for a completed run."""
+    phase_keys = {
+        "baseline": ("t_start", "t_warmup_start"),
+        "warmup": ("t_warmup_start", "t_warmup_end"),
+        "fault": ("t_fault_start", "t_fault_end"),
+        "post": ("t_fault_end", "t_recovery_observed"),
+    }
+    phases = {
+        name: {"start": timings[start_key], "end": timings[end_key]}
+        for name, (start_key, end_key) in phase_keys.items()
+        if timings.get(start_key) and timings.get(end_key)
+    }
+
+    start = timings.get("t_start")
+    end = timings.get("t_recovery_observed")
+    if not start or not end:
+        raise ValueError("observation window requires start and end timestamps")
+
+    return {
+        "schema_version": "1",
+        "run_id": run_id,
+        "experiment_id": experiment_id,
+        "status": status,
+        "timezone": "UTC",
+        "window": {"start": start, "end": end},
+        "phases": phases,
+        "sampling_interval_seconds": sampling_interval_seconds,
+    }
+
+
+def _build_partial_observation_window(
+    run_id: str,
+    experiment_id: str,
+    status: str,
+    events: list[DomainEvent],
+    ended_at: str,
+    sampling_interval_seconds: int,
+) -> Dict[str, Any]:
+    """Build a best-effort window for stopped or failed runs."""
+    event_times = {event.event_type: event.ts for event in events}
+    start = event_times.get("run_started")
+    if not start:
+        raise ValueError("partial observation window requires run_started event")
+
+    phases = {}
+    phase_events = {
+        "baseline": ("run_started", "warmup_started"),
+        "warmup": ("warmup_started", "warmup_completed"),
+        "fault": ("fault_started", "fault_completed"),
+        "post": ("recovery_observation_started", "recovery_observation_completed"),
+    }
+    for name, (start_event, end_event) in phase_events.items():
+        phase_start = event_times.get(start_event)
+        phase_end = event_times.get(end_event)
+        if phase_start and phase_end:
+            phases[name] = {"start": phase_start, "end": phase_end}
+
+    return {
+        "schema_version": "1",
+        "run_id": run_id,
+        "experiment_id": experiment_id,
+        "status": status,
+        "timezone": "UTC",
+        "window": {"start": start, "end": ended_at},
+        "phases": phases,
+        "sampling_interval_seconds": sampling_interval_seconds,
+        "partial": True,
+    }
 
 
 class OrchestratorEngine:
@@ -269,8 +347,10 @@ class OrchestratorEngine:
                 context, metrics_cfg, run_start_iso, recovery_end, step
             )
             metrics_summary = self.metrics.summarize(metrics_raw)
+            # Collect the full execution window so baseline traces can be
+            # compared with fault and recovery traces.
             traces_raw = self.traces.collect_window(
-                context, traces_cfg, fault_start, recovery_end
+                context, traces_cfg, run_start_iso, recovery_end
             )
             traces_summary = self.traces.summarize(traces_raw)
 
@@ -298,6 +378,33 @@ class OrchestratorEngine:
                 fault_end_iso=fault_end,
                 recovery_end_iso=recovery_end,
             )
+
+            # ── Ground-truth auto-labelling ─────────────────────────────────
+            # Experiments submitted by the eval harness carry their ground
+            # truth in the experiment-level tags as ``target:<service>`` and
+            # ``fault_category:<category>``. Extract them here — BEFORE the
+            # gat_graph build below, which reads features["ground_truth_*"] —
+            # so every persisted graph has a stable label that doesn't depend
+            # on the eval harness keeping a static chaos_type → fault_category
+            # map. Future fault families just need to ship the right tag on
+            # the experiment spec.
+            exp_meta = (
+                exp.spec.get("experiment", {}) if isinstance(exp.spec, dict) else {}
+            )
+            spec_tags = exp_meta.get("tags") or []
+            gt_service_from_spec: Optional[str] = None
+            gt_fault_from_spec: Optional[str] = None
+            for tag in spec_tags:
+                if not isinstance(tag, str):
+                    continue
+                if tag.startswith("target:") and gt_service_from_spec is None:
+                    gt_service_from_spec = tag.split(":", 1)[1].strip() or None
+                elif tag.startswith("fault_category:") and gt_fault_from_spec is None:
+                    gt_fault_from_spec = tag.split(":", 1)[1].strip() or None
+            if gt_service_from_spec:
+                features["ground_truth_service"] = gt_service_from_spec
+            if gt_fault_from_spec:
+                features["ground_truth_fault_category"] = gt_fault_from_spec
 
             # Phase-scoped service graph delta — optional evidence for WHERE.
             # The payload is intentionally model-facing but safe: it contains
@@ -336,6 +443,45 @@ class OrchestratorEngine:
 
             features_path = self.storage.save_artifact(run_id, "run_features", features)
 
+            # ── Istio edge features + grafo GAT (Opção D + mesh) ───────────
+            # Coleta golden metrics por aresta (source→destination) via Istio e
+            # constrói o grafo do GAT. Best-effort: sem mesh, edge_source fica
+            # "static" e o gate edge_features_present acusa.
+            try:
+                from .analysis.graph_builder import build_gat_graph
+                from .analysis.istio_edges import collect_istio_edges
+
+                metrics_cfg_ns = (obs.get("metrics") or {}).get("namespace") or "sock-shop"
+                edge_metrics = collect_istio_edges(
+                    self.metrics._client(metrics_cfg),
+                    run_start_iso,
+                    recovery_end,
+                    step,
+                    namespace=metrics_cfg_ns,
+                )
+                if edge_metrics:
+                    self.storage.save_artifact(run_id, "istio_edges", edge_metrics)
+                    gt_service = features.get("ground_truth_service")
+                    gt_fault = features.get("ground_truth_fault_category")
+                    gat_graph = build_gat_graph(
+                        run_id=run_id,
+                        metrics_raw=metrics_raw,
+                        baseline_window=(run_start_iso, warmup_start),
+                        fault_window=(fault_start, fault_end),
+                        ground_truth_service=gt_service,
+                        ground_truth_fault_category=gt_fault,
+                        is_training=bool(run.summary.get("is_training", True)),
+                        edge_metrics=edge_metrics,
+                    )
+                    self.storage.save_artifact(run_id, "gat_graph", gat_graph)
+                    self._event(run_id, "gat_graph_built", {
+                        "edge_source": gat_graph.get("edge_source"),
+                        "node_count": len(gat_graph.get("nodes") or []),
+                        "edge_count": len(gat_graph.get("edges") or []),
+                    })
+            except Exception as exc:  # pragma: no cover - best effort
+                self._event(run_id, "gat_graph_failed", {"error": str(exc)[:500]})
+
             # ── L2: deterministic, RAG-ready summary + tags ─────────────────
             run_timings_preview = {
                 "fault_injection_duration_seconds": fault_duration_seconds,
@@ -367,32 +513,6 @@ class OrchestratorEngine:
             # features dict so the storage layer can persist it.
             current_run = self.storage.get_run(run_id)
             features["is_training"] = bool(current_run.summary.get("is_training", True))
-
-            # ── Ground-truth auto-labelling ─────────────────────────────────
-            # Experiments submitted by the eval harness carry their ground
-            # truth in the experiment-level tags as ``target:<service>`` and
-            # ``fault_category:<category>``. Extract them here so every
-            # persisted run row has a stable label that doesn't depend on the
-            # eval harness keeping a static chaos_type → fault_category map.
-            # Future fault families (config-error, network-degradation, etc.)
-            # just need to ship the right tag on the experiment spec.
-            exp_meta = (
-                exp.spec.get("experiment", {}) if isinstance(exp.spec, dict) else {}
-            )
-            spec_tags = exp_meta.get("tags") or []
-            gt_service: Optional[str] = None
-            gt_fault: Optional[str] = None
-            for tag in spec_tags:
-                if not isinstance(tag, str):
-                    continue
-                if tag.startswith("target:") and gt_service is None:
-                    gt_service = tag.split(":", 1)[1].strip() or None
-                elif tag.startswith("fault_category:") and gt_fault is None:
-                    gt_fault = tag.split(":", 1)[1].strip() or None
-            if gt_service:
-                features["ground_truth_service"] = gt_service
-            if gt_fault:
-                features["ground_truth_fault_category"] = gt_fault
 
             try:
                 self.storage.upsert_run_features(
@@ -451,20 +571,48 @@ class OrchestratorEngine:
                     run_start_iso, run.ended_at
                 ),
                 "post_recovery_observation_seconds": post_seconds,
+                "sampling_interval_seconds": step,
                 "recovery_time_seconds": features.get("recovery_time_seconds"),
             }
+            observation_window = _build_observation_window(
+                run_id=run_id,
+                experiment_id=exp.experiment_id,
+                status=run.status.value,
+                timings=run.timings,
+                sampling_interval_seconds=step,
+            )
+            observation_window_path = self.storage.save_artifact(
+                run_id, "observation_window", observation_window
+            )
+            artifact_paths = {
+                "metrics_raw": metrics_path,
+                "traces_raw": traces_path,
+                "load_summary": load_path,
+                "chaos_artifacts": chaos_path,
+                "run_features": features_path,
+                "observation_window": observation_window_path,
+            }
+            observability_summary = build_observability_summary(
+                run_id=run_id,
+                experiment_id=exp.experiment_id,
+                observation_window=observation_window,
+                metrics_raw=metrics_raw,
+                metrics_summary=metrics_summary,
+                traces_raw=traces_raw,
+                traces_summary=traces_summary,
+                features=features,
+                artifact_paths=artifact_paths,
+            )
+            observability_summary_path = self.storage.save_artifact(
+                run_id, "observability_summary", observability_summary
+            )
+            artifact_paths["observability_summary"] = observability_summary_path
             run.summary = {
                 "load": load_summary,
                 "metrics": metrics_summary,
                 "traces": traces_summary,
                 "features": features,
-                "artifact_paths": {
-                    "metrics_raw": metrics_path,
-                    "traces_raw": traces_path,
-                    "load_summary": load_path,
-                    "chaos_artifacts": chaos_path,
-                    "run_features": features_path,
-                },
+                "artifact_paths": artifact_paths,
                 "technical_summary": self._technical_summary(features),
                 "executive_summary": self._executive_summary(run.verdict, features),
                 "resilience_classification": run.verdict,
@@ -482,15 +630,68 @@ class OrchestratorEngine:
             run.status = RunStatus.STOPPED
             run.ended_at = utc_now_iso()
             run.summary["stop_reason"] = "interrupt_flag"
+            try:
+                window = _build_partial_observation_window(
+                    run_id=run_id,
+                    experiment_id=exp.experiment_id,
+                    status=run.status.value,
+                    events=self.storage.list_events(run_id),
+                    ended_at=run.ended_at,
+                    sampling_interval_seconds=step,
+                )
+                run.summary.setdefault("artifact_paths", {})[
+                    "observation_window"
+                ] = self.storage.save_artifact(
+                    run_id, "observation_window", window
+                )
+            except Exception as window_exc:  # pragma: no cover - best effort
+                self._event(
+                    run_id,
+                    "observation_window_failed",
+                    {"error": str(window_exc)[:500]},
+                )
             self.storage.update_run(run)
             self._event(run_id, "run_stopped", {"reason": "interrupt_flag"})
         except Exception as exc:
+            import traceback
+
+            # Captura o traceback completo + sub-exceções (ExceptionGroup /
+            # TaskGroup escondem a causa real em `str(exc)`). Sem isto, um erro
+            # "unhandled errors in a TaskGroup" não diz onde falhou.
+            tb = traceback.format_exc()
+            sub = []
+            for e in getattr(exc, "exceptions", []) or []:
+                sub.append("".join(traceback.format_exception(type(e), e, e.__traceback__))[-800:])
             run = self.storage.get_run(run_id)
             run.status = RunStatus.FAILED
             run.ended_at = utc_now_iso()
             run.summary["error"] = str(exc)
+            try:
+                window = _build_partial_observation_window(
+                    run_id=run_id,
+                    experiment_id=exp.experiment_id,
+                    status=run.status.value,
+                    events=self.storage.list_events(run_id),
+                    ended_at=run.ended_at,
+                    sampling_interval_seconds=step,
+                )
+                run.summary.setdefault("artifact_paths", {})[
+                    "observation_window"
+                ] = self.storage.save_artifact(
+                    run_id, "observation_window", window
+                )
+            except Exception as window_exc:  # pragma: no cover - best effort
+                self._event(
+                    run_id,
+                    "observation_window_failed",
+                    {"error": str(window_exc)[:500]},
+                )
             self.storage.update_run(run)
-            self._event(run_id, "run_failed", {"error": str(exc)})
+            self._event(
+                run_id,
+                "run_failed",
+                {"error": str(exc), "traceback": tb[-2000:], "sub_exceptions": sub},
+            )
             self.notifier.notify("run_failed", {"run_id": run_id, "error": str(exc)})
         finally:
             self._runtime_handles.pop(run_id, None)
@@ -558,8 +759,16 @@ class OrchestratorEngine:
         for fault in OrchestratorEngine._KNOWN_FAULT_TYPES:
             if engine.endswith(fault):
                 return fault
-        # Fallback: return whatever is available (manifest_path for non-Litmus)
-        return engine or chaos.get("manifest_path") or None
+        # Non-Litmus faults (e.g. Istio VirtualService) carry no chaos_engine.
+        # The manifest filename still encodes "<service>-<fault-type>.yaml",
+        # so match its stem the same way instead of leaking the raw path
+        # (which would bias tags/features with the target service — exactly
+        # what this function exists to prevent for chaos_engine).
+        stem = Path(chaos.get("manifest_path") or "").stem
+        for fault in OrchestratorEngine._KNOWN_FAULT_TYPES:
+            if stem.endswith(fault):
+                return fault
+        return engine or stem or None
 
     def _build_run_features(
         self,

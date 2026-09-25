@@ -155,3 +155,11 @@ htmlcov/
 # with `git rm -r --cached <path>`.
 experiment/eval/memory_hog/out/
 experiment/eval/memory_hog/out-mini/
+
+# ── Agent and campaign runtime output ──────────────────────────────────────
+# Keep source configs and scripts tracked; ledgers and generated stage configs
+# are reproducible from the campaign definition and archived run manifest.
+experiment/eval/memory_hog/out/balanced_campaign/
+backups/
+experiment/eval/gat/out/
+!experiment/eval/gat/out/.gitkeep

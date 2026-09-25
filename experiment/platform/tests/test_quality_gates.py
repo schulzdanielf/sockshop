@@ -237,7 +237,7 @@ def test_runner_healthy_run_is_usable():
     q = run_gates(make_bundle())
     assert q["usable"] is True
     assert q["gaps"] == []
-    assert len(q["gates"]) == 6
+    assert len(q["gates"]) >= 6  # catálogo pode crescer
     assert q["schema_version"] == "1.0"
 
 
@@ -254,6 +254,46 @@ def test_runner_weak_signal_does_not_block():
     q = run_gates(make_bundle(features=feats))
     assert q["usable"] is True
     assert q["weak_signal"] is True
+
+
+# ── edge_features_present ───────────────────────────────────────────────
+def test_edge_features_skip_without_graph():
+    from experiment.platform.backend.quality.gates import gate_edge_features_present
+    r = gate_edge_features_present(make_bundle())
+    assert r.status == "skip" and r.reason == "no_gat_graph"
+
+
+def test_edge_features_pass_with_real_edges():
+    from experiment.platform.backend.quality.gates import gate_edge_features_present
+    graph = {
+        "edges": [
+            {"src": 0, "dst": 1, "features": {"req_rate_lr": 0.5, "latency_lr": None, "error_lr": None}},
+            {"src": 1, "dst": 0, "features": {"req_rate_lr": None, "latency_lr": None, "error_lr": None}},
+        ]
+    }
+    b = make_bundle(artifacts={"gat_graph": graph})
+    r = gate_edge_features_present(b)
+    assert r.status == "pass"
+    assert r.evidence["with_features"] == 1
+
+
+def test_edge_features_fail_all_neutral():
+    from experiment.platform.backend.quality.gates import gate_edge_features_present
+    graph = {
+        "edges": [
+            {"src": 0, "dst": 1, "features": {"req_rate_lr": None, "latency_lr": None, "error_lr": None}},
+        ]
+    }
+    b = make_bundle(artifacts={"gat_graph": graph})
+    r = gate_edge_features_present(b)
+    assert r.status == "fail" and r.reason == "all_edges_neutral"
+
+
+def test_edge_features_fail_no_edges():
+    from experiment.platform.backend.quality.gates import gate_edge_features_present
+    b = make_bundle(artifacts={"gat_graph": {"edges": []}})
+    r = gate_edge_features_present(b)
+    assert r.status == "fail" and r.reason == "no_edges_in_graph"
 
 
 # ── run_health (relatório consolidado) ──────────────────────────────────

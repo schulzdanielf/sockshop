@@ -2,7 +2,7 @@
 
 Este diretório registra o **processo de evolução da pesquisa**: hipóteses, abordagens tentadas, resultados e planos de trabalho. O objetivo é manter um histórico navegável do *porquê* de cada decisão, não apenas do *o quê* foi implementado.
 
-> **Contexto da pesquisa:** localização de falhas (WHERE) e identificação da causa raiz (WHY) em microsserviços (Sock Shop), combinando chaos engineering (Litmus), observabilidade (Prometheus/Tempo/Loki via servidor MCP), LLMs e — na branch `hibrido` — Graph Attention Networks + agentes de IA.
+> **Contexto da pesquisa:** localização e explicação de causas raiz (RCA) em microsserviços (Sock Shop), usando chaos engineering (Litmus), observabilidade (Prometheus/Tempo/Loki via servidor MCP) e uma estratégia experimental 100% baseada em LLMs e multiagentes. Observabilidade também é um princípio do próprio processo: resultados e decisões precisam ser acompanháveis por evidências.
 
 ## Estrutura
 
@@ -24,7 +24,12 @@ Este diretório registra o **processo de evolução da pesquisa**: hipóteses, a
 
 ## Estado atual
 
-- **Abordagem ativa:** [002 — Híbrido GAT + Agentes](abordagens/002-hibrido-gat-agentes.md) (branch `hibrido`)
-- **Hipóteses ativas:** [H001 — GAT localiza falhas](hipoteses/H001-gat-localizacao-falhas.md), [H002 — Agentes identificam o motivo](hipoteses/H002-agentes-ia-motivo-falha.md)
-- **Plano vigente:** [Plano de trabalho da abordagem híbrida](planos/2026-09-19-plano-hibrido.md)
-- **Mapeamento de mudanças:** [2026-09-19-mapeamento-evolutivo](planos/2026-09-19-mapeamento-evolutivo.md) (coleta, gates/checklist, avaliação, observabilidade)
+- **Abordagem ativa:** [003 — LLM multiagente para RCA](abordagens/003-llm-multiagente-rca.md) — exploração incremental
+- **Hipóteses em exploração:** arquitetura especializada, investigação iterativa e MCP enriquecido melhoram RCA sem fixar ainda uma topologia de agentes
+- **Plano vigente:** [Plano de experimentos rápidos multiagente](planos/2026-09-25-plano-llm-multiagente.md)
+- **Histórico anterior:** [002 — Híbrido GAT + Agentes](abordagens/002-hibrido-gat-agentes.md), mantido para rastreabilidade
+- **▶ Retomar o trabalho:** [PROXIMOS_PASSOS.md](PROXIMOS_PASSOS.md) — estado atual, experimentos pequenos e próximos incrementos
+
+## Princípio de observabilidade
+
+Cada experimento deve tornar visível o que foi executado, quais sinais sustentam a RCA, como os agentes chegaram à decisão e por que uma variante foi mantida, alterada ou descartada. Métricas, logs e traces observam o sistema sob investigação; os mesmos sinais também observam o comportamento e o custo da estratégia de agentes.

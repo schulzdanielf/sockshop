@@ -1,6 +1,6 @@
 # H001 — GAT localiza o serviço raiz melhor que ranker híbrido / LLM
 
-- **Status:** refutada para a Opção D (topologia estática) — 2026-09-20; em aberto para edge features reais
+- **Status:** **não suportada** — refutada para topologia estática (2026-09-20) e não suportada com edge features reais Istio (2026-09-20, indeterminada por insuficiência de dados full: 25/218). Aguarda expansão do dataset para veredito definitivo.
 - **Criada em:** 2026-09-19 (branch `hibrido`)
 - **Testada por:** [Abordagem 002 — Híbrido GAT + Agentes](../abordagens/002-hibrido-gat-agentes.md)
 - **Abordagem baseline de comparação:** [001 — LLM + RAG + validadores](../abordagens/001-llm-rag-validadores.md)
@@ -38,6 +38,16 @@ A abordagem 001 resolve o WHERE (qual serviço) via LLM sobre resumo L2 + RAG (r
 
 - **Validada se:** **top-3** ≥ baseline + 10 p.p. em S2 e S3, sem regressão em S1.
 - **Refutada se:** não supera a heurística trivial de centralidade, ou overfita (S1 alto, S2/S3 no nível do acaso) — indício de leakage ou dataset insuficiente.
+
+> **Revisão dos splits (decisão 2026-09-21):** S2 (held-out service) mede algo
+> **artificial** — na prática é viável injetar falha em orders/payment e treinar.
+> A generalização operacionalmente relevante é **falha nova em serviço conhecido**
+> (S3) e **combinação falha × serviço não vista** (um possível S2'). **Decisão:**
+> S2 atual permanece como **diagnóstico** (detector de viés de posição — foi ele
+> que expôs o defeito do GAT), **não** como critério de validação. O peso da
+> validação desloca-se para S3 e, se adotado, um futuro S2'. Mudança S2→S2'
+> (altera `build_dataset`) fica **adiada** para depois da coleta. Detalhes em
+> [research/diario/2026-09-21-hipoteses-mlp-supera-gat.md](../diario/2026-09-21-hipoteses-mlp-supera-gat.md).
 
 ## Riscos / questões abertas
 
@@ -82,3 +92,30 @@ O MLP supera o GAT (S2/S3 dramaticamente) e bate B1 no S3. Prova isolada de que 
 **topologia estática é prejudicial** (injeta viés de identidade de nó). O sinal
 está nas node features, aprendível por-nó e transferível para faults novos
 (S3=0.86). Para um GNN agregar valor aqui, edge features precisam variar por run.
+
+---
+
+**2026-09-20 — Re-teste com edge features reais (Istio): NÃO SUPORTADA.**
+
+Detalhes em [research/diario/2026-09-20-gat-resultado-istio-full.md](../diario/2026-09-20-gat-resultado-istio-full.md).
+
+Com 25 grafos full coletados via Istio, o GAT foi re-treinado (GPU, 3 seeds):
+
+| Split | GAT top-3 | MLP | B1 | GAT-full subset (seed 0) |
+|---|---|---|---|---|
+| S1 | 0.48 ± 0.14 | 0.61 | 0.45 | **0.59 (n=22)** > B1 0.45 |
+| S2 | 0.24 ± 0.07 | 0.56 | 0.58 | 0.00 (n=7) |
+| S3 | 0.40 ± 0.03 | 0.63 | 0.47 | 0.14 (n=7) |
+
+- **Critério (top-3 ≥ B1+10 p.p. em S2/S3): não atingido** — GAT < B1 em S2/S3.
+- **Sinal fraco a favor em S1-full** (0.59 vs 0.45): quando treinado/testado com
+  edges reais, o GAT superou B1. Mas o treino S1 tinha só **3 grafos full** (vs
+  193 static) — o modelo mal aprende a usar arestas.
+- **S2 permanece bloqueado mesmo com edges reais** (full = 0.00): o viés de
+  identidade de serviço held-out não é resolvido por edge features.
+- **MLP ≥ GAT em todos os splits** — a estrutura continua subtraindo valor.
+- **Causa raiz do resultado baixo:** (a) fome de dados reais (25/218; treino S1
+  com 3 full), (b) generalização S2 estruturalmente bloqueada.
+- **Status atualizado:** hipótese **não suportada** na configuração atual;
+  indeterminada por insuficiência de dados com mesh. Plano de expansão:
+  [research/planos/2026-09-20-expansao-dataset-gat.md](../planos/2026-09-20-expansao-dataset-gat.md).

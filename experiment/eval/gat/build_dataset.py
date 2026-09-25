@@ -56,7 +56,8 @@ TRANSIENT_CAP_SECONDS = 180  # 3 min pós-disparo (cap no fim real da fase)
 
 # ── Splits anti-leakage (seção 3 de experimento_validacao_phase_f1.md) ──
 S2_HELD_OUT_SERVICES = ("orders", "payment")
-S3_HELD_OUT_FAULT = "pod-delete"
+S3_HELD_OUT_FAULT = "container-kill"
+EXCLUDED_TARGET_SERVICES = ("queue-master",)
 # S4 (intensidade) não é aplicável retroativamente: os runs históricos não
 # registram intensidade de forma consistente. Marcado como None.
 
@@ -69,6 +70,7 @@ def normalize_chaos_type(raw: Optional[str]) -> Optional[str]:
     """
     if not raw:
         return None
+    raw = Path(str(raw)).stem
     known = (
         "container-kill",
         "http-status-code",
@@ -182,7 +184,7 @@ def build_dataset(storage: SqliteStorage) -> Dict[str, Any]:
         feats = storage.get_run_features(run.run_id) or {}
         ct = normalize_chaos_type(feats.get("chaos_type"))
         svc = feats.get("ground_truth_service")
-        if ct and svc:
+        if ct and svc and svc not in EXCLUDED_TARGET_SERVICES:
             cell_of_run[run.run_id] = (ct, svc)
             cell_totals[(ct, svc)] += 1
 
@@ -205,6 +207,9 @@ def build_dataset(storage: SqliteStorage) -> Dict[str, Any]:
         if not gt_service or not gt_fault:
             excluded["missing_ground_truth"] += 1
             continue
+        if gt_service in EXCLUDED_TARGET_SERVICES:
+            excluded[f"excluded_target_{gt_service}"] += 1
+            continue
 
         metrics_raw = _load_artifact(storage, run.run_id, "metrics_raw")
         if not metrics_raw:
@@ -226,7 +231,10 @@ def build_dataset(storage: SqliteStorage) -> Dict[str, Any]:
             chaos_norm, fault_start, fault_end
         )
 
-        # Grafo (Opção D: sem edge_metrics → edge_source=static)
+        # Grafo. Carrega edge metrics Istio quando o run tem (runs novos com
+        # mesh); runs históricos sem mesh ficam com edge_source=static.
+        edge_metrics = _load_artifact(storage, run.run_id, "istio_edges")
+
         graph = build_gat_graph(
             run_id=run.run_id,
             metrics_raw=metrics_raw,
@@ -235,7 +243,7 @@ def build_dataset(storage: SqliteStorage) -> Dict[str, Any]:
             ground_truth_service=gt_service,
             ground_truth_fault_category=gt_fault,
             is_training=bool(feats.get("is_training", True)),
-            edge_metrics=None,
+            edge_metrics=edge_metrics,
         )
         graph["chaos_type_raw"] = feats.get("chaos_type")
         graph["chaos_type_normalized"] = chaos_norm

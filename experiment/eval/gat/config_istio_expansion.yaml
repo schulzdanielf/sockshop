@@ -1,0 +1,157 @@
+# ────────────────────────────────────────────────────────────────────────────
+# GAT + Istio — EXPANSÃO do dataset (campanha gat-istio-v2, TRAIN-ONLY)
+# ────────────────────────────────────────────────────────────────────────────
+# Objetivo: aumentar a base de grafos edge_source:full (hoje 25/218) para dar
+# dados reais de treino ao GAT. Regras anti-leakage (ver plano
+# research/planos/2026-09-20-expansao-dataset-gat.md):
+#
+#   * TODAS as células usam chaos_type ≠ pod-delete → nunca viram S3-test
+#     (pod-delete é o held-out de S3). Caem em S3-TRAIN.
+#   * Expande principalmente serviços ≠ orders/payment → S2-TRAIN. (orders/
+#     payment aparecem aqui só como reforço de S1 — continuam S2-test.)
+#   * test_experiments VAZIO → nenhum run desta campanha é rotulado is_training=false
+#     e nenhum muda o conjunto de teste S2/S3.
+#
+# 21 células × 5 réplicas = 105 runs alvo (~84 válidos com rendimento ~80%).
+#
+# Pré-requisitos (mesmos da config_istio.yaml):
+#   1. Mesh Istio ativo (istio-injection=enabled em sock-shop)
+#   2. make chaos-enable-netem   (sch_netem — obrigatório p/ network-*)
+#   3. validate_metrics READY    (python -m experiment.eval.gat.validate_metrics --save)
+
+platform:
+  api_base: "http://127.0.0.1:8010"
+  user_role: "chaos_engineer"
+  initiated_by: "gat-istio-expansion"
+  poll_interval_seconds: 15
+  run_timeout_seconds: 1800
+
+cluster:
+  app_namespace: "sock-shop"
+  litmus_namespace: "litmus"
+  argo_controller_instanceid: "f21787ba-08ee-4649-ab66-c880492636dc"
+
+# Campanha distinta da v1 (não mistura com gat-istio-v1 nem com a avaliação LLM).
+experiment_campaign_id: "gat-istio-v2"
+
+# ── Chaos types: catálogo SEM pod-delete (pod-delete é held-out de S3) ─────
+chaos_types:
+  - name: memory-hog
+    template_suffix: memory-hog
+    short: memhog
+    fault_category: memory-exhaustion
+    env:
+      memory_consumption_mb: 500
+      total_chaos_duration_seconds: 60
+      chaos_interval_seconds: 10
+  - name: cpu-hog
+    template_suffix: cpu-hog
+    short: cpuhog
+    fault_category: cpu-exhaustion
+    env:
+      cpu_cores: 1
+      total_chaos_duration_seconds: 60
+      chaos_interval_seconds: 10
+  - name: network-latency
+    template_suffix: network-latency
+    short: netlat
+    fault_category: network-latency
+    env:
+      network_latency_ms: 2000
+      total_chaos_duration_seconds: 60
+  - name: network-loss
+    template_suffix: network-loss
+    short: netloss
+    fault_category: network-loss
+    env:
+      network_packet_loss_percentage: 100
+      total_chaos_duration_seconds: 60
+  - name: http-status-code
+    template_suffix: http-status-code
+    short: httperr
+    fault_category: http-error
+    env:
+      status_code: 500
+      total_chaos_duration_seconds: 60
+  - name: container-kill
+    template_suffix: container-kill
+    short: ckill
+    fault_category: pod-failure
+    env:
+      total_chaos_duration_seconds: 20
+      chaos_interval_seconds: 10
+
+timeline:
+  baseline_seconds: 30
+  warmup_seconds: 30
+  fault_duration_seconds: 90
+  post_recovery_observation_seconds: 180
+  sampling_interval_seconds: 5
+
+load_profile:
+  provider: "locust"
+  command: "kubectl -n loadtest exec deploy/locust-web -- locust"
+  locust_file: "/mnt/locust/locustfile.py"
+  host: "http://front-end.sock-shop.svc.cluster.local"
+  users: 30
+  spawn_rate: 5
+  grace_seconds: 30
+
+slo:
+  error_rate_threshold: 0.05
+  latency_p95_threshold_ms: 800
+  recovery_tolerance_pct: 0.20
+  max_recovery_seconds: 600
+
+# ── Matriz de EXPANSÃO (train only) — 21 células, todas ≠ pod-delete ──────
+# Diversidade de (serviço × fault) para o GAT aprender a assinatura da falha,
+# não a posição. Cobre os 8 serviços; faults distribuídos com foco em REDE
+# (onde edge features mais ajudam) + os faults fracos identificados na auditoria
+# (http-status-code, container-kill, network-*).
+train_experiments:
+  # catalogue — âncora upstream; reforça http-status-code (fraco) e network
+  - {service: catalogue, chaos_type: memory-hog}
+  - {service: catalogue, chaos_type: network-latency}
+  - {service: catalogue, chaos_type: http-status-code}
+  # carts — médio; network + http + container-kill
+  - {service: carts,     chaos_type: network-loss}
+  - {service: carts,     chaos_type: http-status-code}
+  - {service: carts,     chaos_type: container-kill}
+  # orders — held-out de S2: aqui só reforça S1 (continua S2-test)
+  - {service: orders,    chaos_type: cpu-hog}
+  - {service: orders,    chaos_type: memory-hog}
+  - {service: orders,    chaos_type: network-latency}
+  # payment — held-out de S2: idem
+  - {service: payment,   chaos_type: memory-hog}
+  - {service: payment,   chaos_type: network-loss}
+  - {service: payment,   chaos_type: http-status-code}
+  # user — leaf; http + container-kill + network
+  - {service: user,      chaos_type: http-status-code}
+  - {service: user,      chaos_type: container-kill}
+  - {service: user,      chaos_type: network-latency}
+  # shipping — assíncrono/folha; network + container-kill
+  - {service: shipping,  chaos_type: network-latency}
+  - {service: shipping,  chaos_type: container-kill}
+  # queue-master — folha; cpu + memory
+  - {service: queue-master, chaos_type: cpu-hog}
+  - {service: queue-master, chaos_type: memory-hog}
+  # front-end — entry point; cpu + network-latency
+  - {service: front-end,   chaos_type: cpu-hog}
+  - {service: front-end,   chaos_type: network-latency}
+
+# VAZIO de propósito: nenhum run desta campanha é held-out (is_training=false).
+# O teste S2/S3 permanece o conjunto original — comparação continua válida.
+test_experiments: []
+
+# 5 réplicas → 21 × 5 = 105 runs alvo. Réplicas dão treino em S1 (a mais
+# recente de cada célula vira S1-test; as demais, S1-train).
+replicas: 5
+
+# Sem LLM: campanha só para construir corpus de grafos (GAT avaliado offline).
+strategies: []
+
+output:
+  results_dir: "experiment/eval/gat/out"
+  runs_csv: "runs_istio_expansion.csv"
+  evaluation_csv: "evaluation_istio_expansion.csv"
+  manifests_dir: "manifests_istio_expansion"

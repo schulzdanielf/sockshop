@@ -1,6 +1,6 @@
 # 002 — Híbrido: GAT localiza (WHERE) + agentes de IA explicam (WHY)
 
-- **Status:** ativa — **escopo atual: apenas o WHERE (H001)**; H002 pausada
+- **Status:** concluída como histórico — **escopo encerrado no ciclo GAT/Istio**; H001 e H002 não são o foco atual
 - **Branch:** `hibrido` (criada em 2026-09-19)
 - **Antecessora / baseline:** [001 — LLM + RAG + validadores](001-llm-rag-validadores.md)
 - **Hipóteses testadas:** [H001](../hipoteses/H001-gat-localizacao-falhas.md), [H002](../hipoteses/H002-agentes-ia-motivo-falha.md)

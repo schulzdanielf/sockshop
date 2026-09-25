@@ -12,9 +12,8 @@ Design goals
   timestamps. Range queries are bounded by those — never use
   ``increase(...[1h])`` or any open-ended lookback, because that would
   smear counters from earlier experiments into the current window.
-  Counter-based signals (restart counts) are derived as
-  ``last_value − first_value`` on a range_query restricted to
-  ``[start, end]``.
+    Counter-based signals (restart counts) are derived from per-container
+    counter increments on a range_query restricted to ``[start, end]``.
 * **Vocabulary parity.** Pod labels are normalised to the parent
   deployment / service name (``front-end-6489c74749-9jdrg`` →
   ``front-end``) so callers can reason at the service level. The raw
@@ -39,6 +38,7 @@ from typing import Any, Dict, List
 # ``MCPPrometheusMetricsPlugin._pod_to_service`` in the platform so the
 # agent and the engine speak the same service vocabulary.
 _HASH_RE = re.compile(r"^[a-z0-9]{4,10}$")
+SERVICE_LABEL_KEYS = ("destination_workload", "name", "service", "source_workload")
 
 
 def _pod_to_service(pod_name: str) -> str:
@@ -90,15 +90,15 @@ def _aggregate_by_service(
       * ``"max"`` — for 0/1 gauges where any transition to 1 inside
         the window counts; result is ``max(values)`` per series, then
         ``max`` per service. Use for the OOMKilled gauge.
-      * ``"mean"`` — average across the window. Use for saturation
-        percentages.
+            * ``"mean"`` — average across the window per pod, then average
+                pod percentages per service. Use for saturation percentages.
     """
     per_pod: Dict[str, Dict[str, Any]] = {}
     for labels, points in _iter_series(payload):
         if not points:
             continue
-        pod = str(labels.get("pod") or labels.get("name") or "")
-        if not pod:
+        pod = str(labels.get("pod") or next((labels[k] for k in SERVICE_LABEL_KEYS if labels.get(k)), ""))
+        if not pod or pod == "unknown":
             continue
         values = [v for _, v in points]
         if mode == "max_minus_min":
@@ -124,6 +124,48 @@ def _aggregate_by_service(
         else:
             bucket["value"] += entry["value"]
         bucket["pods"].append({"pod": entry["pod"], "value": entry["value"]})
+    if mode == "mean":
+        for bucket in per_service.values():
+            bucket["value"] /= len(bucket["pods"])
+    return per_service
+
+
+def _counter_increments(points: List[tuple]) -> float:
+    """Count increments of one monotonic counter over the supplied window."""
+    ordered = sorted(points, key=lambda point: point[0])
+    increments = 0.0
+    for (_, previous), (_, current) in zip(ordered, ordered[1:]):
+        if current >= previous:
+            increments += current - previous
+        else:
+            increments += current
+    return increments
+
+
+def _restart_rollup(payload: Any) -> Dict[str, Dict[str, Any]]:
+    """Sum reset-aware counter increments by pod and service.
+
+    kube-state-metrics can be scraped through more than one Prometheus job.
+    The query selects its canonical job; the check here also guards test or
+    nonstandard payloads from counting duplicate scrape sources.
+    """
+    per_pod: Dict[str, float] = {}
+    for labels, points in _iter_series(payload):
+        if labels.get("job") not in (None, "kube-state-metrics"):
+            continue
+        pod = str(labels.get("pod") or "")
+        if not pod or pod == "unknown":
+            continue
+        per_pod[pod] = per_pod.get(pod, 0.0) + _counter_increments(points)
+
+    per_service: Dict[str, Dict[str, Any]] = {}
+    for pod, count in per_pod.items():
+        service = _pod_to_service(pod)
+        row = per_service.setdefault(
+            service, {"service": service, "value": 0.0, "pods": []}
+        )
+        row["value"] += count
+        row["pods"].append({"pod": pod, "value": round(count, 4)})
     return per_service
 
 
@@ -251,15 +293,14 @@ def check_pod_restarts(
     """Return per-service restart counts *strictly* within ``[start, end]``.
 
     We avoid ``increase(...[1h])`` because the 1h lookback would include
-    restarts from previous experiments. Instead we range-query the raw
-    counter and compute ``max - min`` per series — that is exactly the
-    number of restarts that happened inside the window, regardless of
-    its duration.
+    restarts from previous experiments. We range-query only the canonical
+    kube-state-metrics scrape, then sum reset-aware adjacent counter
+    increments per container inside the requested window. This avoids
+    treating duplicate scrape-source gaps as counter changes.
     """
     query = (
-        "sum by (pod) ("
         "kube_pod_container_status_restarts_total"
-        f'{{namespace="{namespace}"}})'
+        f'{{namespace="{namespace}",job="kube-state-metrics"}}'
     )
     raw = prometheus.query_range(query, start, end, step)
     if not isinstance(raw, dict) or raw.get("status") == "error":
@@ -271,8 +312,10 @@ def check_pod_restarts(
             "query": query,
             "window": {"start": start, "end": end},
         }
-    rollup = _aggregate_by_service(raw, mode="max_minus_min")
-    top = _top_k(rollup, k=5)
+    rollup = _restart_rollup(raw)
+    # Return all observed services so a targeted question can distinguish a
+    # zero count from a service omitted by a top-5 cutoff.
+    top = _top_k(rollup, k=len(rollup))
     nonzero = [r for r in top if r["value"] > 0.5]
     return {
         "found": len(nonzero) > 0,
@@ -327,7 +370,7 @@ def _saturation_top(
         query = (
             "100 * sum by (pod) ("
             "container_memory_working_set_bytes"
-            f'{{namespace="{namespace}"}}'
+            f'{{namespace="{namespace}",job="kubernetes-cadvisor"}}'
             ")"
             " / on(pod) group_left() ("
             "container_spec_memory_limit_bytes"
@@ -422,15 +465,20 @@ def check_http_error_rate_top(
 ) -> Dict[str, Any]:
     """Top-K services by HTTP 5xx error rate inside ``[start, end]``.
 
-    Uses a rate over the request counter to keep the evidence aligned to the
-    experiment window. The series already carries the service name label, so
-    callers receive direct service-level evidence with no extra joins.
+    Uses Istio/Envoy request counters so services without app-level Prometheus
+    instrumentation are covered. The series is grouped by destination workload,
+    which maps directly to the service receiving the HTTP request.
     """
     query = (
         '100 * ('
-        'sum by (name) (rate(request_duration_seconds_count{status_code=~"5.."}[1m])) '
-        '/ clamp_min(sum by (name) (rate(request_duration_seconds_count[1m])), 0.0001)'
-        ')'
+        'sum by (destination_workload) (rate(istio_requests_total{'
+        'destination_workload_namespace="sock-shop",destination_workload!="unknown",'
+        'response_code=~"5.."}[1m])) '
+        'or on(destination_workload) 0 * sum by (destination_workload) '
+        '(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
+        'destination_workload!="unknown"}[1m]))'
+        ') / clamp_min(sum by (destination_workload) (rate(istio_requests_total{'
+        'destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])), 0.0001)'
     )
     return _service_level_series_top(
         prometheus,
@@ -460,8 +508,10 @@ def check_request_latency_top(
     """
     query = (
         'histogram_quantile(0.95, '
-        'sum(rate(request_duration_seconds_bucket[1m])) by (le, name)'
-        ')'
+        'sum(rate(istio_request_duration_milliseconds_bucket{'
+        'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
+        '[1m])) by (le, destination_workload)'
+        ') / 1000'
     )
     return _service_level_series_top(
         prometheus,

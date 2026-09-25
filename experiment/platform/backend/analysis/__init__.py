@@ -32,6 +32,7 @@ from .retrieval import (
 )
 from .service_localizer import localize_service
 from .summary import build_run_summary_l2, build_summary_tags
+from .observability_summary import build_observability_summary
 from .system_card import (
     SystemCardError,
     list_system_cards,
@@ -44,6 +45,7 @@ from .temporal import compute_temporal_features
 __all__ = [
     "build_run_summary_l2",
     "build_summary_tags",
+    "build_observability_summary",
     "score_similarity",
     "rank_similar_runs",
     "rank_by_embedding",

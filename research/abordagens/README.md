@@ -5,7 +5,8 @@ Cada abordagem representa uma tentativa de evolução do pipeline de RCA. Numera
 | # | Abordagem | Branch / fase | Período | Status | Hipóteses |
 |---|---|---|---|---|---|
 | [001](001-llm-rag-validadores.md) | LLM + RAG + validadores determinísticos | `main` (fase F1) | 2026-04 → 2026-09 | concluida (virou baseline) | — |
-| [002](002-hibrido-gat-agentes.md) | Híbrido: GAT (WHERE) + agentes de IA (WHY) | `hibrido` | 2026-09 → | ativa | [H001](../hipoteses/H001-gat-localizacao-falhas.md), [H002](../hipoteses/H002-agentes-ia-motivo-falha.md) |
+| [002](002-hibrido-gat-agentes.md) | Híbrido: GAT (WHERE) + agentes de IA (WHY) | `hibrido` | 2026-09 | concluida como histórico | [H001](../hipoteses/H001-gat-localizacao-falhas.md), [H002](../hipoteses/H002-agentes-ia-motivo-falha.md) |
+| [003](003-llm-multiagente-rca.md) | LLM multiagente especializado para RCA | exploração incremental | 2026-09 → | ativa | em definição experimental |
 
 ## Regras
 

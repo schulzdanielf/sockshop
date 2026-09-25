@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     tempo_timeout: int = 30
 
     # LLM settings (local Qwen API)
-    llm_url: str = "http://localhost:8001/generate"
+    llm_url: str = "http://localhost:8001/v1/chat/completions"
 
     # Server settings
     host: str = "0.0.0.0"

@@ -13,7 +13,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .analysis.llm_client import LLMClientError, call_llm_messages
+from opentelemetry import trace as otel_trace
+
+from .analysis.llm_client import (
+    LLMClientError,
+    call_llm_messages,
+    call_llm_tool_messages,
+)
 from .metrics_smoke_agent import (
     PrometheusClient,
     check_http_error_rate_top,
@@ -43,8 +49,44 @@ _TOOL_INTENTS = {
     "restarts",
     "oom",
 }
+_MCP_CHAT_TOOL_NAMES = {
+    "check_http_error_rate_top",
+    "check_request_latency_top",
+    "get_cpu_saturation_top",
+    "get_memory_saturation_top",
+    "check_pod_restarts",
+    "check_oom_kills",
+}
+_MCP_INTENT_TOOLS = {
+    "http_error_rate": "check_http_error_rate_top",
+    "latency": "check_request_latency_top",
+    "memory": "get_memory_saturation_top",
+    "cpu": "get_cpu_saturation_top",
+    "restarts": "check_pod_restarts",
+    "oom": "check_oom_kills",
+}
 
 _NO_DATA_MARKER = "Nenhum dado"
+_SERVICE_MARKER_STOP_WORDS = {
+    "com", "foi", "houve", "maior", "menor", "mais", "menos", "possui",
+    "sofreu", "teve", "tem", "teve", "apresenta", "apresentou", "está", "esta",
+}
+_SERVICE_MARKER_PREPOSITIONS = {"de", "do", "da", "dos", "das"}
+_KNOWN_SERVICES = (
+    "catalogue-db",
+    "carts-db",
+    "orders-db",
+    "user-db",
+    "front-end",
+    "queue-master",
+    "rabbitmq",
+    "catalogue",
+    "carts",
+    "orders",
+    "payment",
+    "shipping",
+    "user",
+)
 
 
 def _short(text: str, limit: int = 280) -> str:
@@ -71,7 +113,21 @@ def _extract_service(text: str) -> Optional[str]:
     markers = {"serviço", "servico", "service"}
     for idx, token in enumerate(tokens):
         if token in markers and idx + 1 < len(tokens):
-            return tokens[idx + 1].strip(".,;:!?()[]{}\"")
+            candidate_idx = idx + 1
+            while (
+                candidate_idx < len(tokens)
+                and tokens[candidate_idx] in _SERVICE_MARKER_PREPOSITIONS
+            ):
+                candidate_idx += 1
+            if candidate_idx >= len(tokens):
+                return None
+            candidate = tokens[candidate_idx].strip(".,;:!?()[]{}\"")
+            if candidate in _SERVICE_MARKER_STOP_WORDS:
+                return None
+            return candidate
+    for service in _KNOWN_SERVICES:
+        if re.search(rf"(?<![\w-]){re.escape(service)}(?![\w-])", text):
+            return service
     if len(tokens) >= 2 and tokens[0] in {
         "erro",
         "erros",
@@ -377,11 +433,16 @@ def _fallback_final_answer(query: str, observations: List[Dict[str, str]]) -> st
     if not observations:
         return "Resposta: não foi possível obter observações suficientes."
     last = observations[-1]
+    next_step = (
+        "Nenhuma ação corretiva necessária; continuar monitorando."
+        if _observation_state(last.get("observation") or "") == "ok"
+        else "Validar coleta e labels antes de concluir."
+    )
     return (
         f"Resposta: para '{query}', a última verificação foi {last.get('tool')}"
         f" no serviço {last.get('service') or '-'}\n"
         f"Evidência: {last.get('observation') or 'sem dados'}\n"
-        "Próximo passo: ajustar coleta/labels e repetir a consulta."
+        f"Próximo passo: {next_step}"
     )
 
 
@@ -519,6 +580,359 @@ def _final_messages(query: str, observations: List[Dict[str, str]]) -> List[Dict
     ]
 
 
+def _mcp_chat_tools(mcp_client: Any) -> tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    discovered = mcp_client.list_tools()
+    remote_tools = {
+        tool["name"]: tool
+        for tool in discovered
+        if isinstance(tool, dict) and tool.get("name") in _MCP_CHAT_TOOL_NAMES
+    }
+    if not remote_tools:
+        raise LLMClientError("MCP server exposes no supported telemetry tools")
+
+    model_tools = []
+    for name, tool in remote_tools.items():
+        input_schema = tool.get("inputSchema") or {}
+        properties = input_schema.get("properties") or {}
+        host_managed = {"start", "end", "namespace", "step", "k"}
+        model_properties = {
+            key: value for key, value in properties.items() if key not in host_managed
+        }
+        model_required = [
+            key
+            for key in input_schema.get("required", [])
+            if key not in host_managed
+        ]
+        model_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": {
+                        "type": "object",
+                        "properties": model_properties,
+                        "required": model_required,
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+    return remote_tools, model_tools
+
+
+def _fallback_mcp_tools(
+    query: str, remote_tools: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    intent = parse_request(query).intent
+    intents = [intent] if intent in _MCP_INTENT_TOOLS else []
+    normalized_query = _normalise_text(query)
+    if re.search(r"\b(restart\w*|reinici\w*)\b", normalized_query):
+        intents.append("restarts")
+    if re.search(r"\b(oom|out[ -]+of[ -]+memory)\b", normalized_query):
+        intents.append("oom")
+    tool_names = [_MCP_INTENT_TOOLS[item] for item in intents]
+    return list(dict.fromkeys(name for name in tool_names if name in remote_tools))
+
+
+def _fallback_mcp_answer(tool_results: List[tuple[str, Any]]) -> str:
+    lines = ["Na janela consultada:"]
+    for name, result in tool_results:
+        if not isinstance(result, dict):
+            lines.append(f"{name}: resultado indisponível para resumo.")
+            continue
+        if result.get("error"):
+            lines.append(f"{name}: falha na consulta ({result['error']}).")
+            continue
+        rows = result.get("top") or []
+        if name == "check_pod_restarts":
+            affected = [
+                row
+                for row in rows
+                if isinstance(row, dict) and int(row.get("restarts_in_window") or 0) > 0
+            ]
+            if not affected:
+                lines.append("Restarts: nenhum pod foi reiniciado na janela consultada.")
+            else:
+                details = ", ".join(
+                    f"{row.get('service', 'serviço desconhecido')} ({row.get('restarts_in_window')} restart(s))"
+                    for row in affected
+                )
+                lines.append(f"Restarts detectados: {details}.")
+        elif name == "check_oom_kills":
+            affected = [
+                row
+                for row in rows
+                if isinstance(row, dict) and row.get("transitioned_in_window")
+            ]
+            if not result.get("found") and not int(result.get("count") or 0):
+                lines.append("OOM: nenhuma transição OOMKilled foi detectada na janela consultada.")
+            elif affected:
+                services = ", ".join(
+                    str(row.get("service") or "serviço desconhecido")
+                    for row in affected
+                )
+                lines.append(f"Transições OOMKilled detectadas em: {services}.")
+            else:
+                lines.append(
+                    f"Transições OOMKilled detectadas em {result.get('count', 'um ou mais')} serviço(s)."
+                )
+        elif name in {"get_cpu_saturation_top", "get_memory_saturation_top"}:
+            resource = "CPU" if name == "get_cpu_saturation_top" else "memória"
+            if rows and isinstance(rows[0], dict):
+                row = rows[0]
+                lines.append(
+                    f"Maior saturação de {resource}: {row.get('service', 'serviço desconhecido')}, "
+                    f"pico {float(row.get('saturation_max_pct') or 0):.2f}% e "
+                    f"média {float(row.get('saturation_mean_pct') or 0):.2f}%."
+                )
+            else:
+                lines.append(f"Nenhum dado de saturação de {resource} foi encontrado.")
+        elif name == "check_http_error_rate_top":
+            if rows and isinstance(rows[0], dict):
+                row = rows[0]
+                lines.append(
+                    f"Maior taxa de erro 5xx: {row.get('service', 'serviço desconhecido')}, "
+                    f"pico {float(row.get('error_rate_max_pct') or 0):.2f}% e "
+                    f"média {float(row.get('error_rate_mean_pct') or 0):.2f}%."
+                )
+            else:
+                lines.append("Nenhum dado de taxa de erro 5xx foi encontrado.")
+        elif name == "check_request_latency_top":
+            if rows and isinstance(rows[0], dict):
+                row = rows[0]
+                lines.append(
+                    f"Maior latência P95: {row.get('service', 'serviço desconhecido')}, "
+                    f"pico {float(row.get('latency_p95_max_seconds') or 0):.3f}s e "
+                    f"média {float(row.get('latency_p95_mean_seconds') or 0):.3f}s."
+                )
+            else:
+                lines.append("Nenhum dado de latência P95 foi encontrado.")
+        else:
+            lines.append(f"{name}: consulta concluída; consulte os dados retornados.")
+    return "\n".join(lines)
+
+
+def _clean_mcp_final_answer(content: Any, tool_results: List[tuple[str, Any]]) -> str:
+    if isinstance(content, str) and content.strip():
+        answer = content.strip()
+        if "<think>" not in answer.lower():
+            return answer
+        think_end = re.search(r"</think\s*>", answer, flags=re.IGNORECASE)
+        if think_end:
+            visible_answer = answer[think_end.end() :].strip()
+            if visible_answer:
+                return visible_answer
+    return _fallback_mcp_answer(tool_results)
+
+
+def _synthesize_mcp_answer(
+    llm: Callable[..., Dict[str, Any]],
+    messages: List[Dict[str, Any]],
+    model_tools: List[Dict[str, Any]],
+    max_new_tokens: int,
+    tool_results: List[tuple[str, Any]],
+) -> str:
+    try:
+        final = llm(
+            messages,
+            model_tools,
+            tool_choice="none",
+            parallel_tool_calls=False,
+            max_new_tokens=max_new_tokens,
+        )
+    except LLMClientError:
+        return _fallback_mcp_answer(tool_results)
+    return _clean_mcp_final_answer(final.get("content"), tool_results)
+
+
+def answer_query_mcp(
+    query: str,
+    *,
+    mcp_client: Any,
+    start: str,
+    end: str,
+    namespace: str,
+    llm: Callable[..., Dict[str, Any]] = call_llm_tool_messages,
+    max_steps: int = 3,
+    max_new_tokens: int = 512,
+) -> str:
+    """Investigate a run using a scoped MCP tool list and structured calls."""
+    remote_tools, model_tools = _mcp_chat_tools(mcp_client)
+    agent_span = otel_trace.get_current_span()
+    agent_span.set_attribute("gen_ai.agent.name", "telemetry-chat")
+    agent_span.set_attribute("rca.agent.max_steps", max(1, int(max_steps)))
+    agent_span.set_attribute("rca.agent.allowed_tools", sorted(remote_tools))
+    agent_span.set_attribute("rca.agent.discovered_tools", len(remote_tools))
+    messages: List[Dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "Você é um agente SRE investigando somente o run selecionado. "
+                "Interprete a pergunta pelo significado e escolha a ferramenta "
+                "mais diretamente relevante. CPU exige evidência de CPU; erros "
+                "5xx não respondem pergunta de CPU. Perguntas sobre métricas "
+                "exigem consultar uma tool antes de responder; para consumo ou "
+                "pico de CPU, use get_cpu_saturation_top e explique que o valor "
+                "é saturação percentual do limite de CPU, não uso absoluto em "
+                "cores. Para RCA ampla, investigue sinais complementares em "
+                "chamadas sucessivas. Estas ferramentas medem impacto; não provam "
+                "qual caos foi injetado. Se as tools disponíveis não respondem à "
+                "pergunta, diga isso sem inventar evidência. Uma chamada por vez; "
+                "só use as tools fornecidas. Na resposta final, seja conciso, "
+                "use apenas os resultados observados e não exponha raciocínio interno."
+            ),
+        },
+        {"role": "user", "content": query},
+    ]
+    tool_budget = max(1, int(max_steps))
+    tool_call_count = 0
+    tool_results: List[tuple[str, Any]] = []
+
+    for step_index in range(tool_budget):
+        host_fallback = False
+        try:
+            response = llm(
+                messages,
+                model_tools,
+                tool_choice="required" if step_index == 0 else "auto",
+                parallel_tool_calls=False,
+                max_new_tokens=max_new_tokens,
+            )
+        except LLMClientError:
+            if step_index != 0:
+                raise
+            fallback_tools = _fallback_mcp_tools(query, remote_tools)
+            if not fallback_tools:
+                raise
+            host_fallback = True
+            agent_span.set_attribute("rca.agent.tool_selection_fallback", True)
+            agent_span.set_attribute(
+                "rca.agent.tool_selection_fallback_intent",
+                [name for name in fallback_tools],
+            )
+            response = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call_host_fallback_{index}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": "{}"},
+                    }
+                    for index, name in enumerate(fallback_tools)
+                ],
+            }
+        tool_calls = response.get("tool_calls") or []
+        if not tool_calls:
+            if tool_call_count == 0:
+                fallback_tools = _fallback_mcp_tools(query, remote_tools)
+                if not fallback_tools:
+                    raise LLMClientError(
+                        "model answered without querying an MCP telemetry tool"
+                    )
+                host_fallback = True
+                agent_span.set_attribute("rca.agent.tool_selection_fallback", True)
+                agent_span.set_attribute(
+                    "rca.agent.tool_selection_fallback_intent",
+                    [name for name in fallback_tools],
+                )
+                response = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_host_fallback_{index}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": "{}"},
+                        }
+                        for index, name in enumerate(fallback_tools)
+                    ],
+                }
+                tool_calls = response["tool_calls"]
+            else:
+                content = response.get("content")
+                if isinstance(content, str) and content.strip():
+                    agent_span.set_attribute("rca.agent.tool_calls", tool_call_count)
+                    agent_span.set_attribute("rca.agent.stop_reason", "model_answer")
+                    return _clean_mcp_final_answer(content, tool_results)
+                raise LLMClientError("model returned neither a tool call nor an answer")
+        if len(tool_calls) != 1 and not host_fallback:
+            raise LLMClientError("model returned more than one tool call")
+
+        messages.append(response)
+        for tool_call in tool_calls:
+            function = tool_call.get("function") or {}
+            name = function.get("name")
+            if name not in remote_tools:
+                raise LLMClientError("model requested a tool outside the chat allowlist")
+            try:
+                model_arguments = json.loads(function.get("arguments") or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise LLMClientError("model returned invalid tool arguments") from exc
+            if not isinstance(model_arguments, dict) or model_arguments:
+                raise LLMClientError("chat tools do not accept model-controlled arguments")
+
+            input_schema = remote_tools[name].get("inputSchema") or {}
+            properties = input_schema.get("properties") or {}
+            run_arguments = {
+                key: value
+                for key, value in {
+                    "start": start,
+                    "end": end,
+                    "namespace": namespace,
+                    "step": "15s",
+                    "k": 10,
+                }.items()
+                if key in properties
+            }
+            tool_description = remote_tools[name].get("description")
+            result = mcp_client.call_tool_json(
+                name,
+                run_arguments,
+                tool_call_id=str(tool_call.get("id") or ""),
+                tool_description=str(tool_description or ""),
+            )
+            tool_results.append((name, result))
+            tool_call_count += 1
+            agent_span.set_attribute("rca.agent.tool_calls", tool_call_count)
+            agent_span.add_event(
+                "gen_ai.agent.tool_call.completed",
+                {
+                    "gen_ai.tool.name": name,
+                    "gen_ai.tool.call.id": str(tool_call.get("id") or ""),
+                    "rca.mcp.result_type": type(result).__name__,
+                },
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id", ""),
+                    "name": name,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                }
+            )
+
+        if host_fallback:
+            answer = _fallback_mcp_answer(tool_results)
+            agent_span.set_attribute("rca.agent.tool_calls", tool_call_count)
+            agent_span.set_attribute(
+                "rca.agent.stop_reason", "host_tool_selection_fallback"
+            )
+            return answer
+
+    answer = _synthesize_mcp_answer(
+        llm,
+        messages,
+        model_tools,
+        max_new_tokens,
+        tool_results,
+    )
+    agent_span.set_attribute("rca.agent.tool_calls", tool_call_count)
+    agent_span.set_attribute("rca.agent.stop_reason", "tool_budget_exhausted")
+    return answer
+
+
 def _answer_query_model_loop(
     query: str,
     *,
@@ -633,6 +1047,12 @@ def _answer_query_model_loop(
         _final_messages(query, observations),
         max_new_tokens=max_new_tokens,
     )
+    think_match = re.search(r"</think\s*>", raw_final, flags=re.IGNORECASE)
+    if "<think>" in raw_final.lower():
+        if think_match and raw_final[think_match.end() :].strip():
+            raw_final = raw_final[think_match.end() :].strip()
+        else:
+            raw_final = _fallback_final_answer(query, observations)
     if verbose:
         print(
             f"[loop] synthesis_final_raw_len={len(raw_final)} synthesis_final_raw_preview={_short(raw_final)}"

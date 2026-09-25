@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -42,7 +43,15 @@ from .analysis import (
     validate_fault_category,
     vector_to_blob,
 )
-from .engine import OrchestratorEngine
+from .engine import (
+    OrchestratorEngine,
+    _build_observation_window,
+    _build_partial_observation_window,
+)
+from .domain import DomainEvent
+from .analysis.mcp_investigator import investigate_metric_window
+from .agent_console import answer_query, answer_query_mcp
+from .plugins.mcp_client import MCPToolClient
 from .models import (
     ApproveRunRequest,
     CreateExperimentRequest,
@@ -50,6 +59,7 @@ from .models import (
     OperatorLabelRequest,
     StartRunRequest,
     StopRunRequest,
+    TelemetryChatRequest,
 )
 from .observability import (
     GenAI,
@@ -244,12 +254,221 @@ def create_app() -> FastAPI:
             for e in events
         ]
 
+    @app.get("/api/runs/{run_id}/observation-window")
+    def get_observation_window(run_id: str) -> dict:
+        try:
+            run = storage.get_run(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        sampling_interval = int(run.timings.get("sampling_interval_seconds", 0) or 0)
+        if run.status.value == "completed":
+            try:
+                return _build_observation_window(
+                    run_id=run.run_id,
+                    experiment_id=run.experiment_id,
+                    status=run.status.value,
+                    timings=run.timings,
+                    sampling_interval_seconds=sampling_interval,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if run.status.value in {"stopped", "failed"} and run.ended_at:
+            try:
+                return _build_partial_observation_window(
+                    run_id=run.run_id,
+                    experiment_id=run.experiment_id,
+                    status=run.status.value,
+                    events=storage.list_events(run_id),
+                    ended_at=run.ended_at,
+                    sampling_interval_seconds=sampling_interval,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        raise HTTPException(
+            status_code=409,
+            detail="observation window is unavailable until the run has ended",
+        )
+
+    @app.get("/api/runs/{run_id}/mcp-evidence")
+    def get_mcp_evidence(run_id: str, metric_id: Optional[str] = None) -> dict:
+        window = get_observation_window(run_id)
+        try:
+            run = storage.get_run(run_id)
+            experiment = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        metrics_config = (
+            experiment.spec.get("observability", {}).get("metrics", {}) or {}
+        )
+        queries = metrics_config.get("queries", []) or []
+        selected = next(
+            (
+                query
+                for query in queries
+                if metric_id
+                and (query.get("id") or query.get("name")) == metric_id
+            ),
+            queries[0] if queries else None,
+        )
+        if not isinstance(selected, dict) or not selected.get("query"):
+            raise HTTPException(
+                status_code=409,
+                detail="no PromQL query is configured for this experiment",
+            )
+
+        client = MCPPrometheusMetricsPlugin().client(metrics_config)
+        result = investigate_metric_window(
+            client,
+            run_id=run_id,
+            window_start=window["window"]["start"],
+            window_end=window["window"]["end"],
+            query=str(selected["query"]),
+            step_seconds=int(
+                window.get("sampling_interval_seconds")
+                or metrics_config.get("step_seconds", 15)
+            ),
+        )
+        selected_id = str(selected.get("id") or selected.get("name") or "query")
+        artifact_path = storage.save_artifact(
+            run_id, f"mcp_evidence_{selected_id}", result
+        )
+        result["artifact_path"] = artifact_path
+        storage.append_event(
+            DomainEvent(
+                run_id=run_id,
+                event_type="mcp_evidence_collected",
+                ts=window["window"]["end"],
+                payload={
+                    "tool": result["tool"],
+                    "metric_id": selected_id,
+                    "window": result["window"],
+                    "series_count": result["evidence"]["series_count"],
+                    "sample_count": result["evidence"]["sample_count"],
+                },
+            )
+        )
+        return result
+
     @app.get("/api/runs/{run_id}/features")
     def get_run_features(run_id: str) -> dict:
         features = storage.get_run_features(run_id)
         if features is None:
             raise HTTPException(status_code=404, detail="features not found")
         return features
+
+    @app.post("/api/runs/{run_id}/telemetry-chat")
+    def telemetry_chat(run_id: str, req: TelemetryChatRequest) -> dict:
+        window = get_observation_window(run_id)
+        try:
+            run = storage.get_run(run_id)
+            experiment = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        metrics_config = (
+            experiment.spec.get("observability", {}).get("metrics", {}) or {}
+        )
+        mcp_url = metrics_config.get("mcp_sse_url")
+        if not mcp_url:
+            raise HTTPException(
+                status_code=409,
+                detail="experiment has no MCP metrics endpoint configured",
+            )
+
+        mcp_client = MCPToolClient(
+            str(mcp_url), int(metrics_config.get("timeout_seconds", 10))
+        )
+
+        tracer = get_tracer()
+        with tracer.start_as_current_span("agent.telemetry_chat") as span:
+            span.set_attribute(GenAI.OPERATION_NAME, "invoke_agent")
+            span.set_attribute(GenAI.AGENT_NAME, "telemetry-chat")
+            span.set_attribute(GenAI.PROVIDER_NAME, "custom")
+            span.set_attribute(GenAI.SYSTEM, "qwen")
+            if req.use_model:
+                span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
+            span.set_attribute("rca.run_id", run_id)
+            span.set_attribute("rca.experiment_id", run.experiment_id)
+            span.set_attribute("rca.observation_window.start", window["window"]["start"])
+            span.set_attribute("rca.observation_window.end", window["window"]["end"])
+            span.set_attribute("rca.agent.use_model", req.use_model)
+            span.set_attribute("rca.agent.max_steps", req.max_steps)
+            try:
+                chat_context = {
+                    "start": window["window"]["start"],
+                    "end": window["window"]["end"],
+                    "namespace": str(
+                        experiment.spec.get("scope", {}).get("namespace", "sock-shop")
+                    ),
+                }
+                if req.use_model:
+                    answer = answer_query_mcp(
+                        req.query,
+                        mcp_client=mcp_client,
+                        **chat_context,
+                        max_steps=req.max_steps,
+                        max_new_tokens=req.max_new_tokens,
+                    )
+                else:
+                    class _MCPPrometheusAdapter:
+                        def query_range(
+                            self, query: str, start: str, end: str, step: str
+                        ):
+                            return mcp_client.call_tool_json(
+                                "prometheus_range_query",
+                                {
+                                    "query": query,
+                                    "start": start,
+                                    "end": end,
+                                    "step": step,
+                                },
+                            )
+
+                    answer = answer_query(
+                        req.query,
+                        prometheus=_MCPPrometheusAdapter(),
+                        **chat_context,
+                        use_model=False,
+                        max_steps=req.max_steps,
+                        max_new_tokens=req.max_new_tokens,
+                    )
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            span.set_attribute("rca.agent.answer_chars", len(answer))
+            span.add_event(
+                "agent.telemetry_chat.completed",
+                {"query_chars": len(req.query), "answer_chars": len(answer)},
+            )
+        storage.append_event(
+            DomainEvent(
+                run_id=run_id,
+                event_type="telemetry_chat_completed",
+                ts=window["window"]["end"],
+                payload={
+                    "query_chars": len(req.query),
+                    "answer_chars": len(answer),
+                    "use_model": req.use_model,
+                    "window": window["window"],
+                },
+            )
+        )
+        return {
+            "run_id": run_id,
+            "window": window["window"],
+            "answer": answer,
+            "used_mcp": True,
+        }
 
     @app.get("/api/runs/{run_id}/summary")
     def get_run_summary(run_id: str) -> dict:
@@ -415,6 +634,17 @@ def create_app() -> FastAPI:
         target = storage.get_run_summary(run_id)
         if target is None:
             raise HTTPException(status_code=404, detail="summary not found")
+
+        run = storage.get_run(run_id)
+        artifact_paths = run.summary.get("artifact_paths", {})
+        observability_path = artifact_paths.get("observability_summary")
+        if observability_path:
+            try:
+                target["observability_summary"] = json.loads(
+                    Path(observability_path).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                target["observability_summary"] = None
 
         target_experiment_id = target.get("experiment_id")
 
@@ -618,6 +848,21 @@ def create_app() -> FastAPI:
                 flush=True,
             )
 
+        def _record_usage(span, usage: dict) -> None:
+            input_tokens = int(usage.get("input_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
+            if usage.get("source") != "measured":
+                return
+            span.set_attribute(GenAI.USAGE_INPUT_TOKENS, input_tokens)
+            span.set_attribute(GenAI.USAGE_OUTPUT_TOKENS, output_tokens)
+            span.set_attribute("gen_ai.usage.total_tokens", input_tokens + output_tokens)
+            span.set_attribute("rca.llm.token_count_source", "measured")
+            record_llm_metrics(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=target_model,
+            )
+
         # Resolve LLM target URL and model name for this request.
         # Fall back to environment defaults (Qwen local) if not explicitly passed.
         prov = (provider or "").strip().lower()
@@ -642,9 +887,9 @@ def create_app() -> FastAPI:
             target_model = model or os.environ.get("LLM_MODEL") or "gpt-4o-mini"
             target_api_style = "openai"
         elif prov in {"qwen", "local"}:
-            target_url = "http://localhost:8001/generate"
+            target_url = "http://localhost:8001/v1/chat/completions"
             target_model = model or "qwen-14b"
-            target_api_style = "legacy"
+            target_api_style = "openai"
         elif prov:
             target_url = prov  # custom URL passed directly
             target_model = model or DEFAULT_LLM_MODEL
@@ -771,6 +1016,7 @@ def create_app() -> FastAPI:
 
             # ── LLM call ─────────────────────────────────────────────────
             t_call_start = time.time()
+            usage = {}
             with tracer.start_as_current_span("gen_ai.chat") as span:
                 span.set_attribute(GenAI.OPERATION_NAME, "chat")
                 span.set_attribute(GenAI.SYSTEM, llm_sys)
@@ -783,14 +1029,15 @@ def create_app() -> FastAPI:
                     span.set_attribute("rca.eval.fault", eval_fault)
                 if eval_strategy:
                     span.set_attribute("rca.eval.strategy", eval_strategy)
-                span.add_event(
-                    "llm.request",
-                    {
-                        "attempt": 1,
-                        "retry": False,
-                        "prompt": _trim_for_span(prompt),
-                    },
-                )
+                request_event = {
+                    "attempt": 1,
+                    "retry": False,
+                    "prompt_chars": len(prompt),
+                    "prompt_sha256": prompt_sha,
+                }
+                if capture_content():
+                    request_event["prompt"] = _trim_for_span(prompt)
+                span.add_event("llm.request", request_event)
                 _log("llm.call.start attempt=1")
                 try:
                     raw = call_llm(
@@ -801,6 +1048,7 @@ def create_app() -> FastAPI:
                         api_style=target_api_style,
                         api_key=api_key,
                         timeout=target_timeout,
+                        usage=usage,
                     )
                 except LLMClientError as exc:
                     record_llm_io(
@@ -828,14 +1076,16 @@ def create_app() -> FastAPI:
                     raise HTTPException(status_code=502, detail=str(exc)) from exc
                 if capture_content():
                     span.set_attribute(GenAI.COMPLETION, raw)
-                span.add_event(
-                    "llm.response",
-                    {
-                        "attempt": 1,
-                        "retry": False,
-                        "response": _trim_for_span(raw),
-                    },
-                )
+                _record_usage(span, usage)
+                response_event = {
+                    "attempt": 1,
+                    "retry": False,
+                    "response_chars": len(raw),
+                    "response_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12],
+                }
+                if capture_content():
+                    response_event["response"] = _trim_for_span(raw)
+                span.add_event("llm.response", response_event)
 
             llm_latency_ms = int((time.time() - t_call_start) * 1000)
             timing_meta["llm_ms"] = llm_latency_ms
@@ -901,15 +1151,17 @@ def create_app() -> FastAPI:
                         span.set_attribute("rca.eval.fault", eval_fault)
                     if eval_strategy:
                         span.set_attribute("rca.eval.strategy", eval_strategy)
-                    span.add_event(
-                        "llm.request",
-                        {
-                            "attempt": 2,
-                            "retry": True,
-                            "prompt": _trim_for_span(prompt),
-                        },
-                    )
+                    request_event = {
+                        "attempt": 2,
+                        "retry": True,
+                        "prompt_chars": len(prompt),
+                        "prompt_sha256": prompt_sha,
+                    }
+                    if capture_content():
+                        request_event["prompt"] = _trim_for_span(prompt)
+                    span.add_event("llm.request", request_event)
                     try:
+                        usage_retry = {}
                         raw_retry = call_llm(
                             prompt,
                             max_new_tokens=max_new_tokens,
@@ -918,7 +1170,9 @@ def create_app() -> FastAPI:
                             api_style=target_api_style,
                             api_key=api_key,
                             timeout=target_timeout,
+                            usage=usage_retry,
                         )
+                        _record_usage(span, usage_retry)
                         parsed_retry = parse_verdict_response(raw_retry)
                         _log(
                             "parse.done attempt=2 "
@@ -926,14 +1180,17 @@ def create_app() -> FastAPI:
                             f"rca={parsed_retry.get('rca') or ''} "
                             f"fault_category={parsed_retry.get('fault_category') or ''}"
                         )
-                        span.add_event(
-                            "llm.response",
-                            {
-                                "attempt": 2,
-                                "retry": True,
-                                "response": _trim_for_span(raw_retry),
-                            },
-                        )
+                        response_event = {
+                            "attempt": 2,
+                            "retry": True,
+                            "response_chars": len(raw_retry),
+                            "response_sha256": hashlib.sha256(
+                                raw_retry.encode("utf-8")
+                            ).hexdigest()[:12],
+                        }
+                        if capture_content():
+                            response_event["response"] = _trim_for_span(raw_retry)
+                        span.add_event("llm.response", response_event)
                         span.add_event(
                             "llm.parse",
                             {
@@ -1104,6 +1361,30 @@ def create_app() -> FastAPI:
                     ],
                 },
             }
+            with tracer.start_as_current_span("agent.decision") as span:
+                span.set_attribute("gen_ai.operation.name", "decision")
+                span.set_attribute("rca.decision.rca.source", rca_source)
+                span.set_attribute("rca.decision.fault_category.source", fault_source)
+                span.set_attribute("rca.decision.rca.value", str(analysis.get("rca") or ""))
+                span.set_attribute(
+                    "rca.decision.fault_category.value",
+                    str(analysis.get("fault_category") or ""),
+                )
+                if analysis.get("confidence") is not None:
+                    span.set_attribute("rca.decision.confidence", float(analysis["confidence"]))
+                span.set_attribute(
+                    "rca.decision.citation_count",
+                    len(parsed.get("citations") or []),
+                )
+                span.add_event(
+                    "agent.decision.completed",
+                    {
+                        "rca_source": rca_source,
+                        "fault_category_source": fault_source,
+                        "validator_fired": bool(vmeta.get("fired")),
+                        "localizer_fired": bool(loc.get("fired")),
+                    },
+                )
             root.set_attribute(GenAI.DECISION_SOURCE_RCA, rca_source)
             root.set_attribute(GenAI.DECISION_SOURCE_FAULT, fault_source)
             if analysis.get("rca"):

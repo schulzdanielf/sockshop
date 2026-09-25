@@ -22,6 +22,7 @@ Design goals
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import sys
@@ -40,9 +41,12 @@ class GenAI:
     """OpenTelemetry GenAI / AgentOps attribute keys used across the pipeline."""
 
     SYSTEM = "gen_ai.system"
+    PROVIDER_NAME = "gen_ai.provider.name"
     OPERATION_NAME = "gen_ai.operation.name"
+    AGENT_NAME = "gen_ai.agent.name"
     REQUEST_MODEL = "gen_ai.request.model"
     RESPONSE_MODEL = "gen_ai.response.model"
+    RESPONSE_ID = "gen_ai.response.id"
     REQUEST_MAX_TOKENS = "gen_ai.request.max_tokens"
     RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
     USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
@@ -51,6 +55,9 @@ class GenAI:
     PROMPT = "gen_ai.prompt"
     COMPLETION = "gen_ai.completion"
     TOOL_NAME = "gen_ai.tool.name"
+    TOOL_CALL_ID = "gen_ai.tool.call.id"
+    TOOL_TYPE = "gen_ai.tool.type"
+    TOOL_DESCRIPTION = "gen_ai.tool.description"
 
     # Metric instrument names.
     METRIC_OPERATION_DURATION = "gen_ai.client.operation.duration"
@@ -78,6 +85,25 @@ _llm_io_otlp_handler: Optional[logging.Handler] = None
 
 def _truthy(value: Optional[str]) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _collector_reachable(endpoint: str, timeout_seconds: float = 2.0) -> bool:
+    """Testa se o OTel collector responde antes de instalar o SDK.
+
+    Evita que os BatchProcessors fiquem em retry infinito quando o collector
+    está fora — a causa raiz do travamento de 2026-09-20.
+    """
+    import socket
+    import urllib.parse
+
+    try:
+        parsed = urllib.parse.urlparse(endpoint)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 4318
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
 
 
 def capture_content() -> bool:
@@ -166,11 +192,20 @@ def record_llm_io(entry: dict) -> None:
     if _llm_io_logger is None:
         return
 
+    safe_entry = dict(entry or {})
+    if not capture_content():
+        for field in ("prompt", "response"):
+            content = safe_entry.pop(field, None)
+            if isinstance(content, str):
+                safe_entry[f"{field}_chars"] = len(content)
+                safe_entry[f"{field}_sha256"] = hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest()[:12]
     payload = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "service": _SERVICE_NAME,
         **_trace_context_ids(),
-        **(entry or {}),
+        **safe_entry,
     }
     try:
         line = json.dumps(payload, ensure_ascii=True)
@@ -245,6 +280,17 @@ def _install_sdk() -> None:
     from opentelemetry.semconv.resource import ResourceAttributes
 
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", _DEFAULT_ENDPOINT)
+
+    # Se o collector não responde, não instala o SDK — os BatchProcessors fariam
+    # retry infinito e travariam a thread que processa o run (causa raiz do
+    # travamento de 2026-09-20, quando o collector local estava fora).
+    if not _collector_reachable(endpoint):
+        logging.getLogger("rca.platform").warning(
+            "OTel collector inacessível em %s — SDK desligado (no-op). "
+            "Defina OTEL_SDK_DISABLED=true para silenciar.", endpoint
+        )
+        return
+
     base = endpoint.rstrip("/") + "/"
     resource = Resource.create(
         {

@@ -48,6 +48,7 @@ class MCPTempoTracesPlugin:
         )
 
         traces = search.get("traces", []) if isinstance(search, dict) else []
+        search_error = search.get("error") if isinstance(search, dict) else None
         analyzed: List[Dict[str, Any]] = []
         for item in traces:
             trace_id = item.get("traceID") or item.get("traceId")
@@ -83,6 +84,18 @@ class MCPTempoTracesPlugin:
             "window_end": end_iso,
             "traces": analyzed,
             "count": len(analyzed),
+            "collection": {
+                "provider": "tempo",
+                "search_returned": len(traces),
+                "search_error": search_error,
+                "empty": not analyzed,
+                "empty_reason": (
+                    "tempo_search_error" if search_error
+                    else "no_traces_in_window" if not traces
+                    else "trace_ids_missing_or_analysis_failed"
+                    if not analyzed else None
+                ),
+            },
         }
 
     def collect_phase_graphs(

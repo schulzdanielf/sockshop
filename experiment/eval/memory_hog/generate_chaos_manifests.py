@@ -384,16 +384,43 @@ def _render_io_stress(service: str, env: Dict[str, Any]) -> str:
 
 
 def _render_http_status_code(service: str, env: Dict[str, Any]) -> str:
+    """http-status-code sob Istio: VirtualService com fault.abort.
+
+    O pod-http-status-code do Litmus (proxy na porta 20000 via iptables) é
+    **contornado pelo sidecar Envoy** do Istio — o tráfego real nunca passa pelo
+    proxy, logo o alvo não registra erro (ERRO 2 em erros-experimentos.md). A
+    correção correta sob mesh é o **fault injection nativo do Istio**: um
+    VirtualService que aborta 100% das requisições ao serviço com o status_code
+    configurado. O próprio Envoy injeta o erro → o tráfego real é afetado e o
+    Istio registra os 5xx.
+
+    Gera um VirtualService (não um Argo Workflow). Aplicado via manifest_path.
+    """
     status_code = int(env.get("status_code", 500))
-    duration_s = int(env.get("total_chaos_duration_seconds", 60))
-    return _render_from_baseline(
-        "catalogue-http-status-code.yaml",
-        service,
-        [
-            ('value: "500"', f'value: "{status_code}"'),
-            ('value: "60"', f'value: "{duration_s}"'),
-        ],
-    )
+    return f"""# VirtualService — Istio fault injection (HTTP {status_code}) em {service}.
+# Gerado por generate_chaos_manifests._render_http_status_code.
+# Sob Istio, o pod-http-status-code do Litmus é contornado pelo Envoy; este
+# VirtualService injeta o erro no próprio mesh, garantindo efeito observável.
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {service}-http-status-code
+  namespace: sock-shop
+spec:
+  hosts:
+    - {service}
+  http:
+    - fault:
+        abort:
+          percentage:
+            value: 100
+          httpStatus: {status_code}
+      route:
+        - destination:
+            host: {service}
+            port:
+              number: 80
+"""
 
 
 def _render_container_kill(service: str, env: Dict[str, Any]) -> str:
@@ -490,7 +517,10 @@ def main() -> int:
     args = p.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-    output_dir = Path(__file__).with_name("out") / cfg["output"]["manifests_dir"]
+    output_dir = Path(cfg["output"]["results_dir"])
+    if not output_dir.is_absolute():
+        output_dir = ROOT / output_dir
+    output_dir = output_dir / cfg["output"]["manifests_dir"]
 
     written = generate(cfg, output_dir)
     print(f"Wrote {len(written)} manifest(s) to {output_dir}")

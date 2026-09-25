@@ -1,0 +1,152 @@
+# ────────────────────────────────────────────────────────────────────────────
+# GAT + Istio mesh — coleta de runs novos com edge features reais
+# ────────────────────────────────────────────────────────────────────────────
+# Config específica para a abordagem híbrida (branch hibrido): coleta runs com
+# o service mesh Istio ativo, para que o engine construa o gat_graph com
+# edge_source: full (arestas reais source→destination).
+#
+# Reusa o harness existente (runner.py). Diferenças da config base:
+#   - prioriza fault types de REDE (onde edge features mais ajudam)
+#   - registra intensidade no chaos_profile (necessário para o split S4)
+#   - campaign id distinto para isolar esta campanha no corpus
+#
+# Pré-requisitos:
+#   1. Mesh Istio ativo (istio-injection=enabled em sock-shop)
+#   2. make chaos-enable-netem   (sch_netem — obrigatório p/ network-*)
+#   3. validate_metrics READY    (python -m experiment.eval.gat.validate_metrics --save)
+
+platform:
+  api_base: "http://127.0.0.1:8010"
+  user_role: "chaos_engineer"
+  initiated_by: "gat-istio-harness"
+  poll_interval_seconds: 15
+  run_timeout_seconds: 1800
+
+cluster:
+  app_namespace: "sock-shop"
+  litmus_namespace: "litmus"
+  argo_controller_instanceid: "f21787ba-08ee-4649-ab66-c880492636dc"
+
+# Campanha distinta para a abordagem GAT+Istio (não mistura com a avaliação LLM).
+experiment_campaign_id: "gat-istio-v1"
+
+# ── Chaos types (mesmo catálogo; intensidade registrada por célula) ────────
+chaos_types:
+  - name: memory-hog
+    template_suffix: memory-hog
+    short: memhog
+    fault_category: memory-exhaustion
+    env:
+      memory_consumption_mb: 500
+      total_chaos_duration_seconds: 60
+      chaos_interval_seconds: 10
+  - name: cpu-hog
+    template_suffix: cpu-hog
+    short: cpuhog
+    fault_category: cpu-exhaustion
+    env:
+      cpu_cores: 1
+      total_chaos_duration_seconds: 60
+      chaos_interval_seconds: 10
+  - name: pod-delete
+    template_suffix: pod-delete
+    short: poddel
+    fault_category: pod-failure
+    env:
+      total_chaos_duration_seconds: 30
+      chaos_interval_seconds: 10
+      force: false
+  - name: network-latency
+    template_suffix: network-latency
+    short: netlat
+    fault_category: network-latency
+    env:
+      network_latency_ms: 2000
+      total_chaos_duration_seconds: 60
+  - name: network-loss
+    template_suffix: network-loss
+    short: netloss
+    fault_category: network-loss
+    env:
+      network_packet_loss_percentage: 100
+      total_chaos_duration_seconds: 60
+  - name: http-status-code
+    template_suffix: http-status-code
+    short: httperr
+    fault_category: http-error
+    env:
+      status_code: 500
+      total_chaos_duration_seconds: 60
+  - name: container-kill
+    template_suffix: container-kill
+    short: ckill
+    fault_category: pod-failure
+    env:
+      total_chaos_duration_seconds: 20
+      chaos_interval_seconds: 10
+
+timeline:
+  baseline_seconds: 30
+  warmup_seconds: 30
+  fault_duration_seconds: 90
+  post_recovery_observation_seconds: 180
+  sampling_interval_seconds: 5
+
+load_profile:
+  provider: "locust"
+  command: "kubectl -n loadtest exec deploy/locust-web -- locust"
+  locust_file: "/mnt/locust/locustfile.py"
+  host: "http://front-end.sock-shop.svc.cluster.local"
+  users: 30
+  spawn_rate: 5
+  grace_seconds: 30
+
+slo:
+  error_rate_threshold: 0.05
+  latency_p95_threshold_ms: 800
+  recovery_tolerance_pct: 0.20
+  max_recovery_seconds: 600
+
+# ── Matriz: mesmas células da campanha base ───────────────────────────────
+# Intensidade removida (decisão 2026-09-20): a tag não mudava o env do chaos,
+# logo o split S4 não mediria nada. O experimento foca em S1/S2/S3.
+train_experiments:
+  - {service: catalogue, chaos_type: memory-hog}
+  - {service: carts,     chaos_type: pod-delete}
+  - {service: orders,    chaos_type: cpu-hog}
+  - {service: payment,   chaos_type: memory-hog}
+  - {service: payment,   chaos_type: cpu-hog}
+  - {service: user,      chaos_type: pod-delete}
+  - {service: shipping,  chaos_type: pod-delete}
+  - {service: queue-master, chaos_type: memory-hog}
+  - {service: front-end,   chaos_type: cpu-hog}
+  # Rede — o foco do GAT-full (edge features)
+  - {service: catalogue, chaos_type: network-latency}
+  - {service: carts,     chaos_type: network-loss}
+  - {service: user,      chaos_type: http-status-code}
+  - {service: orders,    chaos_type: container-kill}
+
+test_experiments:
+  - {service: user,         chaos_type: memory-hog}
+  - {service: user,         chaos_type: cpu-hog}
+  - {service: shipping,     chaos_type: pod-delete}
+  - {service: queue-master, chaos_type: cpu-hog}
+  - {service: front-end,    chaos_type: pod-delete}
+  - {service: orders,       chaos_type: memory-hog}
+  # Rede — held-out em serviços diferentes do treino
+  - {service: payment,      chaos_type: network-latency}
+  - {service: shipping,     chaos_type: network-loss}
+  - {service: orders,       chaos_type: http-status-code}
+  - {service: user,         chaos_type: container-kill}
+
+replicas: 1
+
+# Sem estratégias de LLM aqui — esta campanha é só para construir o corpus de
+# grafos (o GAT é avaliado offline por build_dataset/train/evaluate).
+strategies: []
+
+output:
+  results_dir: "experiment/eval/gat/out"
+  runs_csv: "runs_istio.csv"
+  evaluation_csv: "evaluation_istio.csv"
+  manifests_dir: "manifests_istio"

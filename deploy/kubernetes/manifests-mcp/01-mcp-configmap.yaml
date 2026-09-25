@@ -5,7 +5,7 @@ metadata:
   namespace: mcp-server
 data:
   # Prometheus configuration (use DNS name for in-cluster discovery)
-  PROMETHEUS_URL: "http://prometheus.monitoring.svc.cluster.local:9090"
+  PROMETHEUS_URL: "http://prometheus-v3.monitoring.svc.cluster.local:9090"
   PROMETHEUS_TIMEOUT: "30"
   
   # Loki configuration (use DNS name for in-cluster discovery)

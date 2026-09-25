@@ -3,6 +3,8 @@ const stepIndicator = document.getElementById('stepIndicator');
 let currentStep = 1;
 let currentRunId = null;
 let pollTimer = null;
+let telemetryRuns = [];
+let telemetryRunId = null;
 
 function showStep(step) {
   currentStep = Math.max(1, Math.min(6, step));
@@ -66,9 +68,9 @@ function buildSpec() {
         mcp_sse_url: 'http://127.0.0.1:18080/sse',
         timeout_seconds: 10,
         queries: [
-          { id: 'traffic', query: 'sum(rate(request_duration_seconds_count[5m])) by (name)' },
-          { id: 'error_rate', query: 'sum(rate(request_duration_seconds_count{status_code=~"5.."}[5m])) by (name)' },
-          { id: 'latency_p95', query: 'histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket[5m])) by (le,name))' }
+          { id: 'traffic', query: 'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[5m])) by (destination_workload)' },
+          { id: 'error_rate', query: '100 * (sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown",response_code=~"5.."}[5m])) by (destination_workload) or on(destination_workload) 0 * sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[5m])) by (destination_workload)) / clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[5m])) by (destination_workload), 0.0001)' },
+          { id: 'latency_p95', query: 'histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{destination_workload_namespace="sock-shop",destination_workload!="unknown"}[5m])) by (le,destination_workload))' }
         ]
       },
       traces: {
@@ -278,6 +280,77 @@ async function loadCatalog(sync) {
 document.getElementById('loadCatalogBtn').addEventListener('click', () => loadCatalog(true));
 document.getElementById('refreshHistoryBtn').addEventListener('click', loadHistory);
 document.getElementById('historyDisagreementOnly')?.addEventListener('change', loadHistory);
+
+// ── MCP telemetry chat ──────────────────────────────────────────────────────
+function addChatMessage(role, text, meta = '') {
+  const container = document.getElementById('telemetryChatMessages');
+  container.querySelector('.chat-empty')?.remove();
+  const item = document.createElement('div');
+  item.className = `chat-message ${role}`;
+  const label = role === 'user' ? 'Você' : 'MCP / Qwen';
+  item.innerHTML = `<div class="chat-message-label">${label}</div><div class="chat-message-body"></div>${meta ? `<div class="chat-message-meta">${meta}</div>` : ''}`;
+  item.querySelector('.chat-message-body').textContent = text;
+  container.appendChild(item);
+  container.scrollTop = container.scrollHeight;
+}
+
+function setTelemetryRun(runId) {
+  telemetryRunId = runId || null;
+  const input = document.getElementById('telemetryChatInput');
+  const send = document.getElementById('telemetryChatSendBtn');
+  input.disabled = !telemetryRunId;
+  send.disabled = !telemetryRunId;
+  const run = telemetryRuns.find((item) => item.run_id === telemetryRunId);
+  document.getElementById('chatWindowBadge').textContent = run
+    ? `${run.run_id} · ${run.status}`
+    : 'Nenhum run selecionado';
+}
+
+async function loadTelemetryRuns() {
+  const select = document.getElementById('telemetryRunSelect');
+  telemetryRuns = (await api('/api/runs')).filter((run) => ['completed', 'failed', 'stopped'].includes(run.status));
+  select.innerHTML = '<option value="">Selecione um run concluído</option>' + telemetryRuns.map((run) =>
+    `<option value="${run.run_id}">${run.experiment_id} · ${run.run_id} · ${run.status}</option>`
+  ).join('');
+  if (telemetryRunId && telemetryRuns.some((run) => run.run_id === telemetryRunId)) select.value = telemetryRunId;
+  setTelemetryRun(select.value);
+}
+
+document.getElementById('telemetryRunSelect').addEventListener('change', (event) => {
+  setTelemetryRun(event.target.value);
+  if (event.target.value) {
+    document.getElementById('telemetryChatMessages').innerHTML = '<div class="chat-empty">Janela carregada. Faça uma pergunta sobre este run.</div>';
+  }
+});
+document.getElementById('refreshTelemetryRunsBtn').addEventListener('click', loadTelemetryRuns);
+document.querySelectorAll('[data-chat-question]').forEach((button) => button.addEventListener('click', () => {
+  const input = document.getElementById('telemetryChatInput');
+  input.value = button.dataset.chatQuestion;
+  input.focus();
+}));
+document.getElementById('telemetryChatForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = document.getElementById('telemetryChatInput');
+  const question = input.value.trim();
+  if (!telemetryRunId || !question) return;
+  addChatMessage('user', question);
+  input.value = '';
+  input.disabled = true;
+  document.getElementById('telemetryChatSendBtn').disabled = true;
+  try {
+    const result = await api(`/api/runs/${telemetryRunId}/telemetry-chat`, {
+      method: 'POST',
+      body: JSON.stringify({ query: question, use_model: true })
+    });
+    addChatMessage('assistant', result.answer, `Janela MCP: ${result.window.start} → ${result.window.end}`);
+  } catch (err) {
+    addChatMessage('error', `Não foi possível consultar a telemetria: ${err.message}`);
+  } finally {
+    input.disabled = false;
+    document.getElementById('telemetryChatSendBtn').disabled = false;
+  }
+});
+loadTelemetryRuns().catch(() => {});
 
 // ── Run History ──────────────────────────────────────────────────────────────
 const VERDICT_LABELS = ['resilient', 'degraded_recoverable', 'degraded_persistent', 'unsure'];

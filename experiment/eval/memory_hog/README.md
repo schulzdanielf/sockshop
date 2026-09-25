@@ -27,7 +27,7 @@ experiment/eval/memory_hog/
 * The platform is running and reachable at `http://127.0.0.1:8010`
   (`uvicorn experiment.platform.backend.main:app --host 0.0.0.0 --port 8010`).
 * The MCP observability server is up at `127.0.0.1:18080`.
-* Local Qwen LLM is up at `localhost:8001/generate`.
+* Local Qwen LLM is up at `localhost:8001/v1/chat/completions`.
 * Litmus + Argo are installed in the `litmus` namespace, with the
   `controller-instanceid` `f21787ba-08ee-4649-ab66-c880492636dc`.
 * `kubectl` context points to the cluster running Sock Shop in the
@@ -173,6 +173,22 @@ to the `POST /api/runs/{id}/llm-analysis` query params:
 
 Re-run with `--phase eval` to backfill results on existing runs.
 
+## Escopo do runner e comparação multiagente
+
+O runner atual chama somente `POST /api/runs/{id}/llm-analysis`. Cada célula
+`(run_id, strategy)` mede o baseline de LLM único com RAG e os validadores
+determinísticos ativos; registra WHERE/WHY/full accuracy, confiança, tokens,
+timings, retries e metadados de validator/localizer em `evaluation.csv`.
+Ele não avalia `telemetry-chat` nem agentes especializados/paralelos.
+
+Para o primeiro piloto multiagente, preserve o runner e o CSV atuais como
+baseline. Implemente um adapter/runner separado que produza os mesmos campos
+de avaliação e acrescente chamadas por agente, cobertura, evidências citadas,
+latência e tokens por agente. Execute baseline e variante nos mesmos runs
+concluídos com ground-truth e quality gates aprovados; não use runs sem
+cobertura de traces para pontuar o especialista de traces. O plano está em
+[`research/planos/2026-09-25-plano-llm-multiagente.md`](../../../research/planos/2026-09-25-plano-llm-multiagente.md).
+
 ## Troubleshooting
 
 * **`HTTP 400` on `/api/runs/start`** — likely the Argo workflow template
@@ -180,6 +196,6 @@ Re-run with `--phase eval` to backfill results on existing runs.
 * **Run sits at `running` forever** — check `kubectl get workflows -n litmus`
   for stuck workflows and `kubectl get pods -n sock-shop` for crash-looping
   target pods. The harness has a `run_timeout_seconds` (30 min default) cap.
-* **LLM 502 in eval phase** — Qwen at `localhost:8001/generate` is down or
+* **LLM 502 in eval phase** — Qwen at `localhost:8001/v1/chat/completions` is down or
   out of context. Lower `budget_tokens` in the failing strategy or restart
   the model.

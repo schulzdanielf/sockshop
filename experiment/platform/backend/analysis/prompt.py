@@ -18,6 +18,7 @@ safely under the 4k context window with headroom for ``max_new_tokens``.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -124,6 +125,29 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[:max_chars].rstrip() + "\n…[truncated]"
 
 
+def _model_observability_context(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep evidence while excluding derived RCA labels from the target."""
+    sources = summary.get("sources") or {}
+    metrics = sources.get("metrics") or {}
+    traces = sources.get("traces") or {}
+    return {
+        "observation_window": summary.get("observation_window"),
+        "metrics": {
+            "coverage": metrics.get("coverage", {}),
+            "summary": metrics.get("summary", {}),
+            "phase_metrics": metrics.get("phase_metrics", {}),
+            "metric_hotspots": metrics.get("metric_hotspots", {}),
+        },
+        "traces": {
+            "window_start": traces.get("window_start"),
+            "window_end": traces.get("window_end"),
+            "summary": traces.get("summary", {}),
+            "collection": traces.get("collection", {}),
+        },
+        "gaps": summary.get("gaps", {}),
+    }
+
+
 def assemble_prompt(
     rag_context: Dict[str, Any],
     *,
@@ -152,6 +176,14 @@ def assemble_prompt(
 
     target_text = target.get("summary_text") or ""
     target_text = _mask_target_summary(target_text)
+    observability_summary = target.get("observability_summary")
+    if isinstance(observability_summary, dict):
+        observability_text = json.dumps(
+            _model_observability_context(observability_summary),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        target_text += f"\n\n## Observability context\n{observability_text}"
     target_budget = int(budget_tokens * target_share)
     target_text = _truncate_to_tokens(target_text, target_budget)
 

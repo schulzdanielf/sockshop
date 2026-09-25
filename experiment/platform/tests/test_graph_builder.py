@@ -84,6 +84,33 @@ def test_series_by_service_and_window_mean():
     assert abs(mean - 30.0) < 1e-6
 
 
+def test_series_by_service_accepts_istio_destination_workload_label():
+    b0 = _ts(BASELINE[0])
+    metrics = {
+        "data": {
+            "error_rate": {
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"destination_workload": "orders"},
+                            "values": [[b0, "0.0"], [b0 + 15, "5.0"]],
+                        },
+                        {
+                            "metric": {"destination_workload": "unknown"},
+                            "values": [[b0, "99.0"]],
+                        },
+                    ]
+                }
+            }
+        }
+    }
+
+    series = _series_by_service(metrics, "error_rate")
+
+    assert sorted(series) == ["orders"]
+    assert series["orders"] == [(b0, 0.0), (b0 + 15, 5.0)]
+
+
 # ── build_gat_graph ─────────────────────────────────────────────────────
 def test_graph_structure():
     g = build_gat_graph(

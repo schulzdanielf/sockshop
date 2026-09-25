@@ -33,7 +33,7 @@ if str(ROOT) not in sys.path:
 
 from experiment.eval.gat.baselines import BASELINES  # noqa: E402
 from experiment.eval.gat.metrics import bootstrap_ci, evaluate_scorer  # noqa: E402
-from experiment.eval.gat.model import NODE_DIM, graph_to_pyg, set_seed  # noqa: E402
+from experiment.eval.gat.model import NODE_DIM, get_device, graph_to_pyg, set_seed  # noqa: E402
 
 SCHEMA_VERSION = "1.0"
 SPLITS = ("S1", "S2", "S3")
@@ -62,11 +62,12 @@ def _split_graphs(graphs: List[Dict], split: str, which: str) -> List[Dict]:
             and (g.get("label") or {}).get("root_service_idx") is not None]
 
 
-def _make_scorer(model: NodeMLP):
+def _make_scorer(model: NodeMLP, device: torch.device | None = None):
     model.eval()
+    device = device or get_device()
 
     def scorer(graph: Dict) -> np.ndarray:
-        data = graph_to_pyg(graph)
+        data = graph_to_pyg(graph).to(device)
         with torch.no_grad():
             return model(data.x).cpu().numpy()
 
@@ -75,9 +76,10 @@ def _make_scorer(model: NodeMLP):
 
 def _train_mlp(train_graphs: List[Dict], *, seed: int, epochs: int = 150, lr: float = 0.01, weight_decay: float = 5e-4) -> NodeMLP:
     set_seed(seed)
-    model = NodeMLP()
+    device = get_device()
+    model = NodeMLP().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    data = [graph_to_pyg(g) for g in train_graphs]
+    data = [graph_to_pyg(g).to(device) for g in train_graphs]
     for _ in range(epochs):
         model.train()
         for d in data:
@@ -99,7 +101,7 @@ def run_ablation(graphs: List[Dict], seeds: List[int]) -> Dict:
         top3s = []
         for seed in seeds:
             model = _train_mlp(tr, seed=seed)
-            top3s.append(evaluate_scorer(te, _make_scorer(model))["top3"])
+            top3s.append(evaluate_scorer(te, _make_scorer(model, get_device()))["top3"])
         top3s = np.array(top3s)
         b1 = bootstrap_ci(te, BASELINES["B1_max_anomaly"], metric="top3")
         results["splits"][split] = {

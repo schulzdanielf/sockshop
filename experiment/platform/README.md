@@ -97,7 +97,7 @@ helpers (`mcp-observability-server/tests/`).
 ## RAG Pipeline (Phases A & B)
 
 The platform produces a layered representation of every run so that a 4k‑context
-LLM (Qwen 14B served at `localhost:8001/generate`) can reason over historical
+LLM (Qwen 14B served at `localhost:8001/v1/chat/completions`) can reason over historical
 campaigns without loading raw Prometheus/Tempo payloads.
 
 ```
@@ -345,7 +345,7 @@ in cosine ranking.
 ### Phase D — LLM verdict with citations
 
 Phase D closes the RAG loop by feeding `/rag-context` into the local
-Qwen 14B server (`model/server.py`, default `http://localhost:8001/generate`).
+Qwen 14B server (`model/server.py`, default `http://localhost:8001/v1/chat/completions`).
 The assembler stays under the 4k‑token window and asks the model to
 return a structured JSON answer that always cites the neighbour runs it
 used.
@@ -378,11 +378,11 @@ embedded neighbours, each prefixed with a `[n1]`/`[n2]` citation tag.
 
 | Function | Purpose |
 | --- | --- |
-| `call_llm(prompt, max_new_tokens=512, url=LLM_URL)` | POST to `/generate`; raises `LLMClientError` on transport/JSON failure. |
+| `call_llm(prompt, max_new_tokens=512, url=LLM_URL)` | POST to OpenAI-compatible `/v1/chat/completions`; raises `LLMClientError` on transport/JSON failure. |
 | `parse_verdict_response(text)` | Extracts the first JSON block, validates `verdict ∈ {resilient, degraded_recoverable, degraded_persistent}`, clamps `confidence` to `[0,1]`, returns `parse_error` instead of raising. |
 | `llm_health()` | `GET /health` probe; returns `{ok, ...}` with the model name. |
 
-Environment knobs: `LLM_URL` (default `http://localhost:8001/generate`),
+Environment knobs: `LLM_URL` (default `http://localhost:8001/v1/chat/completions`),
 `LLM_TIMEOUT` (default `120` seconds).
 
 **Persistence** — `run_features` gains two columns:

@@ -53,7 +53,9 @@ class Qwen14BEngine:
 
         print("Qwen 14B loaded")
 
-    def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
+    def generate_with_metadata(
+        self, prompt: str, max_new_tokens: int = 512
+    ) -> tuple[str, int]:
         settings = ExLlamaV2Sampler.Settings()
         # Greedy decoding for reproducible experiments. With temperature=0
         # and top_k=1 the sampler always picks the argmax token, so two
@@ -64,20 +66,25 @@ class Qwen14BEngine:
         settings.top_p = 1.0
         settings.top_k = 1
 
-        output = self.generator.generate_simple(
+        raw_output = self.generator.generate_simple(
             prompt,
             settings,
             num_tokens=max_new_tokens,
             completion_only=True,
         )
+        raw_token_count = int(self.tokenizer.encode(raw_output).shape[-1])
 
         # Qwen3 thinking mode: strip <think>...</think> blocks before returning.
         # The model sometimes omits the opening tag, so also strip anything
         # before a bare </think> closing tag.
-        output = re.sub(r"<think>.*?</think>", "", output, flags=re.DOTALL)
+        output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL)
         output = re.sub(r"^.*?</think>", "", output, flags=re.DOTALL)
         output = output.strip()
 
+        return output, raw_token_count
+
+    def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
+        output, _raw_token_count = self.generate_with_metadata(prompt, max_new_tokens)
         return output
 
 

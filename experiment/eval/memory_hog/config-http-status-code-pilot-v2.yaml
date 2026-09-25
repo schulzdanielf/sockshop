@@ -1,0 +1,64 @@
+# Isolated pilot v2: one sequential HTTP 500 run per selected service.
+# Error-rate thresholds use percentage units, matching the Prometheus-derived
+# metrics and the existing platform validators.
+
+platform:
+  api_base: "http://127.0.0.1:8010"
+  user_role: "chaos_engineer"
+  initiated_by: "http-status-code-pilot-v2"
+  poll_interval_seconds: 10
+  run_timeout_seconds: 900
+  inter_run_cooldown_seconds: 90
+
+cluster:
+  app_namespace: "sock-shop"
+  litmus_namespace: "litmus"
+  argo_controller_instanceid: "f21787ba-08ee-4649-ab66-c880492636dc"
+
+experiment_campaign_id: "http-status-code-pilot-v2-20260923"
+
+chaos_types:
+  - name: http-status-code
+    template_suffix: http-status-code
+    short: httperr
+    fault_category: http-error
+    env:
+      status_code: 500
+      total_chaos_duration_seconds: 90
+
+timeline:
+  baseline_seconds: 30
+  warmup_seconds: 30
+  fault_duration_seconds: 90
+  post_recovery_observation_seconds: 120
+  sampling_interval_seconds: 5
+
+load_profile:
+  provider: "locust"
+  command: "kubectl -n loadtest exec deploy/locust-web -- locust"
+  locust_file: "/mnt/locust/locustfile.py"
+  host: "http://front-end.sock-shop.svc.cluster.local"
+  users: 30
+  spawn_rate: 5
+  grace_seconds: 30
+
+slo:
+  error_rate_threshold: 5.0
+  latency_p95_threshold_ms: 800
+  recovery_tolerance_pct: 0.20
+  max_recovery_seconds: 600
+
+train_experiments:
+  - {service: catalogue, chaos_type: http-status-code}
+  - {service: carts, chaos_type: http-status-code}
+  - {service: payment, chaos_type: http-status-code}
+
+test_experiments: []
+replicas: 1
+strategies: []
+
+output:
+  results_dir: "experiment/eval/memory_hog/out/http-status-code-pilot-v2"
+  runs_csv: "runs.csv"
+  evaluation_csv: "evaluation.csv"
+  manifests_dir: "manifests"

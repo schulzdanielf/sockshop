@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from experiment.eval.gat.build_dataset import (
+    EXCLUDED_TARGET_SERVICES,
     S2_HELD_OUT_SERVICES,
     S3_HELD_OUT_FAULT,
     TRANSIENT_CAP_SECONDS,
@@ -21,6 +22,13 @@ def test_normalize_strips_service_prefix():
     assert normalize_chaos_type("payment-network-latency") == "network-latency"
     assert normalize_chaos_type("catalogue-network-loss") == "network-loss"
     assert normalize_chaos_type("user-http-status-code") == "http-status-code"
+
+
+def test_normalize_manifest_path():
+    assert (
+        normalize_chaos_type("/tmp/manifests_istio_expansion/payment-http-status-code.yaml")
+        == "http-status-code"
+    )
 
 
 def test_normalize_none_and_unknown():
@@ -90,10 +98,15 @@ def test_s2_held_out_service():
 
 
 def test_s3_held_out_fault():
+    assert S3_HELD_OUT_FAULT == "container-kill"
     s = assign_splits("r", S3_HELD_OUT_FAULT, "user", True, 0, 2)
     assert s["S3"] == "test"
     s = assign_splits("r", "cpu-hog", "user", True, 0, 2)
     assert s["S3"] == "train"
+
+
+def test_queue_master_excluded_from_target_corpus():
+    assert "queue-master" in EXCLUDED_TARGET_SERVICES
 
 
 def test_s4_not_applicable_retroactive():

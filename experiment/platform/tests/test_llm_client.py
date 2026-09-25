@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from unittest.mock import MagicMock
+
 from experiment.platform.backend.analysis import llm_client
 
 
@@ -251,7 +254,7 @@ def test_call_llm_messages_sends_bearer_token(monkeypatch):
             return False
 
         def read(self):
-            return b'{"choices":[{"message":{"role":"assistant","content":"{\\"rca\\":\\"orders\\"}"}}]}'
+            return b'{"choices":[{"message":{"role":"assistant","content":"{\\"rca\\":\\"orders\\"}"}}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}'
 
     def _fake_urlopen(req, timeout):
         captured["headers"] = dict(req.headers)
@@ -259,15 +262,23 @@ def test_call_llm_messages_sends_bearer_token(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(llm_client.urllib.request, "urlopen", _fake_urlopen)
+    usage = {}
     out = llm_client.call_llm_messages(
         [{"role": "user", "content": "test"}],
         url="https://api.openai.com/v1/chat/completions",
         model="gpt-4o-mini",
         api_key="sk-test_token_123",
+        usage=usage,
     )
 
     assert out == '{"rca":"orders"}'
     assert captured["headers"].get("Authorization") == "Bearer sk-test_token_123"
+    assert usage == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+        "source": "measured",
+    }
     assert (
         captured["headers"].get("User-agent") == "MicroservicesDemo-RCA/1.0"
         or captured["headers"].get("User-Agent") == "MicroservicesDemo-RCA/1.0"
@@ -281,6 +292,110 @@ def test_llm_health_handles_cloud_endpoints():
     )
     assert out["ok"] is True
     assert out["style"] == "openai_cloud"
+
+
+def test_call_llm_messages_reads_qwen_usage(monkeypatch):
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"role":"assistant","content":"{\\"rca\\":\\"orders\\"}"}}],"usage":{"prompt_tokens":13,"completion_tokens":5,"total_tokens":18}}'
+
+    monkeypatch.setattr(llm_client.urllib.request, "urlopen", lambda req, timeout: _Resp())
+    usage = {}
+    out = llm_client.call_llm_messages(
+        [{"role": "user", "content": "test"}],
+        url="http://localhost:8001/v1/chat/completions",
+        api_style="openai",
+        usage=usage,
+    )
+
+    assert out == '{"rca":"orders"}'
+    assert usage["input_tokens"] == 13
+    assert usage["output_tokens"] == 5
+    assert usage["source"] == "measured"
+
+
+def test_call_llm_tool_messages_sends_tools_and_returns_tool_calls(monkeypatch):
+    captured = {}
+    tracer = MagicMock()
+    span = tracer.start_as_current_span.return_value.__enter__.return_value
+    monkeypatch.setattr(llm_client, "get_tracer", lambda: tracer)
+    monkeypatch.setattr(llm_client, "capture_content", lambda: False)
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return (
+                b'{"choices":[{"message":{"role":"assistant","content":null,'
+                b'"tool_calls":[{"id":"call_1","type":"function",'
+                b'"function":{"name":"get_cpu","arguments":"{}"}}]},'
+                b'"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,'
+                b'"completion_tokens":7,"total_tokens":18}}'
+            )
+
+    def _fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data)
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(llm_client.urllib.request, "urlopen", _fake_urlopen)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_cpu",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    usage = {}
+    message = llm_client.call_llm_tool_messages(
+        [{"role": "user", "content": "CPU?"}],
+        tools,
+        tool_choice="auto",
+        parallel_tool_calls=False,
+        url="http://localhost:8001/v1/chat/completions",
+        api_style="openai",
+        usage=usage,
+    )
+
+    assert captured["payload"]["tools"] == tools
+    assert captured["payload"]["tool_choice"] == "auto"
+    assert captured["payload"]["parallel_tool_calls"] is False
+    assert "response_format" not in captured["payload"]
+    assert captured["timeout"] == llm_client.DEFAULT_LLM_TIMEOUT
+    assert message["tool_calls"][0]["function"]["name"] == "get_cpu"
+    assert usage["total_tokens"] == 18
+    span.set_attribute.assert_any_call("gen_ai.operation.name", "chat")
+    span.set_attribute.assert_any_call("gen_ai.provider.name", "custom")
+    span.set_attribute.assert_any_call("gen_ai.request.model", "qwen-14b")
+    span.set_attribute.assert_any_call("gen_ai.usage.input_tokens", 11)
+    span.set_attribute.assert_any_call("gen_ai.usage.output_tokens", 7)
+    span.set_attribute.assert_any_call("gen_ai.response.finish_reasons", ["tool_calls"])
+    span.set_attribute.assert_any_call("rca.gen_ai.response.tool_calls_count", 1)
+    assert not any(
+        call.args[0] in {"gen_ai.prompt", "gen_ai.completion"}
+        for call in span.set_attribute.call_args_list
+    )
+
+
+def test_default_llm_endpoint_is_openai_compatible():
+    assert (
+        llm_client._resolve_api_style(
+            "http://localhost:8001/v1/chat/completions", None
+        )
+        == "openai"
+    )
 
 
 def test_llm_health_uses_root_of_openai_endpoint(monkeypatch):

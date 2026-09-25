@@ -11,7 +11,9 @@ import statistics
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from .mcp_client import MCPToolClient
+from experiment.platform.backend.plugins.mcp_client import MCPToolClient
+
+SERVICE_LABEL_KEYS = ("destination_workload", "name", "service", "source_workload")
 
 
 def _parse_iso(value: str) -> float:
@@ -39,11 +41,14 @@ class MCPPrometheusMetricsPlugin:
         if not config.get("mcp_sse_url"):
             raise ValueError("observability.metrics.mcp_sse_url is required")
 
-    def _client(self, config: Dict[str, Any]) -> MCPToolClient:
+    def client(self, config: Dict[str, Any]) -> MCPToolClient:
         return MCPToolClient(
             sse_url=str(config["mcp_sse_url"]),
             timeout_seconds=int(config.get("timeout_seconds", 10)),
         )
+
+    def _client(self, config: Dict[str, Any]) -> MCPToolClient:
+        return self.client(config)
 
     def collect_window(
         self,
@@ -252,11 +257,14 @@ class MCPPrometheusMetricsPlugin:
 
             for ts, val, labels in self._iter_points(payload):
                 # Pick the discriminating label: prefer 'name' (RED metrics)
-                # then 'pod' (container/saturation). If neither, skip — the
-                # metric is already a single global series with nothing to
-                # localise.
-                if "name" in labels and labels["name"]:
-                    key = str(labels["name"])
+                # or Istio workload labels, then 'pod' (container/saturation).
+                # If neither, skip — the metric is already a single global
+                # series with nothing to localise.
+                service_label = next((k for k in SERVICE_LABEL_KEYS if labels.get(k)), None)
+                if service_label:
+                    key = str(labels[service_label])
+                    if key == "unknown":
+                        continue
                     label_kind = "service"
                 elif "pod" in labels and labels["pod"]:
                     key = self._pod_to_service(str(labels["pod"]))

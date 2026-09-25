@@ -1,37 +1,18 @@
 {
   "schema_version": "1.0",
-  "total_runs": 205,
-  "graphs_built": 192,
-  "excluded": {
-    "status_running": 4,
-    "status_failed": 9
-  },
+  "total_runs": 57,
+  "graphs_built": 57,
+  "excluded": {},
   "cells": {
-    "container-kill × orders [train]": 5,
-    "container-kill × user [test]": 5,
-    "cpu-hog × front-end [train]": 9,
-    "cpu-hog × orders [train]": 12,
-    "cpu-hog × payment [train]": 9,
-    "cpu-hog × queue-master [test]": 8,
-    "cpu-hog × user [test]": 8,
-    "http-status-code × orders [test]": 5,
-    "http-status-code × user [train]": 5,
-    "memory-hog × catalogue [train]": 14,
-    "memory-hog × orders [test]": 8,
-    "memory-hog × payment [train]": 9,
-    "memory-hog × queue-master [train]": 9,
-    "memory-hog × user [test]": 10,
-    "network-latency × catalogue [train]": 5,
-    "network-latency × payment [test]": 10,
-    "network-loss × carts [train]": 5,
-    "network-loss × shipping [test]": 6,
-    "pod-delete × carts [train]": 14,
-    "pod-delete × front-end [test]": 8,
-    "pod-delete × shipping [test]": 10,
-    "pod-delete × shipping [train]": 9,
-    "pod-delete × user [train]": 9
+    "container-kill [train]": 12,
+    "cpu-hog [train]": 11,
+    "memory-hog [train]": 8,
+    "network-latency [train]": 18,
+    "network-loss [train]": 4,
+    "pod-delete [train]": 4
   },
   "edge_source_counts": {
-    "static": 192
+    "full": 54,
+    "static": 3
   }
 }

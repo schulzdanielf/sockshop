@@ -1,0 +1,219 @@
+{
+  "dashboard": {
+    "id": 2,
+    "uid": "efn9kkk3lr7k0b",
+    "title": "LLM",
+    "tags": ["llm", "genai", "qwen"],
+    "timezone": "browser",
+    "schemaVersion": 39,
+    "version": 6,
+    "editable": true,
+    "refresh": "30s",
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    },
+    "graphTooltip": 1,
+    "annotations": {
+      "list": [
+        {
+          "builtIn": 1,
+          "datasource": {
+            "type": "grafana",
+            "uid": "-- Grafana --"
+          },
+          "enable": true,
+          "hide": true,
+          "iconColor": "rgba(0, 211, 255, 1)",
+          "name": "Annotations & Alerts",
+          "type": "dashboard"
+        }
+      ]
+    },
+    "templating": {
+      "list": []
+    },
+    "panels": [
+      {
+        "id": 1,
+        "type": "timeseries",
+        "title": "Instrumented requests / second",
+        "description": "Series are split by job: llm-qwen14b is model execution; rca-platform is client-side instrumentation. Do not sum the two jobs as unique requests.",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (job) (rate(gen_ai_client_operation_duration_seconds_count{gen_ai_system=\"qwen\"}[$__rate_interval]))",
+            "legendFormat": "{{job}}",
+            "range": true,
+            "instant": false
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps",
+            "decimals": 3,
+            "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false, "stacking": {"mode": "none", "group": "A"}}
+          },
+          "overrides": []
+        },
+        "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      },
+      {
+        "id": 2,
+        "type": "timeseries",
+        "title": "Mean request latency",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (job) (rate(gen_ai_client_operation_duration_seconds_sum{gen_ai_system=\"qwen\"}[$__rate_interval])) / sum by (job) (rate(gen_ai_client_operation_duration_seconds_count{gen_ai_system=\"qwen\"}[$__rate_interval]))",
+            "legendFormat": "{{job}}",
+            "range": true,
+            "instant": false
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "s", "decimals": 2, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false, "stacking": {"mode": "none", "group": "A"}}},
+          "overrides": []
+        },
+        "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      },
+      {
+        "id": 3,
+        "type": "timeseries",
+        "title": "P95 request latency",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "histogram_quantile(0.95, sum by (le, job) (rate(gen_ai_client_operation_duration_seconds_bucket{gen_ai_system=\"qwen\"}[$__rate_interval])))",
+            "legendFormat": "{{job}}",
+            "range": true,
+            "instant": false
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "s", "decimals": 2, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": false, "stacking": {"mode": "none", "group": "A"}}},
+          "overrides": []
+        },
+        "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      },
+      {
+        "id": 4,
+        "type": "stat",
+        "title": "Requests in selected range",
+        "description": "Cumulative histogram counts over the dashboard time range, split by instrumentation job.",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "gridPos": {"h": 7, "w": 8, "x": 0, "y": 8},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (job) (increase(gen_ai_client_operation_duration_seconds_count{gen_ai_system=\"qwen\"}[$__range]))",
+            "legendFormat": "{{job}}",
+            "instant": true,
+            "range": false
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "color": {"mode": "palette-classic"}}, "overrides": []},
+        "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "value_and_name", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"}
+      },
+      {
+        "id": 5,
+        "type": "timeseries",
+        "title": "Input tokens / second",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (job) (rate(gen_ai_client_token_usage_sum{gen_ai_system=\"qwen\",gen_ai_token_type=\"input\"}[$__rate_interval]))",
+            "legendFormat": "{{job}}",
+            "range": true,
+            "instant": false
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "short", "decimals": 1, "custom": {"axisLabel": "tokens/s", "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "stacking": {"mode": "none", "group": "A"}}}, "overrides": []},
+        "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      },
+      {
+        "id": 6,
+        "type": "timeseries",
+        "title": "Output tokens / second",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (job) (rate(gen_ai_client_token_usage_sum{gen_ai_system=\"qwen\",gen_ai_token_type=\"output\"}[$__rate_interval]))",
+            "legendFormat": "{{job}}",
+            "range": true,
+            "instant": false
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "short", "decimals": 1, "custom": {"axisLabel": "tokens/s", "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "stacking": {"mode": "none", "group": "A"}}}, "overrides": []},
+        "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      },
+      {
+        "id": 7,
+        "type": "timeseries",
+        "title": "Average tokens per request",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "(sum by (job, gen_ai_token_type) (rate(gen_ai_client_token_usage_sum{gen_ai_system=\"qwen\"}[$__rate_interval])) / on (job, gen_ai_token_type) sum by (job, gen_ai_token_type) (rate(gen_ai_client_token_usage_count{gen_ai_system=\"qwen\"}[$__rate_interval]))) and on (job, gen_ai_token_type) (sum by (job, gen_ai_token_type) (rate(gen_ai_client_token_usage_count{gen_ai_system=\"qwen\"}[$__rate_interval])) > 0)",
+            "legendFormat": "{{job}} / {{gen_ai_token_type}}",
+            "range": true,
+            "instant": false
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "short", "decimals": 1, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "stacking": {"mode": "none", "group": "A"}}}, "overrides": []},
+        "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      },
+      {
+        "id": 8,
+        "type": "timeseries",
+        "title": "Qwen generations by finish reason",
+        "description": "Counts completed and token-limited generations from model logs. A rising length series indicates the output budget is too small.",
+        "datasource": {"type": "loki", "uid": "loki"},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (finish_reason) (count_over_time({service=\"llm-qwen14b\"} | json | event=\"gen_ai.chat\" | regexp \"gen_ai\\\\.response\\\\.finish_reasons.*(?P<finish_reason>stop|length)\" | finish_reason!=\"\" [5m]))",
+            "legendFormat": "{{finish_reason}}",
+            "queryType": "range"
+          }
+        ],
+        "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "stacking": {"mode": "none", "group": "A"}}}, "overrides": []},
+        "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      },
+      {
+        "id": 9,
+        "type": "logs",
+        "title": "Recent Qwen generations (safe metadata)",
+        "description": "Prompt and completion are intentionally excluded from the displayed line.",
+        "datasource": {"type": "loki", "uid": "loki"},
+        "gridPos": {"h": 10, "w": 24, "x": 0, "y": 24},
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "{service=\"llm-qwen14b\"} | json | event=\"gen_ai.chat\" | regexp \"gen_ai\\\\.response\\\\.finish_reasons.*(?P<finish_reason>stop|length)\" | finish_reason!=\"\" | line_format \"model={{.gen_ai_request_model}} finish={{.finish_reason}} input={{.gen_ai_usage_input_tokens}} output={{.gen_ai_usage_output_tokens}} visible={{.rca_llm_visible_output_tokens}} duration={{.gen_ai_client_operation_duration}}s\"",
+            "queryType": "range"
+          }
+        ],
+        "options": {"showTime": true, "showLabels": false, "showCommonLabels": false, "wrapLogMessage": false, "prettifyLogMessage": false, "enableLogDetails": false, "dedupStrategy": "none", "sortOrder": "Descending", "maxLines": 100}
+      }
+    ]
+  },
+  "overwrite": true,
+  "folderId": 0
+}

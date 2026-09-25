@@ -10,10 +10,15 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
 class LitmusChaosPlugin:
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
     def validate(self, config: Dict[str, Any]) -> None:
         if config.get("provider") != "litmus":
             raise ValueError("chaos_profile.provider must be 'litmus'")
@@ -48,6 +53,12 @@ class LitmusChaosPlugin:
                 "chaos_result": config.get("chaos_result"),
                 "manifest_path": manifest_path,
                 "workflow_name": None,
+                "injected_at": self._now(),
+                "apply": {
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                },
             }
 
         # ── Path 2: Litmus UI workflow template (Argo Workflow resubmit) ─────
@@ -63,6 +74,7 @@ class LitmusChaosPlugin:
             "chaos_engine": None,
             "chaos_result": None,
             "manifest_path": None,
+            "injected_at": self._now(),
         }
 
     def _submit_workflow(self, workflow_template: str) -> str:
@@ -151,7 +163,14 @@ class LitmusChaosPlugin:
                 "--ignore-not-found=true",
             ]
             proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-            return {"deleted": proc.returncode == 0, "workflow_name": workflow_name}
+            result = {
+                "deleted": proc.returncode == 0,
+                "workflow_name": workflow_name,
+                "stopped_at": self._now(),
+                "cleanup": {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr},
+            }
+            handle.update(result)
+            return result
 
         # Local manifest mode
         manifest_path = handle.get("manifest_path")
@@ -164,11 +183,15 @@ class LitmusChaosPlugin:
                 "--ignore-not-found=true",
             ]
             proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-            return {
+            result = {
                 "deleted": proc.returncode == 0,
                 "stdout": proc.stdout,
                 "stderr": proc.stderr,
+                "stopped_at": self._now(),
+                "cleanup": {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr},
             }
+            handle.update(result)
+            return result
 
         return {
             "deleted": False,
@@ -291,6 +314,9 @@ class LitmusChaosPlugin:
                     "workflow_template": handle.get("workflow_template"),
                     "workflow_name": handle.get("workflow_name"),
                     "litmus_ui_url": "http://localhost:9091",
+                    "injected_at": handle.get("injected_at"),
+                    "stopped_at": handle.get("stopped_at"),
+                    "cleanup": handle.get("cleanup"),
                 }
             )
         else:
@@ -298,6 +324,11 @@ class LitmusChaosPlugin:
                 {
                     "chaos_engine": handle.get("chaos_engine"),
                     "chaos_result": handle.get("chaos_result"),
+                    "manifest_path": handle.get("manifest_path"),
+                    "injected_at": handle.get("injected_at"),
+                    "stopped_at": handle.get("stopped_at"),
+                    "apply": handle.get("apply"),
+                    "cleanup": handle.get("cleanup"),
                 }
             )
         return base

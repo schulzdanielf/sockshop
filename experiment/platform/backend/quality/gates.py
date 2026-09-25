@@ -300,6 +300,38 @@ def gate_symptom_presence(bundle: RunBundle) -> GateResult:
     )
 
 
+def gate_edge_features_present(bundle: RunBundle) -> GateResult:
+    """Runs com mesh (Istio) devem ter edge features reais (não-neutras).
+
+    Lê o artefato ``gat_graph.json`` e valida que ao menos uma aresta carrega
+    feature não-nula. Sem grafo (runs históricos sem mesh), ``skip``.
+    """
+    gate = "edge_features_present"
+    graph = bundle.load_artifact("gat_graph")
+    if not graph:
+        return _skip(gate, True, "no_gat_graph")
+
+    edges = graph.get("edges") or []
+    if not edges:
+        return _fail(gate, True, "no_edges_in_graph", {})
+
+    with_features = sum(
+        1 for e in edges
+        if isinstance(e, dict) and any(
+            (e.get("features") or {}).get(k) is not None
+            for k in ("req_rate_lr", "latency_lr", "error_lr")
+        )
+    )
+    if with_features == 0:
+        return _fail(
+            gate,
+            True,
+            "all_edges_neutral",
+            {"edge_count": len(edges), "with_features": 0},
+        )
+    return _pass(gate, True, evidence={"edge_count": len(edges), "with_features": with_features})
+
+
 # ── Catálogo (ordem de execução) ────────────────────────────────────────
 GATES: List[Callable[[RunBundle], GateResult]] = [
     gate_collection_completeness,
@@ -307,5 +339,6 @@ GATES: List[Callable[[RunBundle], GateResult]] = [
     gate_label_consistency,
     gate_graph_connectivity,
     gate_feature_sanity,
+    gate_edge_features_present,
     gate_symptom_presence,
 ]
