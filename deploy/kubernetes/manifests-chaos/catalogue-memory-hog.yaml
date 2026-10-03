@@ -72,7 +72,7 @@ spec:
                     - /bin/bash
                     env:
                       - name: TOTAL_CHAOS_DURATION
-                        value: '30'
+                        value: '120'
 
                       - name: CHAOS_INTERVAL
                         value: '10'
@@ -148,7 +148,7 @@ spec:
                             - name: MEMORY_CONSUMPTION
                               value: "60"
                             - name: TOTAL_CHAOS_DURATION
-                              value: "30"
+                              value: "120"
                             - name: CHAOS_KILL_COMMAND
                               value: >-
                                 kill -9 $(ps afx | grep "[dd] if /dev/zero" | awk '{print $1}' |

@@ -36,14 +36,19 @@ experiment_campaign_id: "multi-chaos-eval-v2"
 # `fault_category` is the value the harness writes into experiment metadata
 # as the ground-truth fault label; it must be one of
 # ``allowed_fault_categories`` declared in the sock-shop system card.
+resource_chaos:
+  duration_seconds: 120
+  cpu_load_percentage: 100
+  memory_load_percentage: 70
+
 chaos_types:
   - name: memory-hog
     template_suffix: memory-hog
     short: memhog
     fault_category: memory-exhaustion
     env:
-      memory_consumption_mb: 500        # → MEMORY_CONSUMPTION
-      total_chaos_duration_seconds: 60  # → TOTAL_CHAOS_DURATION
+      memory_consumption_mb: 500        # Bootstrap template default; per-run value comes from the target limit.
+      total_chaos_duration_seconds: 120
       chaos_interval_seconds: 10        # → CHAOS_INTERVAL
 
   - name: cpu-hog
@@ -51,8 +56,9 @@ chaos_types:
     short: cpuhog
     fault_category: cpu-exhaustion
     env:
-      cpu_cores: 1                      # → CPU_CORES
-      total_chaos_duration_seconds: 60  # → TOTAL_CHAOS_DURATION
+      cpu_cores: 0                      # Percentage mode requires CPU_CORES=0.
+      cpu_load_percentage: 100          # → CPU_LOAD
+      total_chaos_duration_seconds: 120
       chaos_interval_seconds: 10        # → CHAOS_INTERVAL
 
   - name: pod-delete
@@ -85,8 +91,8 @@ chaos_types:
     short: netlat
     fault_category: network-latency        # already in sock-shop allowed list
     env:
-      network_latency_ms: 2000             # → NETWORK_LATENCY
-      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+      network_latency_ms: 500               # → NETWORK_LATENCY; keep below the default 1s probe timeout
+      total_chaos_duration_seconds: 120    # → TOTAL_CHAOS_DURATION
 
   - name: network-loss
     template_suffix: network-loss
@@ -94,7 +100,7 @@ chaos_types:
     fault_category: network-loss           # added to sock-shop allowed list
     env:
       network_packet_loss_percentage: 100  # → NETWORK_PACKET_LOSS_PERCENTAGE
-      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+      total_chaos_duration_seconds: 120    # → TOTAL_CHAOS_DURATION
 
   - name: dns-error
     template_suffix: dns-error
@@ -102,7 +108,7 @@ chaos_types:
     fault_category: dns-failure            # added to sock-shop allowed list
     # ❌ NOT in the matrix: dns_interceptor incompatible with WSL2 kernel.
     env:
-      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+      total_chaos_duration_seconds: 120    # → TOTAL_CHAOS_DURATION
 
   - name: io-stress
     template_suffix: io-stress
@@ -120,7 +126,7 @@ chaos_types:
     fault_category: http-error             # added to sock-shop allowed list
     env:
       status_code: 500                     # → STATUS_CODE
-      total_chaos_duration_seconds: 60     # → TOTAL_CHAOS_DURATION
+      total_chaos_duration_seconds: 120    # → TOTAL_CHAOS_DURATION
 
   - name: container-kill
     template_suffix: container-kill
@@ -134,7 +140,7 @@ chaos_types:
 timeline:
   baseline_seconds: 30
   warmup_seconds: 30
-  fault_duration_seconds: 90          # > total_chaos_duration to capture tail
+  fault_duration_seconds: 150         # > 120s chaos duration to capture tail
   post_recovery_observation_seconds: 180
   sampling_interval_seconds: 5
 
@@ -151,11 +157,31 @@ load_profile:
   grace_seconds: 30
 
 # ── SLO thresholds (used by engine for resilient/degraded label) ───────────
+# The `error_rate` query is expressed in PERCENT (0–100), so the threshold
+# must be too: 5.0 == 5 %. The legacy value 0.05 was effectively 0.05 % and
+# flagged any single 5xx as a violation.
+# `*_relative_factor`: effective threshold = max(absolute, factor × run
+# baseline mean) so a service whose baseline P95 already exceeds 800 ms
+# (front-end under 30 users) is not labelled degraded by load alone.
 slo:
-  error_rate_threshold: 0.05
+  error_rate_threshold: 5.0
+  error_rate_relative_factor: 3.0
   latency_p95_threshold_ms: 800
+  latency_p95_relative_factor: 1.5
   recovery_tolerance_pct: 0.20
   max_recovery_seconds: 600
+
+# ── Execution order / controls ──────────────────────────────────────────────
+# shuffle: interleave (service × fault × replica) cells deterministically so
+# cluster drift over a long session is not confounded with one cell.
+# start_jitter_max_seconds: random pause [0, N] before each run so cells do not
+# always start at the same offset from the previous run's recovery.
+# Sham controls (chaos_type: none) are declared as ordinary cells with
+# service "none"; same schedule and load, no injection.
+ordering:
+  shuffle: false
+  seed: 20260930
+  start_jitter_max_seconds: 0
 
 # ── Train / Test split — mixed chaos cells ─────────────────────────────────
 # Each cell is a (service, chaos_type) pair. Train cells seed the RAG corpus;

@@ -426,6 +426,20 @@ class SqliteStorage:
             )
         return rel_path
 
+    def get_artifact(self, run_id: str, name: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT path FROM artifacts WHERE run_id = ? AND name = ? ORDER BY id DESC LIMIT 1",
+                (run_id, name),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            content = json.loads(Path(row["path"]).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return content if isinstance(content, dict) else None
+
     def upsert_chaos_catalog(self, entries: List[Dict[str, Any]]) -> int:
         """Upsert chaos engine entries into the catalog. Returns count upserted."""
         now = utc_now_iso()

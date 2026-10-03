@@ -73,7 +73,7 @@ spec:
                     - /bin/bash
                     env:
                     - name: TOTAL_CHAOS_DURATION
-                      value: '30'
+                      value: '120'
 
                     - name: CHAOS_INTERVAL
                       value: '10'
@@ -149,7 +149,7 @@ spec:
                             - name: SOCKET_PATH
                               value: /var/run/docker.sock
                             - name: TOTAL_CHAOS_DURATION
-                              value: "60"
+                              value: "120"
                             - name: CHAOS_KILL_COMMAND
                               value: >-
                                 kill -9 $(ps afx | grep "[md5sum] /dev/zero" | awk '{print$1}' |

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
@@ -50,7 +51,12 @@ from .engine import (
 )
 from .domain import DomainEvent
 from .analysis.mcp_investigator import investigate_metric_window
-from .agent_console import answer_query, answer_query_mcp
+from .agent_console import (
+    answer_query,
+    answer_query_mcp,
+    answer_run_rca_mcp,
+    rca_reference_phases,
+)
 from .plugins.mcp_client import MCPToolClient
 from .models import (
     ApproveRunRequest,
@@ -73,10 +79,30 @@ from .observability import (
 )
 from .plugins.litmus_plugin import LitmusChaosPlugin
 from .plugins.locust_plugin import LocustLoadPlugin
+from .plugins.mcp_evidence_snapshot_plugin import (
+    MCPRcaEvidenceSnapshotPlugin,
+    SnapshotPreferredMCPClient,
+)
 from .plugins.mcp_metrics_plugin import MCPPrometheusMetricsPlugin
 from .plugins.mcp_traces_plugin import MCPTempoTracesPlugin
 from .security import require_roles
 from .storage.sqlite_storage import SqliteStorage
+
+
+def _select_telemetry_windows(
+    observation_window: dict, scope: str
+) -> tuple[dict, Optional[dict]]:
+    if scope == "run":
+        return observation_window["window"], None
+    if scope != "fault":
+        raise ValueError(f"unsupported telemetry window scope: {scope!r}")
+
+    phases = observation_window.get("phases") or {}
+    fault_window = phases.get("fault")
+    if not isinstance(fault_window, dict) or not fault_window.get("start") or not fault_window.get("end"):
+        raise ValueError("telemetry chat requires a fault phase window")
+    baseline_window = phases.get("baseline")
+    return fault_window, baseline_window if isinstance(baseline_window, dict) else None
 
 
 def create_app() -> FastAPI:
@@ -99,6 +125,7 @@ def create_app() -> FastAPI:
         traces=MCPTempoTracesPlugin(),
         notifier=NoopNotificationAdapter(),
         kill_switch_path=kill_switch_path,
+        evidence_snapshot=MCPRcaEvidenceSnapshotPlugin(),
     )
 
     app = FastAPI(title="Chaos Platform", version="1.0.0")
@@ -366,6 +393,12 @@ def create_app() -> FastAPI:
     def telemetry_chat(run_id: str, req: TelemetryChatRequest) -> dict:
         window = get_observation_window(run_id)
         try:
+            query_window, baseline_window = _select_telemetry_windows(
+                window, req.window_scope
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
             run = storage.get_run(run_id)
             experiment = storage.get_experiment(
                 run.experiment_id, run.experiment_version
@@ -397,14 +430,17 @@ def create_app() -> FastAPI:
                 span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
             span.set_attribute("rca.run_id", run_id)
             span.set_attribute("rca.experiment_id", run.experiment_id)
-            span.set_attribute("rca.observation_window.start", window["window"]["start"])
-            span.set_attribute("rca.observation_window.end", window["window"]["end"])
+            span.set_attribute("rca.observation_window.start", query_window["start"])
+            span.set_attribute("rca.observation_window.end", query_window["end"])
+            span.set_attribute("rca.observation_window.scope", req.window_scope)
+            span.set_attribute("rca.run_window.start", window["window"]["start"])
+            span.set_attribute("rca.run_window.end", window["window"]["end"])
             span.set_attribute("rca.agent.use_model", req.use_model)
             span.set_attribute("rca.agent.max_steps", req.max_steps)
             try:
                 chat_context = {
-                    "start": window["window"]["start"],
-                    "end": window["window"]["end"],
+                    "start": query_window["start"],
+                    "end": query_window["end"],
                     "namespace": str(
                         experiment.spec.get("scope", {}).get("namespace", "sock-shop")
                     ),
@@ -414,6 +450,12 @@ def create_app() -> FastAPI:
                         req.query,
                         mcp_client=mcp_client,
                         **chat_context,
+                        baseline_start=(
+                            baseline_window.get("start") if baseline_window else None
+                        ),
+                        baseline_end=(
+                            baseline_window.get("end") if baseline_window else None
+                        ),
                         max_steps=req.max_steps,
                         max_new_tokens=req.max_new_tokens,
                     )
@@ -435,7 +477,9 @@ def create_app() -> FastAPI:
                     answer = answer_query(
                         req.query,
                         prometheus=_MCPPrometheusAdapter(),
-                        **chat_context,
+                        start=chat_context["start"],
+                        end=chat_context["end"],
+                        namespace=chat_context["namespace"],
                         use_model=False,
                         max_steps=req.max_steps,
                         max_new_tokens=req.max_new_tokens,
@@ -454,19 +498,143 @@ def create_app() -> FastAPI:
             DomainEvent(
                 run_id=run_id,
                 event_type="telemetry_chat_completed",
-                ts=window["window"]["end"],
+                ts=query_window["end"],
                 payload={
                     "query_chars": len(req.query),
                     "answer_chars": len(answer),
                     "use_model": req.use_model,
+                    "window": query_window,
+                    "run_window": window["window"],
+                    "baseline_window": baseline_window,
+                    "window_scope": req.window_scope,
+                },
+            )
+        )
+        return {
+            "run_id": run_id,
+            "window": query_window,
+            "run_window": window["window"],
+            "baseline_window": baseline_window,
+            "window_scope": req.window_scope,
+            "phases": window.get("phases", {}),
+            "phase_sources": window.get("phase_sources", {}),
+            "configured_chaos_duration_seconds": (
+                (experiment.spec.get("chaos_profile") or {}).get(
+                    "fault_duration_seconds"
+                )
+            ),
+            "fault_injection_duration_seconds": run.timings.get(
+                "fault_injection_duration_seconds"
+            ),
+            "answer": answer,
+            "used_mcp": True,
+        }
+
+    @app.post("/api/runs/{run_id}/rca")
+    def run_rca(run_id: str) -> dict:
+        window = get_observation_window(run_id)
+        phases = window.get("phases") or {}
+        if "baseline" not in phases or "fault" not in phases:
+            raise HTTPException(
+                status_code=409,
+                detail="RCA requires baseline and fault phase windows",
+            )
+        try:
+            run = storage.get_run(run_id)
+            experiment = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        metrics_config = (
+            experiment.spec.get("observability", {}).get("metrics", {}) or {}
+        )
+        traces_config = (
+            experiment.spec.get("observability", {}).get("traces", {}) or {}
+        )
+        mcp_url = metrics_config.get("mcp_sse_url") or traces_config.get("mcp_sse_url")
+        if not mcp_url:
+            raise HTTPException(
+                status_code=409,
+                detail="experiment has no MCP observability endpoint configured",
+            )
+
+        timeout_seconds = max(
+            int(metrics_config.get("timeout_seconds", 10)),
+            int(traces_config.get("timeout_seconds", 20)),
+        )
+        mcp_client = MCPToolClient(str(mcp_url), timeout_seconds)
+        try:
+            snapshot = storage.get_artifact(run_id, "rca_evidence_snapshot")
+        except (OSError, sqlite3.Error):
+            snapshot = None
+        if isinstance(snapshot, dict):
+            mcp_client = SnapshotPreferredMCPClient(mcp_client, snapshot)
+        namespace = str(
+            experiment.spec.get("scope", {}).get("namespace", "sock-shop")
+        )
+        tracer = get_tracer()
+        with tracer.start_as_current_span("agent.run_rca") as span:
+            span.set_attribute(GenAI.OPERATION_NAME, "invoke_agent")
+            span.set_attribute(GenAI.AGENT_NAME, "run-rca")
+            span.set_attribute(GenAI.PROVIDER_NAME, "custom")
+            span.set_attribute(GenAI.SYSTEM, "qwen")
+            span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
+            span.set_attribute("rca.run_id", run_id)
+            span.set_attribute("rca.experiment_id", run.experiment_id)
+            span.set_attribute("rca.agent.max_tool_calls", 10)
+            rca_phases, reference_source = rca_reference_phases(phases)
+            span.set_attribute("rca.reference_source", reference_source)
+            try:
+                result = answer_run_rca_mcp(
+                    mcp_client=mcp_client,
+                    phases=rca_phases,
+                    namespace=namespace,
+                    max_iterations=10,
+                )
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            trace = {
+                "run_id": run_id,
+                "window": window,
+                "rca_phases": rca_phases,
+                "reference_source": reference_source,
+                "namespace": namespace,
+                **result,
+            }
+            artifact_path = storage.save_artifact(run_id, "rca_investigation", trace)
+            tool_names = [call["tool"] for call in result["calls"]]
+            span.set_attribute("rca.agent.iterations", result["iterations"])
+            span.set_attribute("rca.agent.tool_calls", len(result["calls"]))
+            span.set_attribute("rca.agent.stop_reason", result["stop_reason"])
+            span.set_attribute("rca.agent.answer_chars", len(result["answer"]))
+
+        storage.append_event(
+            DomainEvent(
+                run_id=run_id,
+                event_type="rca_investigation_completed",
+                ts=window["window"]["end"],
+                payload={
+                    "tools": tool_names,
+                    "iterations": result["iterations"],
+                    "stop_reason": result["stop_reason"],
                     "window": window["window"],
+                    "artifact_path": artifact_path,
                 },
             )
         )
         return {
             "run_id": run_id,
             "window": window["window"],
-            "answer": answer,
+            "answer": result["answer"],
+            "tools_used": tool_names,
+            "iterations": result["iterations"],
+            "stop_reason": result["stop_reason"],
+            "artifact_path": artifact_path,
             "used_mcp": True,
         }
 

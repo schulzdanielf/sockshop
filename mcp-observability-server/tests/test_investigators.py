@@ -140,6 +140,120 @@ def test_check_pod_restarts_ignores_duplicate_scrape_and_counts_window_deltas():
     assert rows["orders"] == 5
 
 
+def test_check_pod_restarts_reports_container_increment_interval_not_exact_time():
+    prom = _FakePrometheus(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {
+                            "pod": "user-abcde-12345",
+                            "container": "user",
+                            "job": "kube-state-metrics",
+                        },
+                        "values": [[1760000000, "3"], [1760000015, "4"]],
+                    }
+                ]
+            }
+        }
+    )
+
+    result = inv.check_pod_restarts(
+        prom, start="2025-10-09T08:53:20Z", end="2025-10-09T08:53:35Z"
+    )
+    pod = result["top"][0]["pods"][0]
+
+    assert pod["container"] == "user"
+    assert pod["restart_observations"] == [
+        {
+            "observed_from": "2025-10-09T08:53:20Z",
+            "observed_to": "2025-10-09T08:53:35Z",
+            "restart_count_delta": 1.0,
+            "counter_reset": False,
+            "timestamp_precision": "between_scrapes",
+        }
+    ]
+
+
+def test_check_pod_restarts_keeps_containers_separate_and_marks_counter_reset():
+    duplicate_app_series = {
+        "metric": {
+            "pod": "user-abcde-12345",
+            "container": "user",
+            "job": "kube-state-metrics",
+        },
+        "values": [[1760000000, "0"], [1760000015, "2"]],
+    }
+    prom = _FakePrometheus(
+        {
+            "data": {
+                "result": [
+                    duplicate_app_series,
+                    {**duplicate_app_series, "metric": dict(duplicate_app_series["metric"])},
+                    {
+                        "metric": {
+                            "pod": "user-abcde-12345",
+                            "container": "istio-proxy",
+                            "job": "kube-state-metrics",
+                        },
+                        "values": [[1760000000, "5"], [1760000015, "1"]],
+                    },
+                ]
+            }
+        }
+    )
+
+    result = inv.check_pod_restarts(
+        prom, start="2025-10-09T08:53:20Z", end="2025-10-09T08:53:35Z"
+    )
+    service = result["top"][0]
+    pods = {pod["container"]: pod for pod in service["pods"]}
+
+    assert service["restarts_in_window"] == 3
+    assert pods["user"]["value"] == 2
+    assert pods["user"]["restart_observations"][0]["restart_count_delta"] == 2
+    assert pods["istio-proxy"]["value"] == 1
+    assert pods["istio-proxy"]["restart_observations"][0]["counter_reset"] is True
+
+
+def test_check_service_readiness_reports_only_observed_transitions():
+    class _ReadinessPrometheus:
+        def query_range(self, _query, start, _end, _step):
+            values = [[1760000000, "1"], [1760000015, "0"], [1760000030, "0"]]
+            if start == "baseline":
+                values = [[1760000000, "0"], [1760000015, "0"]]
+            return {
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"pod": "user-abcde-12345"},
+                            "values": values,
+                        }
+                    ]
+                }
+            }
+
+    result = inv.check_service_readiness(
+        _ReadinessPrometheus(),
+        baseline_start="baseline",
+        baseline_end="baseline-end",
+        fault_start="fault",
+        fault_end="fault-end",
+    )
+    baseline_pod = result["phases"]["baseline"]["services"][0]["pods"][0]
+    fault_pod = result["phases"]["fault"]["services"][0]["pods"][0]
+
+    assert baseline_pod["transitions"] == []
+    assert fault_pod["transitions"] == [
+        {
+            "transition": "ready_to_not_ready",
+            "observed_from": "2025-10-09T08:53:20Z",
+            "observed_to": "2025-10-09T08:53:35Z",
+            "timestamp_precision": "between_scrapes",
+        }
+    ]
+
+
 def test_check_pod_restarts_keeps_zero_count_service_after_top_five():
     services = ["carts", "catalogue", "front-end", "orders", "payment"]
     results = [
@@ -173,6 +287,25 @@ def test_check_pod_restarts_keeps_zero_count_service_after_top_five():
 
     rabbitmq = next(row for row in out["top"] if row["service"] == "rabbitmq")
     assert rabbitmq["restarts_in_window"] == 0
+
+
+@pytest.mark.parametrize(
+    "payload,expected_status",
+    [
+        ({"data": {"result": []}}, "no_data"),
+        ({"status": "error", "error": "backend unavailable"}, "tool_error"),
+    ],
+)
+def test_oom_and_restart_tools_report_coverage_state(payload, expected_status):
+    for investigator in (inv.check_oom_kills, inv.check_pod_restarts):
+        result = investigator(
+            _FakePrometheus(payload),
+            start="2026-01-01T00:00:00Z",
+            end="2026-01-01T00:05:00Z",
+        )
+
+        assert result["status"] == expected_status
+        assert result["coverage"] == {"series_count": 0, "sample_count": 0}
 
 
 def test_aggregate_gauge_uses_max():
@@ -372,3 +505,148 @@ def test_service_level_series_top_handles_prometheus_error():
 
     assert out["found"] is False
     assert out["error"] == "boom"
+
+
+def test_get_run_golden_signals_compares_baseline_and_fault_with_coverage():
+    class _PhasePrometheus:
+        def __init__(self):
+            self.calls = []
+
+        def query_range(self, query, start, end, step):
+            self.calls.append((query, start, end, step))
+            value = "10" if start == "2026-01-01T00:00:00Z" else "20"
+            return {
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"destination_workload": "orders"},
+                            "values": [[1.0, value], [2.0, value]],
+                        }
+                    ]
+                }
+            }
+
+    prom = _PhasePrometheus()
+    out = inv.get_run_golden_signals(
+        prom,
+        baseline_start="2026-01-01T00:00:00Z",
+        baseline_end="2026-01-01T00:01:00Z",
+        fault_start="2026-01-01T00:02:00Z",
+        fault_end="2026-01-01T00:03:00Z",
+    )
+
+    assert len(prom.calls) == 10
+    assert {(call[1], call[2]) for call in prom.calls} == {
+        ("2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z"),
+        ("2026-01-01T00:02:00Z", "2026-01-01T00:03:00Z"),
+    }
+    assert out["status"] == "ok"
+    row = out["metrics"]["request_rate"]["top"][0]
+    assert row["service"] == "orders"
+    assert row["baseline_mean"] == 10.0
+    assert row["fault_mean"] == 20.0
+    assert row["delta_abs"] == 10.0
+    assert out["metrics"]["request_rate"]["phases"]["fault"]["sample_count"] == 2
+    assert out["metrics"]["cpu_saturation_pct"]["signal_detected"] is True
+
+
+def test_check_network_packet_drops_compares_service_rates_and_coverage():
+    class _PacketPrometheus:
+        def __init__(self):
+            self.calls = []
+
+        def query_range(self, query, start, end, step):
+            self.calls.append({"query": query, "start": start, "end": end, "step": step})
+            baseline = start == "2026-01-01T00:00:00Z"
+            is_receive = "receive_packets_dropped" in query
+            value = "0" if baseline or not is_receive else "0.5"
+            return {
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"interface": "eth0"},
+                            "values": [[1.0, value], [2.0, value]],
+                        }
+                    ]
+                }
+            }
+
+    prom = _PacketPrometheus()
+    out = inv.check_network_packet_drops(
+        prom,
+        baseline_start="2026-01-01T00:00:00Z",
+        baseline_end="2026-01-01T00:01:00Z",
+        fault_start="2026-01-01T00:02:00Z",
+        fault_end="2026-01-01T00:03:00Z",
+    )
+
+    assert len(prom.calls) == 4
+    assert all('job="kubernetes-cadvisor"' in call["query"] for call in prom.calls)
+    assert all("sum by (interface)" in call["query"] for call in prom.calls)
+    assert all(call["step"] == "15s" for call in prom.calls)
+    assert out["status"] == "ok"
+    assert out["found"] is True
+    receive = out["metrics"]["network_receive_dropped_rate"]
+    assert receive["signal_detected"] is True
+    assert receive["top"][0]["interface"] == "eth0"
+    assert receive["top"][0]["delta_abs"] == 0.5
+    assert out["metrics"]["network_transmit_dropped_rate"]["signal_detected"] is False
+
+
+def test_get_run_golden_signals_distinguishes_no_data_from_tool_error():
+    prom = _FakePrometheus({"data": {"result": []}})
+    out = inv.get_run_golden_signals(
+        prom,
+        baseline_start="2026-01-01T00:00:00Z",
+        baseline_end="2026-01-01T00:01:00Z",
+        fault_start="2026-01-01T00:02:00Z",
+        fault_end="2026-01-01T00:03:00Z",
+    )
+
+    assert out["status"] == "no_data"
+    assert all(metric["status"] == "no_data" for metric in out["metrics"].values())
+
+
+def test_check_service_readiness_compares_per_service_across_phases():
+    class _ReadinessPrometheus:
+        def __init__(self):
+            self.calls = []
+
+        def query_range(self, query, start, end, step):
+            self.calls.append((query, start, end, step))
+            user_ready = "0" if start == "fault" else "1"
+            return {
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"pod": "user-abcde-12345"},
+                            "values": [[1.0, user_ready], [2.0, user_ready]],
+                        },
+                        {
+                            "metric": {"pod": "catalogue-fghij-67890"},
+                            "values": [[1.0, "1"], [2.0, "1"]],
+                        },
+                    ]
+                }
+            }
+
+    prom = _ReadinessPrometheus()
+    out = inv.check_service_readiness(
+        prom,
+        baseline_start="baseline",
+        baseline_end="baseline-end",
+        fault_start="fault",
+        fault_end="fault-end",
+        post_start="post",
+        post_end="post-end",
+    )
+
+    assert len(prom.calls) == 3
+    assert all('condition="true"' in call[0] for call in prom.calls)
+    assert all('job="kube-state-metrics"' in call[0] for call in prom.calls)
+    assert out["status"] == "ok"
+    fault_services = {
+        row["service"]: row for row in out["phases"]["fault"]["services"]
+    }
+    assert fault_services["user"]["ready_mean_pct"] == 0.0
+    assert fault_services["catalogue"]["ready_mean_pct"] == 100.0

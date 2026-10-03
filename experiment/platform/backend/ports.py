@@ -100,6 +100,18 @@ class TraceProviderPort(Protocol):
         ...
 
 
+class RcaEvidenceSnapshotPort(Protocol):
+    def capture(
+        self,
+        context: Dict[str, Any],
+        observability_config: Dict[str, Any],
+        namespace: str,
+        observation_window: Dict[str, Any],
+        capture_config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        ...
+
+
 class StoragePort(Protocol):
     def create_experiment(
         self, created_by: str, spec: Dict[str, Any]
@@ -135,6 +147,9 @@ class StoragePort(Protocol):
         ...
 
     def save_artifact(self, run_id: str, name: str, content: Dict[str, Any]) -> str:
+        ...
+
+    def get_artifact(self, run_id: str, name: str) -> Optional[Dict[str, Any]]:
         ...
 
 

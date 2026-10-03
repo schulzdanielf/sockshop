@@ -61,7 +61,7 @@ def _render_memory_hog(service: str, env: Dict[str, Any]) -> str:
     src = (CHAOS_MANIFEST_DIR / "catalogue-memory-hog.yaml").read_text(encoding="utf-8")
     text = _strip_probe_ref(src)
     mem_mb = int(env.get("memory_consumption_mb", 60))
-    duration_s = int(env.get("total_chaos_duration_seconds", 30))
+    duration_s = int(env.get("total_chaos_duration_seconds", 120))
     text = _replace_in_order(
         text,
         [
@@ -81,7 +81,7 @@ def _render_memory_hog(service: str, env: Dict[str, Any]) -> str:
                 f'- name: MEMORY_CONSUMPTION\n                              value: "{mem_mb}"',
             ),
             (
-                '- name: TOTAL_CHAOS_DURATION\n                              value: "30"',
+                '- name: TOTAL_CHAOS_DURATION\n                              value: "120"',
                 f'- name: TOTAL_CHAOS_DURATION\n                              value: "{duration_s}"',
             ),
         ],
@@ -93,7 +93,7 @@ def _render_cpu_hog(service: str, env: Dict[str, Any]) -> str:
     src = (CHAOS_MANIFEST_DIR / "catalogue-cpu-hog.yaml").read_text(encoding="utf-8")
     text = _strip_probe_ref(src)
     cpu_cores = int(env.get("cpu_cores", 1))
-    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    duration_s = int(env.get("total_chaos_duration_seconds", 120))
     text = _replace_in_order(
         text,
         [
@@ -111,7 +111,13 @@ def _render_cpu_hog(service: str, env: Dict[str, Any]) -> str:
                 f'- name: CPU_CORES\n                              value: "{cpu_cores}"',
             ),
             (
-                '- name: TOTAL_CHAOS_DURATION\n                              value: "60"',
+              '- name: CPU_CORES\n                              value: "0"',
+              '- name: CPU_CORES\n                              value: "0"\n'
+              '                            - name: CPU_LOAD\n'
+              f'                              value: "{int(env.get("cpu_load_percentage", 100))}"',
+            ),
+            (
+                '- name: TOTAL_CHAOS_DURATION\n                              value: "120"',
                 f'- name: TOTAL_CHAOS_DURATION\n                              value: "{duration_s}"',
             ),
         ],
@@ -332,38 +338,38 @@ def _render_from_baseline(
 
 
 def _render_network_latency(service: str, env: Dict[str, Any]) -> str:
-    latency_ms = int(env.get("network_latency_ms", 2000))
-    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    latency_ms = int(env.get("network_latency_ms", 500))
+    duration_s = int(env.get("total_chaos_duration_seconds", 120))
     return _render_from_baseline(
         "catalogue-network-latency.yaml",
         service,
         [
             ('value: "2000"', f'value: "{latency_ms}"'),
-            ('value: "60"', f'value: "{duration_s}"'),
+            ('value: "120"', f'value: "{duration_s}"'),
         ],
     )
 
 
 def _render_network_loss(service: str, env: Dict[str, Any]) -> str:
     loss_pct = int(env.get("network_packet_loss_percentage", 100))
-    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    duration_s = int(env.get("total_chaos_duration_seconds", 120))
     return _render_from_baseline(
         "catalogue-network-loss.yaml",
         service,
         [
             ('value: "100"', f'value: "{loss_pct}"'),
-            ('value: "60"', f'value: "{duration_s}"'),
+            ('value: "120"', f'value: "{duration_s}"'),
         ],
     )
 
 
 def _render_dns_error(service: str, env: Dict[str, Any]) -> str:
-    duration_s = int(env.get("total_chaos_duration_seconds", 60))
+    duration_s = int(env.get("total_chaos_duration_seconds", 120))
     return _render_from_baseline(
         "catalogue-dns-error.yaml",
         service,
         [
-            ('value: "60"', f'value: "{duration_s}"'),
+            ('value: "120"', f'value: "{duration_s}"'),
         ],
     )
 
@@ -455,6 +461,8 @@ def _collect_cells(cfg: Dict[str, Any]) -> List[tuple[str, str]]:
     pairs: set[tuple[str, str]] = set()
     for key in ("train_experiments", "test_experiments"):
         for cell in cfg.get(key, []) or []:
+            if cell["chaos_type"] == "none":
+                continue
             pairs.add((cell["service"], cell["chaos_type"]))
     return sorted(pairs)
 
@@ -462,7 +470,24 @@ def _collect_cells(cfg: Dict[str, Any]) -> List[tuple[str, str]]:
 def _chaos_env(cfg: Dict[str, Any], chaos_type: str) -> Dict[str, Any]:
     for entry in cfg.get("chaos_types", []) or []:
         if entry.get("name") == chaos_type:
-            return entry.get("env") or {}
+            env = dict(entry.get("env") or {})
+            if chaos_type in {"cpu-hog", "memory-hog"}:
+                resource_cfg = cfg.get("resource_chaos", {})
+                env["total_chaos_duration_seconds"] = int(
+                    resource_cfg.get(
+                        "duration_seconds",
+                        env.get("total_chaos_duration_seconds", 120),
+                    )
+                )
+                if chaos_type == "cpu-hog":
+                    env["cpu_cores"] = 0
+                    env["cpu_load_percentage"] = int(
+                        resource_cfg.get(
+                            "cpu_load_percentage",
+                            env.get("cpu_load_percentage", 100),
+                        )
+                    )
+            return env
     raise KeyError(f"chaos_type {chaos_type!r} not declared in config.chaos_types")
 
 

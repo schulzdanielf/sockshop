@@ -1,5 +1,6 @@
 from experiment.platform.backend.engine import _build_observation_window
 from experiment.platform.backend.engine import _build_partial_observation_window
+from experiment.platform.backend.engine import _resolve_fault_window
 from experiment.platform.backend.domain import DomainEvent
 
 
@@ -14,11 +15,12 @@ TIMINGS = {
 
 
 def test_observation_window_contains_run_and_phase_bounds():
+    timings = dict(TIMINGS, fault_window_source="manifest_observed")
     result = _build_observation_window(
         run_id="run-abc123",
         experiment_id="memory-hog",
         status="completed",
-        timings=TIMINGS,
+        timings=timings,
         sampling_interval_seconds=15,
     )
 
@@ -30,6 +32,7 @@ def test_observation_window_contains_run_and_phase_bounds():
         "start": TIMINGS["t_fault_start"],
         "end": TIMINGS["t_fault_end"],
     }
+    assert result["phase_sources"]["fault"] == "manifest_observed"
     assert result["sampling_interval_seconds"] == 15
 
 
@@ -49,6 +52,84 @@ def test_observation_window_rejects_missing_global_bounds():
         assert str(exc) == "observation window requires start and end timestamps"
     else:
         raise AssertionError("missing window end must be rejected")
+
+
+def test_fault_window_uses_litmus_injection_start_and_configured_duration():
+    result = _resolve_fault_window(
+        "2026-09-25T10:02:00+00:00",
+        "2026-09-25T10:04:30+00:00",
+        {
+            "mode": "argo_workflow",
+            "final_status": {
+                "chaos_started_at": "2026-09-25T10:02:37+00:00",
+                "chaos_window_confirmed": True,
+            },
+        },
+        60,
+    )
+
+    assert result == (
+        "2026-09-25T10:02:37+00:00",
+        "2026-09-25T10:03:37+00:00",
+        "litmus_result_created_at_plus_configured_duration",
+    )
+
+
+def test_fault_window_uses_manifest_apply_and_cleanup_timestamps():
+    result = _resolve_fault_window(
+        "2026-09-25T10:02:00+00:00",
+        "2026-09-25T10:04:30+00:00",
+        {
+            "mode": "manifest",
+            "injected_at": "2026-09-25T10:02:04+00:00",
+            "stopped_at": "2026-09-25T10:03:04+00:00",
+        },
+        60,
+    )
+
+    assert result == (
+        "2026-09-25T10:02:04+00:00",
+        "2026-09-25T10:03:04+00:00",
+        "manifest_observed",
+    )
+
+
+def test_fault_window_falls_back_when_actual_timestamps_are_unavailable():
+    result = _resolve_fault_window(
+        "2026-09-25T10:02:00+00:00",
+        "2026-09-25T10:04:30+00:00",
+        {"mode": "argo_workflow", "final_status": {"workflow_phase": "Succeeded"}},
+        60,
+    )
+
+    assert result == (
+        "2026-09-25T10:02:00+00:00",
+        "2026-09-25T10:04:30+00:00",
+        "planned_phase_fallback",
+    )
+
+
+def test_fault_window_does_not_treat_failed_litmus_creation_as_injection_start():
+    result = _resolve_fault_window(
+        "2026-09-25T10:02:00+00:00",
+        "2026-09-25T10:04:30+00:00",
+        {
+            "mode": "argo_workflow",
+            "final_status": {
+                "chaos_started_at": None,
+                "chaos_result_created_at": "2026-09-25T10:02:37Z",
+                "chaos_phase": "Error",
+                "chaos_window_confirmed": False,
+            },
+        },
+        60,
+    )
+
+    assert result == (
+        "2026-09-25T10:02:00+00:00",
+        "2026-09-25T10:04:30+00:00",
+        "planned_phase_fallback",
+    )
 
 
 def test_partial_observation_window_uses_events_and_marks_missing_phases():

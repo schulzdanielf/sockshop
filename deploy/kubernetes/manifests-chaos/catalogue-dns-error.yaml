@@ -81,7 +81,7 @@ spec:
                     - name: DEFAULT_HEALTH_CHECK
                       value: 'false'
                     - name: TOTAL_CHAOS_DURATION
-                      value: '60'
+                      value: '120'
                     - name: RAMP_TIME
                       value: ''
                     - name: PODS_AFFECTED_PERC
@@ -144,7 +144,7 @@ spec:
                             - name: TARGET_CONTAINER
                               value: catalogue
                             - name: TOTAL_CHAOS_DURATION
-                              value: "60"
+                              value: "120"
                             - name: CONTAINER_RUNTIME
                               value: docker
                             - name: SOCKET_PATH

@@ -30,10 +30,10 @@ spec:
         resources:
           limits:
             cpu: 300m
-            memory: 500Mi
+            memory: 750Mi
           requests:
             cpu: 100m
-            memory: 200Mi
+            memory: 300Mi
         ports:
         - containerPort: 80
         securityContext:
@@ -270,10 +270,10 @@ spec:
         image: weaveworksdemos/front-end:0.3.12
         resources:
           limits:
-            cpu: 300m
+            cpu: 500m
             memory: 1000Mi
           requests:
-            cpu: 100m
+            cpu: 200m
             memory: 300Mi
         ports:
         - containerPort: 8079
@@ -360,10 +360,10 @@ spec:
         resources:
           limits:
             cpu: 500m
-            memory: 500Mi
+            memory: 750Mi
           requests:
             cpu: 100m
-            memory: 300Mi
+            memory: 450Mi
         ports:
         - containerPort: 80
         securityContext:
@@ -555,10 +555,10 @@ spec:
         resources:
           limits:
             cpu: 300m
-            memory: 500Mi
+            memory: 750Mi
           requests:
             cpu: 100m
-            memory: 300Mi
+            memory: 450Mi
         ports:
         - containerPort: 80
       nodeSelector:
@@ -620,6 +620,11 @@ spec:
           readOnlyRootFilesystem: true
       - name: rabbitmq-exporter
         image: kbudde/rabbitmq-exporter
+        env:
+        # Recent exporter images default to 9419; the Service/annotation
+        # scrape 9090, so pin the listener to keep the target reachable.
+        - name: PUBLISH_PORT
+          value: "9090"
         ports:
         - containerPort: 9090
           name: exporter
@@ -729,10 +734,10 @@ spec:
         resources:
           limits:
             cpu: 300m
-            memory: 500Mi
+            memory: 750Mi
           requests:
             cpu: 100m
-            memory: 300Mi
+            memory: 450Mi
         ports:
         - containerPort: 80
         securityContext:

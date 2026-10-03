@@ -23,10 +23,10 @@ spec:
         image: weaveworksdemos/front-end:node18-otel
         resources:
           limits:
-            cpu: 300m
+            cpu: 500m
             memory: 1000Mi
           requests:
-            cpu: 100m
+            cpu: 200m
             memory: 300Mi
         ports:
         - containerPort: 8079

@@ -5,6 +5,7 @@ let currentRunId = null;
 let pollTimer = null;
 let telemetryRuns = [];
 let telemetryRunId = null;
+let telemetryBusy = false;
 
 function showStep(step) {
   currentStep = Math.max(1, Math.min(6, step));
@@ -294,12 +295,53 @@ function addChatMessage(role, text, meta = '') {
   container.scrollTop = container.scrollHeight;
 }
 
+function formatDuration(seconds) {
+  const totalSeconds = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return minutes ? `${minutes} min ${remainingSeconds} s` : `${remainingSeconds} s`;
+}
+
+function formatTelemetryWindow(result) {
+  const { start, end } = result.window;
+  const durationSeconds = (Date.parse(end) - Date.parse(start)) / 1000;
+  const scopeLabel = result.window_scope === 'run' ? 'run completo' : 'fase da falha';
+  const details = [
+    `MCP consultou ${scopeLabel} (${formatDuration(durationSeconds)}): ${start} → ${end}.`
+  ];
+  if (result.baseline_window) {
+    details.push(`Baseline de comparação: ${result.baseline_window.start} → ${result.baseline_window.end}.`);
+  }
+  const fault = result.phases?.fault;
+  if (fault) {
+    const phaseSeconds = (Date.parse(fault.end) - Date.parse(fault.start)) / 1000;
+    const source = result.phase_sources?.fault;
+    const sourceLabels = {
+      manifest_observed: 'timestamps observados no manifest',
+      litmus_result_created_at_plus_configured_duration: 'estimativa: criação do ChaosResult + duração configurada',
+      planned_phase_fallback: 'fase planejada, sem confirmação da injeção real'
+    };
+    details.push(`Fase fault registrada: ${formatDuration(phaseSeconds)} (${sourceLabels[source] || source || 'origem desconhecida'}).`);
+  }
+  if (result.configured_chaos_duration_seconds != null) {
+    const configuredDuration = formatDuration(result.configured_chaos_duration_seconds);
+    if (result.fault_injection_duration_seconds == null) {
+      details.push(`Duração configurada do caos: ${configuredDuration}; duração real não confirmada pelo backend.`);
+    } else {
+      details.push(`Duração configurada do caos: ${configuredDuration}; duração registrada: ${formatDuration(result.fault_injection_duration_seconds)}.`);
+    }
+  }
+  return details.join(' ');
+}
+
 function setTelemetryRun(runId) {
   telemetryRunId = runId || null;
   const input = document.getElementById('telemetryChatInput');
   const send = document.getElementById('telemetryChatSendBtn');
-  input.disabled = !telemetryRunId;
-  send.disabled = !telemetryRunId;
+  const rca = document.getElementById('telemetryRcaBtn');
+  input.disabled = !telemetryRunId || telemetryBusy;
+  send.disabled = !telemetryRunId || telemetryBusy;
+  rca.disabled = !telemetryRunId || telemetryBusy;
   const run = telemetryRuns.find((item) => item.run_id === telemetryRunId);
   document.getElementById('chatWindowBadge').textContent = run
     ? `${run.run_id} · ${run.status}`
@@ -309,11 +351,35 @@ function setTelemetryRun(runId) {
 async function loadTelemetryRuns() {
   const select = document.getElementById('telemetryRunSelect');
   telemetryRuns = (await api('/api/runs')).filter((run) => ['completed', 'failed', 'stopped'].includes(run.status));
-  select.innerHTML = '<option value="">Selecione um run concluído</option>' + telemetryRuns.map((run) =>
+  renderTelemetryRuns();
+}
+
+function renderTelemetryRuns() {
+  const select = document.getElementById('telemetryRunSelect');
+  const filter = document.getElementById('telemetryRunFilter').value.trim().toLowerCase();
+  const matchingRuns = telemetryRuns.filter((run) =>
+    `${run.run_id} ${run.experiment_id} ${run.status}`.toLowerCase().includes(filter)
+  );
+  const previousRunId = telemetryRunId;
+  const selectedRunMatches = matchingRuns.some((run) => run.run_id === previousRunId);
+  const nextRunId = selectedRunMatches
+    ? previousRunId
+    : filter && matchingRuns.length === 1
+      ? matchingRuns[0].run_id
+      : '';
+  document.getElementById('telemetryRunFilterCount').textContent = filter
+    ? `${matchingRuns.length} de ${telemetryRuns.length} runs`
+    : `${telemetryRuns.length} runs disponíveis`;
+  select.innerHTML = `<option value="">${matchingRuns.length ? 'Selecione um run concluído' : 'Nenhum run correspondente'}</option>` + matchingRuns.map((run) =>
     `<option value="${run.run_id}">${run.experiment_id} · ${run.run_id} · ${run.status}</option>`
   ).join('');
-  if (telemetryRunId && telemetryRuns.some((run) => run.run_id === telemetryRunId)) select.value = telemetryRunId;
+
+  select.value = nextRunId;
   setTelemetryRun(select.value);
+  if (previousRunId && previousRunId !== select.value) {
+    document.getElementById('telemetryChatMessages').innerHTML =
+      '<div class="chat-empty">Selecione um run visível no filtro para continuar.</div>';
+  }
 }
 
 document.getElementById('telemetryRunSelect').addEventListener('change', (event) => {
@@ -322,6 +388,7 @@ document.getElementById('telemetryRunSelect').addEventListener('change', (event)
     document.getElementById('telemetryChatMessages').innerHTML = '<div class="chat-empty">Janela carregada. Faça uma pergunta sobre este run.</div>';
   }
 });
+document.getElementById('telemetryRunFilter').addEventListener('input', renderTelemetryRuns);
 document.getElementById('refreshTelemetryRunsBtn').addEventListener('click', loadTelemetryRuns);
 document.querySelectorAll('[data-chat-question]').forEach((button) => button.addEventListener('click', () => {
   const input = document.getElementById('telemetryChatInput');
@@ -335,19 +402,76 @@ document.getElementById('telemetryChatForm').addEventListener('submit', async (e
   if (!telemetryRunId || !question) return;
   addChatMessage('user', question);
   input.value = '';
-  input.disabled = true;
-  document.getElementById('telemetryChatSendBtn').disabled = true;
+  telemetryBusy = true;
+  setTelemetryRun(telemetryRunId);
   try {
     const result = await api(`/api/runs/${telemetryRunId}/telemetry-chat`, {
       method: 'POST',
-      body: JSON.stringify({ query: question, use_model: true })
+      body: JSON.stringify({
+        query: question,
+        use_model: true,
+        window_scope: document.getElementById('telemetryWindowScope').value
+      })
     });
-    addChatMessage('assistant', result.answer, `Janela MCP: ${result.window.start} → ${result.window.end}`);
+    let windowDetails = result;
+    if (!result.phases) {
+      try {
+        const observationWindow = await api(
+          `/api/runs/${telemetryRunId}/observation-window`
+        );
+        windowDetails = { ...result, ...observationWindow };
+      } catch {
+        // Keep the answer usable if optional window details are unavailable.
+      }
+    }
+    if (windowDetails.configured_chaos_duration_seconds == null) {
+      const selectedRun = telemetryRuns.find((run) => run.run_id === telemetryRunId);
+      if (selectedRun?.experiment_id) {
+        try {
+          const experiment = await api(
+            `/api/experiments/${encodeURIComponent(selectedRun.experiment_id)}`
+          );
+          windowDetails.configured_chaos_duration_seconds =
+            experiment.spec?.chaos_profile?.fault_duration_seconds;
+        } catch {
+          // The answer and observed window remain useful without experiment metadata.
+        }
+      }
+    }
+    addChatMessage('assistant', result.answer, formatTelemetryWindow(windowDetails));
   } catch (err) {
     addChatMessage('error', `Não foi possível consultar a telemetria: ${err.message}`);
   } finally {
-    input.disabled = false;
-    document.getElementById('telemetryChatSendBtn').disabled = false;
+    telemetryBusy = false;
+    setTelemetryRun(telemetryRunId);
+  }
+});
+
+document.getElementById('telemetryRcaBtn').addEventListener('click', async () => {
+  if (!telemetryRunId || telemetryBusy) return;
+  const button = document.getElementById('telemetryRcaBtn');
+  const originalLabel = button.textContent;
+  addChatMessage('user', 'Investigue a causa raiz deste run.');
+  telemetryBusy = true;
+  setTelemetryRun(telemetryRunId);
+  button.textContent = 'Analisando…';
+  try {
+    const result = await api(`/api/runs/${telemetryRunId}/rca`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+    const tools = (result.tools_used || []).join(', ') || 'nenhuma tool';
+    addChatMessage(
+      'assistant',
+      result.answer,
+      `RCA · ${result.iterations} iterações · ${tools} · ${result.stop_reason}`
+    );
+  } catch (err) {
+    addChatMessage('error', `Não foi possível investigar a causa raiz: ${err.message}`);
+  } finally {
+    telemetryBusy = false;
+    button.textContent = originalLabel;
+    setTelemetryRun(telemetryRunId);
   }
 });
 loadTelemetryRuns().catch(() => {});

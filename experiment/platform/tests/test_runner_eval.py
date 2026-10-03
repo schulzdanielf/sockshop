@@ -6,8 +6,14 @@ from experiment.eval.memory_hog.runner import _compute_prediction_scores
 from experiment.eval.memory_hog.runner import RunRecord
 from experiment.eval.memory_hog.runner import build_spec
 from experiment.eval.memory_hog.runner import evaluate_strategy
+from experiment.eval.memory_hog import runner as runner_module
 from experiment.platform.backend.analysis.summary import build_run_summary_l2
 from experiment.platform.backend.storage.sqlite_storage import SqliteStorage
+
+expand_cells = getattr(runner_module, "_expand_cells")
+flush_runs = getattr(runner_module, "_flush_runs")
+load_runs_csv = getattr(runner_module, "_load_runs_csv")
+manipulation_check = getattr(runner_module, "_manipulation_check")
 
 
 def test_run_retrieval_is_scoped_to_experiment_version(tmp_path):
@@ -103,10 +109,15 @@ def test_training_corpus_retrieval_does_not_require_test_experiment_id(tmp_path)
     assert {row["run_id"] for row in candidates} == {"train_run"}
 
 
-def test_harness_reuses_stable_campaign_id_for_train_and_test():
+def test_harness_reuses_stable_campaign_id_for_train_and_test(monkeypatch):
     with open("experiment/eval/memory_hog/config.yaml", encoding="utf-8") as file:
         config = yaml.safe_load(file)
 
+    monkeypatch.setattr(
+        runner_module,
+        "_target_container_limits",
+        lambda service, namespace: {"cpu": "300m", "memory": "500Mi"},
+    )
     train_spec = build_spec(config, "catalogue", 0, "memory-hog")
     test_spec = build_spec(config, "user", 0, "memory-hog")
 
@@ -124,6 +135,15 @@ def test_harness_reuses_stable_campaign_id_for_train_and_test():
         "network_receive_dropped_rate",
         "network_transmit_dropped_rate",
     }.issubset(query_ids)
+    resource_cfg = config["resource_chaos"]
+    expected_mb = int(
+        500 * 1024 * 1024 * resource_cfg["memory_load_percentage"] / 100 / 1_000_000
+    )
+    assert train_spec["chaos_profile"]["resource_chaos"]["environment"] == {
+        "MEMORY_CONSUMPTION": str(expected_mb),
+        "TOTAL_CHAOS_DURATION": str(resource_cfg["duration_seconds"]),
+        "TARGET_CONTAINER": "catalogue",
+    }
 
 
 def test_l2_summary_includes_global_network_phase_signals():
@@ -246,3 +266,128 @@ def test_gemini_eval_caps_tokens_and_sets_request_timeout(monkeypatch):
     assert captured["request_timeout"] == 45
     assert captured["query"]["max_new_tokens"] == 384
     assert captured["query"]["provider"] == "gemini"
+
+
+def test_expand_cells_shuffle_is_deterministic_and_complete():
+    cells = [
+        {"service": "carts", "chaos_type": "cpu-hog"},
+        {"service": "user", "chaos_type": "none"},
+        {"service": "orders", "chaos_type": "pod-delete"},
+    ]
+    cfg = {"ordering": {"shuffle": True, "seed": 7}}
+    first = expand_cells(cells, 2, cfg)
+    second = expand_cells(cells, 2, cfg)
+    assert first == second
+    assert len(first) == 6
+    assert sorted((c["service"], r) for c, r in first) == sorted(
+        (c["service"], r) for c in cells for r in range(2)
+    )
+    assert first != expand_cells(cells, 2, {"ordering": {}})
+
+
+def test_sham_spec_uses_provider_none_and_control_tag():
+    with open("experiment/eval/memory_hog/config.yaml", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    spec = build_spec(config, "none", 0, runner_module.SHAM_CHAOS_TYPE)
+    assert spec["chaos_profile"]["provider"] == "none"
+    assert spec["chaos_profile"]["chaos_engine"] is None
+    assert "control:sham" in spec["experiment"]["tags"]
+    assert "fault_category:none" in spec["experiment"]["tags"]
+
+
+class _CheckApi:
+    def __init__(self, run, feats):
+        self._run = run
+        self._feats = feats
+
+    def get(self, path, **_q):
+        if path.endswith("/features"):
+            return self._feats
+        return self._run
+
+
+def _rec(chaos_type, target="carts"):
+    return RunRecord(
+        service=target,
+        replica_idx=0,
+        phase="train",
+        chaos_target=target,
+        experiment_id="e",
+        run_id="run-x",
+        status="completed",
+        chaos_type=chaos_type,
+    )
+
+
+def test_manipulation_check_detects_target_effect_by_pod_label():
+    run = {"verdict": "degraded_recoverable", "timings": {"fault_window_source": "litmus"}}
+    feats = {
+        "metric_hotspots": {
+            "memory_working_set_bytes": {
+                "label_kind": "pod",
+                "top": [
+                    {"label": "carts-6cb6b78746-dcd9g", "baseline_mean": 100.0, "fault_mean": 400.0},
+                    {"label": "orders-1", "baseline_mean": 90.0, "fault_mean": 95.0},
+                ],
+            },
+            "oom_killed": {"label_kind": "pod", "top": []},
+        }
+    }
+    observed, reason, window, verdict = manipulation_check(
+        _CheckApi(run, feats), _rec("memory-hog")
+    )
+    assert observed is True
+    assert reason.startswith("effect_on_target memory_working_set_bytes")
+    assert window == "litmus"
+    assert verdict == "degraded_recoverable"
+
+
+def test_manipulation_check_reports_absent_target_without_dropping_run():
+    run = {"verdict": "resilient", "timings": {}}
+    feats = {
+        "metric_hotspots": {
+            "latency_p95": {
+                "label_kind": "service",
+                "top": [{"label": "orders", "baseline_mean": 10.0, "fault_mean": 500.0}],
+            }
+        }
+    }
+    observed, reason, _w, _v = manipulation_check(
+        _CheckApi(run, feats), _rec("network-latency")
+    )
+    assert observed is False
+    assert reason.startswith("target_not_hotspot")
+
+
+def test_manipulation_check_is_not_applicable_for_sham():
+    run = {"verdict": "degraded_recoverable", "timings": {"fault_window_source": "sham_planned_phase"}}
+    observed, reason, window, verdict = manipulation_check(
+        _CheckApi(run, {}), _rec(runner_module.SHAM_CHAOS_TYPE, target="none")
+    )
+    assert observed is None
+    assert "sham" in reason
+    assert window == "sham_planned_phase"
+    assert verdict == "degraded_recoverable"
+
+
+def test_runs_csv_roundtrips_ledger_covariates(tmp_path):
+    rec = _rec("cpu-hog")
+    rec.effect_observed = False
+    rec.effect_reason = "target_not_hotspot cpu_usage_cores"
+    rec.fault_window_source = "planned_phase_fallback"
+    rec.verdict = "resilient"
+    rec.attempt = 2
+    rec.order_idx = 5
+    rec.jitter_seconds = 17
+    rec.env_fingerprint_sha = "abc123"
+    path = tmp_path / "runs.csv"
+    flush_runs(path, [rec])
+    loaded = load_runs_csv(path)
+    assert len(loaded) == 1
+    got = loaded[0]
+    assert got.effect_observed is False
+    assert got.effect_reason == rec.effect_reason
+    assert got.fault_window_source == "planned_phase_fallback"
+    assert got.verdict == "resilient"
+    assert (got.attempt, got.order_idx, got.jitter_seconds) == (2, 5, 17)
+    assert got.env_fingerprint_sha == "abc123"

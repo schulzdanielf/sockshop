@@ -130,13 +130,23 @@
           <div>
             <p class="eyebrow">MCP / TELEMETRIA</p>
             <h2>Ask the experiment</h2>
-            <p class="panel-copy">Pergunte sobre métricas, latência, erros, restarts e OOM dentro da janela do run selecionado.</p>
+            <p class="panel-copy">Pergunte sobre métricas, latência, erros, restarts e OOM.</p>
           </div>
           <span id="chatWindowBadge" class="window-badge">Nenhum run selecionado</span>
         </div>
         <div class="chat-toolbar">
+          <label>Filtrar runs
+            <input id="telemetryRunFilter" type="search" autocomplete="off" placeholder="Trecho do ID ou experimento" />
+            <small id="telemetryRunFilterCount" class="filter-result-count" role="status" aria-live="polite"></small>
+          </label>
           <label>Experiment run
             <select id="telemetryRunSelect"><option value="">Selecione um run concluído</option></select>
+          </label>
+          <label>Período
+            <select id="telemetryWindowScope">
+              <option value="fault">Período da falha</option>
+              <option value="run">Run completo</option>
+            </select>
           </label>
           <button id="refreshTelemetryRunsBtn" class="btn-sm" title="Atualizar runs">⟳</button>
         </div>
@@ -146,6 +156,7 @@
         <form id="telemetryChatForm" class="chat-composer">
           <input id="telemetryChatInput" autocomplete="off" placeholder="Qual serviço teve a maior taxa de erros?" disabled />
           <button type="submit" id="telemetryChatSendBtn" disabled>Enviar</button>
+          <button type="button" id="telemetryRcaBtn" disabled title="Investigar causa raiz do run selecionado">RCA</button>
         </form>
         <div class="chat-suggestions">
           <button type="button" data-chat-question="Qual serviço teve a maior porcentagem de erros?">maior taxa de erros</button>

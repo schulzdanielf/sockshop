@@ -11,7 +11,8 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,7 @@ from .ports import (
     LoadProviderPort,
     MetricsProviderPort,
     NotificationPort,
+    RcaEvidenceSnapshotPort,
     StoragePort,
     TraceProviderPort,
 )
@@ -40,6 +42,58 @@ def _parse_iso(value: str) -> datetime:
 
 def _duration_seconds(start_iso: str, end_iso: str) -> float:
     return (_parse_iso(end_iso) - _parse_iso(start_iso)).total_seconds()
+
+
+def _resolve_fault_window(
+    planned_start: str,
+    planned_end: str,
+    chaos_artifacts: Dict[str, Any],
+    configured_duration_seconds: Optional[int],
+) -> tuple[str, str, str]:
+    """Prefer observed injection timestamps, falling back to the planned phase."""
+    if chaos_artifacts.get("mode") == "sham":
+        return planned_start, planned_end, "sham_planned_phase"
+    if chaos_artifacts.get("mode") == "manifest":
+        actual_start = chaos_artifacts.get("injected_at")
+        actual_end = chaos_artifacts.get("stopped_at")
+        if actual_start and actual_end and _duration_seconds(actual_start, actual_end) > 0:
+            return actual_start, actual_end, "manifest_observed"
+
+    final_status = chaos_artifacts.get("final_status") or {}
+    actual_start = (
+        final_status.get("chaos_started_at")
+        if final_status.get("chaos_window_confirmed")
+        else None
+    )
+    if actual_start and configured_duration_seconds and configured_duration_seconds > 0:
+        actual_end = (
+            _parse_iso(actual_start)
+            + timedelta(seconds=int(configured_duration_seconds))
+        ).isoformat()
+        stopped_at = chaos_artifacts.get("stopped_at")
+        if stopped_at and _parse_iso(stopped_at) < _parse_iso(actual_end):
+            actual_end = stopped_at
+        if _duration_seconds(actual_start, actual_end) > 0:
+            return (
+                actual_start,
+                actual_end,
+                "litmus_result_created_at_plus_configured_duration",
+            )
+
+    # The Argo run-chaos step starts before the experiment pod; it is a
+    # coarser anchor but still closer to the injection than the schedule.
+    step_start = final_status.get("chaos_step_started_at")
+    if step_start and configured_duration_seconds and configured_duration_seconds > 0:
+        step_end = (
+            _parse_iso(step_start) + timedelta(seconds=int(configured_duration_seconds))
+        ).isoformat()
+        step_finished = final_status.get("chaos_step_finished_at")
+        if step_finished and _parse_iso(step_finished) < _parse_iso(step_end):
+            step_end = step_finished
+        if _duration_seconds(step_start, step_end) > 0:
+            return step_start, step_end, "argo_step_started_at_plus_configured_duration"
+
+    return planned_start, planned_end, "planned_phase_fallback"
 
 
 def _build_observation_window(
@@ -75,6 +129,9 @@ def _build_observation_window(
         "timezone": "UTC",
         "window": {"start": start, "end": end},
         "phases": phases,
+        "phase_sources": {
+            "fault": timings.get("fault_window_source", "unknown"),
+        },
         "sampling_interval_seconds": sampling_interval_seconds,
     }
 
@@ -129,6 +186,7 @@ class OrchestratorEngine:
         traces: TraceProviderPort,
         notifier: NotificationPort,
         kill_switch_path: Optional[Path] = None,
+        evidence_snapshot: Optional[RcaEvidenceSnapshotPort] = None,
     ):
         self.storage = storage
         self.chaos = chaos
@@ -137,6 +195,7 @@ class OrchestratorEngine:
         self.traces = traces
         self.notifier = notifier
         self.kill_switch_path = kill_switch_path
+        self.evidence_snapshot = evidence_snapshot
 
         self._stop_flags: Dict[str, threading.Event] = {}
         self._runtime_handles: Dict[str, Dict[str, Any]] = {}
@@ -190,6 +249,51 @@ class OrchestratorEngine:
         )
         t.start()
         return run
+
+    def _persist_rca_evidence_snapshot(
+        self,
+        run_id: str,
+        context: Dict[str, Any],
+        observability_config: Dict[str, Any],
+        namespace: str,
+        observation_window: Dict[str, Any],
+        capture_config: Dict[str, Any],
+        artifact_paths: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(capture_config, dict) or capture_config.get("enabled") is not True:
+            return None
+        if self.evidence_snapshot is None:
+            snapshot = {
+                "schema_version": 1,
+                "status": "tool_unavailable",
+                "namespace": namespace,
+            }
+        else:
+            try:
+                snapshot = self.evidence_snapshot.capture(
+                    context,
+                    observability_config,
+                    namespace,
+                    observation_window,
+                    capture_config,
+                )
+            except (OSError, RuntimeError, TimeoutError, ValueError, TypeError):
+                return None
+        if not isinstance(snapshot, dict):
+            snapshot = {"schema_version": 1, "status": "invalid_response"}
+        snapshot.setdefault("schema_version", 1)
+        snapshot["references"] = {
+            name: path
+            for name, path in artifact_paths.items()
+            if name in {"metrics_raw", "traces_raw", "observation_window"}
+        }
+        try:
+            artifact_paths["rca_evidence_snapshot"] = self.storage.save_artifact(
+                run_id, "rca_evidence_snapshot", snapshot
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return None
+        return snapshot
 
     def approve_run(self, run_id: str, approved_by: str) -> RunRecord:
         run = self.storage.get_run(run_id)
@@ -288,13 +392,19 @@ class OrchestratorEngine:
             metrics_cfg = dict(obs.get("metrics", {}))
             traces_cfg = dict(obs.get("traces", {}))
 
+            # provider "none" = sham/control run: identical schedule and load,
+            # no injection. Gives the null distribution for verdicts and RCA.
+            sham_run = str(chaos_cfg.get("provider") or "").lower() == "none"
+
             self.load.validate(load_cfg)
-            self.chaos.validate(chaos_cfg)
+            if not sham_run:
+                self.chaos.validate(chaos_cfg)
             self.metrics.validate(metrics_cfg)
             self.traces.validate(traces_cfg)
 
             self.load.prepare(context, load_cfg)
-            self.chaos.prepare(context, chaos_cfg)
+            if not sham_run:
+                self.chaos.prepare(context, chaos_cfg)
 
             self._event(run_id, "run_started", {"at": run_start_iso})
 
@@ -323,14 +433,27 @@ class OrchestratorEngine:
             self._event(run_id, "warmup_completed", {})
 
             fault_start = utc_now_iso()
-            chaos_handle = self.chaos.inject(context, chaos_cfg)
+            if sham_run:
+                chaos_handle = {
+                    "provider": "none",
+                    "mode": "sham",
+                    "namespace": chaos_cfg.get("namespace"),
+                    "injected_at": None,
+                }
+            else:
+                chaos_handle = self.chaos.inject(context, chaos_cfg)
             self._runtime_handles.setdefault(run_id, {})["chaos"] = chaos_handle
-            self._event(run_id, "fault_started", {"seconds": fault_duration_seconds})
+            self._event(
+                run_id,
+                "fault_started",
+                {"seconds": fault_duration_seconds, "sham": sham_run},
+            )
 
             self._sleep_interruptible(stop_flag, fault_duration_seconds)
 
             fault_end = utc_now_iso()
-            self.chaos.stop(context, chaos_handle)
+            if not sham_run:
+                self.chaos.stop(context, chaos_handle)
             self._event(run_id, "fault_completed", {})
 
             self._event(
@@ -341,7 +464,24 @@ class OrchestratorEngine:
 
             self.load.stop_load(context, load_handle)
             load_summary = self.load.collect_summary(context, load_handle)
-            chaos_artifacts = self.chaos.collect_artifacts(context, chaos_handle)
+            chaos_artifacts = (
+                dict(chaos_handle)
+                if sham_run
+                else self.chaos.collect_artifacts(context, chaos_handle)
+            )
+            planned_fault_start, planned_fault_end = fault_start, fault_end
+            fault_start, fault_end, fault_window_source = _resolve_fault_window(
+                planned_fault_start,
+                planned_fault_end,
+                chaos_artifacts,
+                chaos_cfg.get("fault_duration_seconds"),
+            )
+            fault_injection_duration = (
+                _duration_seconds(fault_start, fault_end)
+                if fault_window_source != "planned_phase_fallback"
+                else None
+            )
+            warmup_end = fault_start
 
             metrics_raw = self.metrics.collect_window(
                 context, metrics_cfg, run_start_iso, recovery_end, step
@@ -484,7 +624,7 @@ class OrchestratorEngine:
 
             # ── L2: deterministic, RAG-ready summary + tags ─────────────────
             run_timings_preview = {
-                "fault_injection_duration_seconds": fault_duration_seconds,
+                "fault_injection_duration_seconds": fault_injection_duration,
                 "experiment_total_duration_seconds": _duration_seconds(
                     run_start_iso, utc_now_iso()
                 ),
@@ -563,10 +703,13 @@ class OrchestratorEngine:
                 "t_warmup_end": warmup_end,
                 "t_fault_start": fault_start,
                 "t_fault_end": fault_end,
+                "t_fault_planned_start": planned_fault_start,
+                "t_fault_planned_end": planned_fault_end,
+                "fault_window_source": fault_window_source,
                 "t_recovery_observed": recovery_end,
                 "baseline_seconds": baseline_seconds,
                 "warmup_time_seconds": warmup_seconds,
-                "fault_injection_duration_seconds": fault_duration_seconds,
+                "fault_injection_duration_seconds": fault_injection_duration,
                 "experiment_total_duration_seconds": _duration_seconds(
                     run_start_iso, run.ended_at
                 ),
@@ -592,6 +735,15 @@ class OrchestratorEngine:
                 "run_features": features_path,
                 "observation_window": observation_window_path,
             }
+            self._persist_rca_evidence_snapshot(
+                run_id=run_id,
+                context=context,
+                observability_config=obs,
+                namespace=str(scope.get("namespace", "sock-shop")),
+                observation_window=observation_window,
+                capture_config=obs.get("rca_evidence_snapshot") or {},
+                artifact_paths=artifact_paths,
+            )
             observability_summary = build_observability_summary(
                 run_id=run_id,
                 experiment_id=exp.experiment_id,
@@ -725,12 +877,18 @@ class OrchestratorEngine:
     def _slo_thresholds(spec: Dict[str, Any]) -> Dict[str, float]:
         """Extract SLO thresholds from spec.analysis.slo with sane defaults."""
         slo = spec.get("analysis", {}).get("slo", {}) or {}
-        return {
+        out = {
             "error_rate": float(slo.get("error_rate_threshold", 0.05)),
             "latency_p95_ms": float(slo.get("latency_p95_threshold_ms", 800)),
             "recovery_tolerance_pct": float(slo.get("recovery_tolerance_pct", 0.20)),
             "max_recovery_seconds": float(slo.get("max_recovery_seconds", 600)),
         }
+        # Optional: threshold = max(absolute, factor × run baseline). Absent →
+        # legacy absolute behaviour.
+        for key in ("latency_p95_relative_factor", "error_rate_relative_factor"):
+            if slo.get(key) is not None:
+                out[key] = float(slo[key])
+        return out
 
     # Known fault-type suffixes in descending specificity order so that the
     # most precise match wins (e.g. "pod-delete" before a hypothetical "delete").
@@ -755,6 +913,8 @@ class OrchestratorEngine:
         service prefix so only the fault type is stored.
         """
         chaos = spec.get("chaos_profile", {}) or {}
+        if str(chaos.get("provider") or "").lower() == "none":
+            return "none"
         engine = chaos.get("chaos_engine") or ""
         for fault in OrchestratorEngine._KNOWN_FAULT_TYPES:
             if engine.endswith(fault):
@@ -814,6 +974,11 @@ class OrchestratorEngine:
             "error_rate": ("error_rate", slo["error_rate"]),
             "latency_p95": ("latency_p95_ms", slo["latency_p95_ms"]),
         }
+        relative_factor = {
+            "error_rate": slo.get("error_rate_relative_factor"),
+            "latency_p95": slo.get("latency_p95_relative_factor"),
+        }
+        effective_thresholds: Dict[str, Dict[str, Any]] = {}
         for metric_id, (label, threshold) in slo_map.items():
             phase_stats = per_phase.get(metric_id, {})
             base = (
@@ -822,6 +987,17 @@ class OrchestratorEngine:
             baseline_means[metric_id] = (
                 base.get("mean") if isinstance(base, dict) else None
             )
+            factor = relative_factor.get(metric_id)
+            base_mean = baseline_means[metric_id]
+            if factor and base_mean is not None and factor > 0:
+                threshold = max(threshold, factor * float(base_mean))
+            effective_thresholds[metric_id] = {
+                "absolute": slo_map[metric_id][1],
+                "relative_factor": factor,
+                "baseline_mean": base_mean,
+                "effective": threshold,
+            }
+            slo_map[metric_id] = (label, threshold)
             for phase_name in ("warmup", "fault", "post"):
                 s = (
                     phase_stats.get(phase_name, {})
@@ -851,10 +1027,13 @@ class OrchestratorEngine:
                         }
                     )
 
-        # ── Recovery time (use error_rate first, fall back to latency_p95) ──
+        # ── Recovery time per SLO metric; the run recovers when the SLOWEST
+        # violated metric recovers (None if any violated metric never does).
         recovery_method = getattr(self.metrics, "find_recovery_time", None)
         recovery_time: Optional[float] = None
         recovery_metric: Optional[str] = None
+        recovery_by_metric: Dict[str, Optional[float]] = {}
+        violated_metrics = {v["metric"] for v in slo_violations}
         if callable(recovery_method):
             for metric_id, (_label, threshold) in slo_map.items():
                 try:
@@ -869,10 +1048,17 @@ class OrchestratorEngine:
                     )
                 except Exception:
                     rt = None
-                if rt is not None:
-                    recovery_time = rt
-                    recovery_metric = metric_id
-                    break
+                recovery_by_metric[metric_id] = rt
+            considered = violated_metrics or set(slo_map)
+            unrecovered = [m for m in considered if recovery_by_metric.get(m) is None]
+            if unrecovered:
+                recovery_time = None
+                recovery_metric = unrecovered[0]
+            else:
+                recovery_metric = max(
+                    considered, key=lambda m: recovery_by_metric.get(m) or 0.0
+                )
+                recovery_time = recovery_by_metric.get(recovery_metric)
 
         # ── Trace-derived failure aggregation ───────────────────────────────
         failure_agg: Dict[str, Any] = {}
@@ -922,11 +1108,13 @@ class OrchestratorEngine:
             "verdict": verdict,
             "chaos_type": self._chaos_type(spec),
             "slo_thresholds": slo,
+            "slo_effective_thresholds": effective_thresholds,
             "phase_metrics": per_phase,
             "metric_hotspots": hotspots,
             "slo_violations": slo_violations,
             "recovery_time_seconds": recovery_time,
             "recovery_reference_metric": recovery_metric,
+            "recovery_by_metric": recovery_by_metric,
             "affected_services": failure_agg.get("affected_services", []),
             "top_failure_signatures": failure_agg.get("top_failure_signatures", []),
             "rca_hypotheses": failure_agg.get("rca_hypotheses", []),

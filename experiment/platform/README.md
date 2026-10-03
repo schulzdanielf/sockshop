@@ -1,4 +1,4 @@
-# Chaos Platform (MVP Phase 1)
+?# Chaos Platform (MVP Phase 1)
 
 This module implements a product-oriented chaos engineering platform with:
 
@@ -76,6 +76,108 @@ helpers (`mcp-observability-server/tests/`).
 - Store run summaries and artifacts (metrics/traces/load/chaos)
 - Compare runs by run id
 - Persist manual conclusion per run
+
+## Fluxo de RCA
+
+A investigação é iniciada por `POST /api/runs/{run_id}/rca`. Ela analisa somente
+o run existente; não injeta nem reinicia chaos.
+
+```mermaid
+flowchart TD
+   A[POST /api/runs/{run_id}/rca] --> B{Run tem fases baseline e fault?}
+   B -- Não --> B1[HTTP 409]
+   B -- Sim --> C[Carrega run, experimento, namespace e endpoint MCP]
+   C --> D[Escolhe janela de referência]
+   D --> D1[Últimos 45 s antes do fault; fallback para baseline do run se curta]
+   D1 --> E[Descobre tools MCP e consulta métricas RED/resource]
+   E --> F{Há próximo check obrigatório?}
+  F -- Sim --> G[Host executa prontidão, OOM, restarts e Tempo por fase]
+   G --> H[Guarda resultado bruto e envia digest compacto ao modelo]
+   H --> F
+   F -- Não --> I[Modelo escolhe tools adicionais ou sintetiza conclusão]
+   I --> J{Resposta tem formato válido e serviço conhecido?}
+   J -- Sim --> K[Host acrescenta evidências e limitações]
+   J -- Não --> L[Modelo recebe feedback e tenta corrigir uma vez]
+   L --> M{Resposta corrigida é válida?}
+   M -- Sim --> K
+   M -- Não --> N[Registra avaliação indisponível; não inventa causa]
+   K --> O[Persiste artefato e evento RCA concluído]
+   N --> O
+   O --> P[Retorna resposta, tools, iterações e stop_reason]
+```
+
+### Etapas
+
+1. **Validação e contexto:** a rota exige janelas `baseline` e `fault`; carrega
+  o run e a versão do experimento para obter namespace e endpoint MCP. Fases
+  ausentes ou endpoint não configurado resultam em HTTP 409; run/experimento
+  inexistente resulta em HTTP 404.
+2. **Referência:** quando há histórico suficiente, a baseline da RCA é
+  substituída pelos últimos 45 segundos anteriores ao início do fault. Isso
+  reduz o viés do ramp-up de carga. Se a janela for curta ou inválida, usa-se a
+  baseline original do run. A fonte escolhida fica registrada como
+  `reference_source`.
+3. **Métricas iniciais:** o host chama `get_run_golden_signals` com as janelas
+  de referência e fault. O modelo recebe um digest das métricas, não o payload
+  completo.
+4. **Investigação MCP:** as ferramentas disponíveis são descobertas via MCP e
+  a investigação é limitada a até 10 chamadas. Antes da localização, o host
+  força os checks disponíveis nesta ordem: `check_service_readiness`,
+  `check_oom_kills`, `check_pod_restarts` e `tempo_service_graph_phases`, mesmo
+  que uma indisponibilidade ou restart já tenha sido detectado. Readiness
+  compara baseline, fault e post quando disponíveis. Um incremento de restart
+  fica associado a pod/container e ao intervalo entre os scrapes que o
+  observaram; não é apresentado como horário exato do evento. Transições de
+  readiness também preservam essa precisão limitada.
+  O modelo então propõe uma localização. Quando ela é válida e corresponde a um
+  serviço conhecido, o host fixa esse serviço e executa `check_service_logs`
+  para as janelas explícitas baseline/fault/post antes de pedir a síntese da
+  causa. O modelo não escolhe LogQL, timestamps nem outro serviço nessa consulta.
+  Se a latência subir muito
+  e a causa continuar sem explicação, ele pode chamar
+  `check_network_packet_drops`, que compara drops de receive/transmit entre
+  baseline e fault. Essa análise é opcional; latência alta, sozinha, não prova
+  perda de pacotes. Os contadores são do nó/interface, não localizam um serviço,
+  e não provam causalidade isoladamente.
+  Janelas e namespace são controlados pelo host; o modelo não pode alterá-los.
+5. **Escopo das evidências:** `check_service_logs` filtra o serviço e a
+  namespace, consulta amostras limitadas por fase e redige segredos antes de
+  enviar exemplos ao modelo. Assinaturas e contagens representam somente linhas
+  observadas; truncamento, cobertura parcial, `no_data` e erros são explícitos.
+  Logs são dados não confiáveis e nunca instruções. O digest do Tempo preserva
+  assinaturas de falha, destino, operação, trace ID e fase já extraídos, sem
+  uma consulta adicional. Contagens, nós, arestas e deltas continuam disponíveis;
+  caminhos heurísticos não são prova causal. `no_data` e arestas ausentes não
+  provam ausência de evento ou chamada.
+6. **Síntese:** a localização é fixada após a primeira resposta válida; a
+  resposta causal precisa manter o mesmo serviço. Um restart isolado é evento
+  de ciclo de vida, não mecanismo causal. Timeouts isolados não confirmam perda
+  de rede, e restart posterior a uma falha de conexão não prova que ela o causou.
+  A resposta do modelo tem duas linhas (`Localização provável` e `Causa
+  provável`); o host acrescenta `Evidências` e `Limitações`. Sem evidência
+  suficiente, o resultado correto é mecanismo não confirmado, não uma causa
+  determinística.
+7. **Persistência:** `rca_investigation.json` mantém janelas, `reference_source`,
+  chamadas e resultados, resposta, iterações, `stop_reason`, tentativas do
+  modelo limitadas/redigidas (`model_attempts`) e `evidence_bundle` versão 1 com
+  localização, cobertura, timeline compacta e IDs de evidência. A plataforma
+  também emite `rca_investigation_completed` e retorna os metadados existentes
+  pela API.
+
+### Snapshot de evidências (opt-in)
+
+A captura automática de logs fica desativada por padrão. Para habilitá-la em um
+experimento, configure `observability.rca_evidence_snapshot.enabled: true`.
+`max_total_lines` aceita no máximo 1200 linhas e é distribuído uniformemente
+entre os serviços do cartão e as fases disponíveis; `timeout_seconds` é limitado
+a 15 segundos. O artifact `rca_evidence_snapshot.json` guarda mensagens já
+saneadas, manifest de janelas/cobertura e referências a métricas, traces e
+observation window, sem duplicar esses payloads. Falhas de captura ou gravação
+nunca mudam o verdict; sem snapshot compatível, uma RCA usa o MCP live. Snapshot
+e replay precisam coincidir em namespace, serviço e janelas para serem usados.
+
+O limite de até 10 iterações restringe a investigação; uma síntese final e a
+tentativa de correção de formato podem ocorrer depois do loop de tools.
 
 ## Product Evolution Hooks Implemented
 

@@ -18,14 +18,14 @@ o template precisa existir uma vez no Litmus antes de rodar o harness.
 
 | Manifesto | ChaosExperiment (Litmus) | `fault_category` | Parâmetros-chave (defaults) | Status no docker-desktop / WSL2 |
 |---|---|---|---|---|
-| `catalogue-memory-hog.yaml` | `pod-memory-hog` | `memory-exhaustion` | `MEMORY_CONSUMPTION=60MB`, `DURATION=30s` | ✅ OK (verificado) |
-| `catalogue-cpu-hog.yaml` | `pod-cpu-hog` | `cpu-exhaustion` | `CPU_CORES=1`, `DURATION=60s` | ✅ OK (verificado) |
-| `catalogue-network-latency.yaml` | `pod-network-latency` | `network-latency` | `NETWORK_LATENCY=2000ms`, `DURATION=60s` | ✅ OK após `make chaos-enable-netem` (testado, Pass) |
-| `catalogue-network-loss.yaml` | `pod-network-loss` | `network-loss` | `PACKET_LOSS=100%`, `DURATION=60s` | ✅ OK após `make chaos-enable-netem` (testado, Pass) |
-| `catalogue-http-status-code.yaml` | `pod-http-status-code` | `http-error` | `STATUS_CODE=500`, `PORT=80`, `DURATION=60s` | ✅ OK (testado, Pass) |
+| `catalogue-memory-hog.yaml` | `pod-memory-hog` | `memory-exhaustion` | `MEMORY_CONSUMPTION=60MB`, `DURATION=120s` | ✅ verificado no default anterior de 30s; 120s não retestado |
+| `catalogue-cpu-hog.yaml` | `pod-cpu-hog` | `cpu-exhaustion` | `CPU_CORES=1`, `DURATION=120s` | ✅ verificado a 60s; 120s não retestado |
+| `catalogue-network-latency.yaml` | `pod-network-latency` | `network-latency` | `NETWORK_LATENCY=500ms`, `DURATION=120s` | ✅ verificado a 60s após `make chaos-enable-netem`; 120s não retestado |
+| `catalogue-network-loss.yaml` | `pod-network-loss` | `network-loss` | `PACKET_LOSS=100%`, `DURATION=120s` | ✅ verificado a 60s após `make chaos-enable-netem`; 120s não retestado |
+| `catalogue-http-status-code.yaml` | `pod-http-status-code` | `http-error` | `STATUS_CODE=500`, `PORT=80`, `DURATION=120s` | ✅ verificado a 60s; 120s não retestado |
 | `catalogue-container-kill.yaml` | `container-kill` | `pod-failure` | `SIGNAL=SIGKILL`, `INTERVAL=10s`, `DURATION=20s` | ✅ OK (testado, Pass) |
 | `catalogue-io-stress.yaml` | `pod-io-stress` | `io-exhaustion` | `FS_UTIL=10%`, `WORKERS=4`, `DURATION=120s` | ❌ NÃO roda aqui (overlayfs WSL2) |
-| `catalogue-dns-error.yaml` | `pod-dns-error` | `dns-failure` | `MATCH_SCHEME=exact`, `DURATION=60s` | ❌ NÃO roda aqui (dns_interceptor) |
+| `catalogue-dns-error.yaml` | `pod-dns-error` | `dns-failure` | `MATCH_SCHEME=exact`, `DURATION=120s` | ❌ NÃO roda aqui (dns_interceptor) |
 
 > Os 6 manifestos novos (latency, loss, dns, io, http, container-kill) usam
 > `CONTAINER_RUNTIME=docker` e `SOCKET_PATH=/var/run/docker.sock`, alinhados aos
@@ -121,8 +121,8 @@ Convenção dos baselines (para a renderização ser segura):
 
 * o token `catalogue` só aparece onde identifica o alvo (nome do workflow,
   label `workflow_name`, `applabel` e o `TARGET_CONTAINER` do engine);
-* defaults do `ChaosExperiment` usam aspas simples (`value: '60'`) e o
-  `ChaosEngine` usa aspas duplas (`value: "60"`), de modo que a substituição
+* defaults do `ChaosExperiment` usam aspas simples (`value: '120'`) e o
+  `ChaosEngine` usa aspas duplas (`value: "120"`), de modo que a substituição
   atinge só o engine (o que de fato dirige o run).
 
 ## ⚠️ Integração com o pipeline de RCA da plataforma

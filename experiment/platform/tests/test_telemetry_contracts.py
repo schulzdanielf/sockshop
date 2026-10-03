@@ -3,9 +3,32 @@ from __future__ import annotations
 from unittest.mock import MagicMock, Mock, patch
 
 from experiment.platform.backend.analysis.istio_edges import collect_istio_edges
+from experiment.platform.backend.api import _select_telemetry_windows
+from experiment.platform.backend.models import TelemetryChatRequest
 from experiment.platform.backend.plugins.litmus_plugin import LitmusChaosPlugin
 from experiment.platform.backend.plugins.mcp_traces_plugin import MCPTempoTracesPlugin
 from experiment.platform.backend.plugins import mcp_client as mcp_client_module
+
+
+def test_telemetry_chat_defaults_to_fault_and_selects_baseline_separately():
+    observation_window = {
+        "window": {"start": "run-start", "end": "run-end"},
+        "phases": {
+            "baseline": {"start": "baseline-start", "end": "baseline-end"},
+            "fault": {"start": "fault-start", "end": "fault-end"},
+        },
+    }
+
+    request = TelemetryChatRequest(query="memória")
+    assert request.window_scope == "fault"
+    assert _select_telemetry_windows(observation_window, request.window_scope) == (
+        observation_window["phases"]["fault"],
+        observation_window["phases"]["baseline"],
+    )
+    assert _select_telemetry_windows(observation_window, "run") == (
+        observation_window["window"],
+        None,
+    )
 
 
 def test_istio_collection_reports_unknown_source_series():

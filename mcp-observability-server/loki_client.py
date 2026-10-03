@@ -28,6 +28,7 @@ class LokiClient:
         start: Optional[str] = None,
         end: Optional[str] = None,
         limit: int = 1000,
+        direction: str = "backward",
     ) -> Dict[str, Any]:
         """Execute a range query against Loki.
 
@@ -36,6 +37,7 @@ class LokiClient:
             start: Start time (Unix timestamp in nanoseconds). Defaults to 1 hour ago
             end: End time (Unix timestamp in nanoseconds). Defaults to now
             limit: Maximum number of log lines
+            direction: Result ordering, either ``forward`` or ``backward``
 
         Returns:
             Query result from Loki
@@ -47,11 +49,19 @@ class LokiClient:
             start = str(int((datetime.utcnow() - timedelta(hours=1)).timestamp() * 1e9))
         if not end:
             end = str(int(datetime.utcnow().timestamp() * 1e9))
+        if direction not in {"forward", "backward"}:
+            raise ValueError("direction must be 'forward' or 'backward'")
 
         try:
             response = self.client.get(
                 f"{self.base_url}/loki/api/v1/query_range",
-                params={"query": query, "start": start, "end": end, "limit": limit},
+                params={
+                    "query": query,
+                    "start": start,
+                    "end": end,
+                    "limit": limit,
+                    "direction": direction,
+                },
             )
             response.raise_for_status()
             return response.json()

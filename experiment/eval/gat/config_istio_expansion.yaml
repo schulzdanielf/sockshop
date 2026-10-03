@@ -42,7 +42,7 @@ chaos_types:
     fault_category: memory-exhaustion
     env:
       memory_consumption_mb: 500
-      total_chaos_duration_seconds: 60
+      total_chaos_duration_seconds: 120
       chaos_interval_seconds: 10
   - name: cpu-hog
     template_suffix: cpu-hog
@@ -50,29 +50,29 @@ chaos_types:
     fault_category: cpu-exhaustion
     env:
       cpu_cores: 1
-      total_chaos_duration_seconds: 60
+      total_chaos_duration_seconds: 120
       chaos_interval_seconds: 10
   - name: network-latency
     template_suffix: network-latency
     short: netlat
     fault_category: network-latency
     env:
-      network_latency_ms: 2000
-      total_chaos_duration_seconds: 60
+      network_latency_ms: 500               # keep below the 1s probe/HTTP timeouts so the fault degrades instead of failing-fast
+      total_chaos_duration_seconds: 120
   - name: network-loss
     template_suffix: network-loss
     short: netloss
     fault_category: network-loss
     env:
       network_packet_loss_percentage: 100
-      total_chaos_duration_seconds: 60
+      total_chaos_duration_seconds: 120
   - name: http-status-code
     template_suffix: http-status-code
     short: httperr
     fault_category: http-error
     env:
       status_code: 500
-      total_chaos_duration_seconds: 60
+      total_chaos_duration_seconds: 120
   - name: container-kill
     template_suffix: container-kill
     short: ckill
@@ -84,7 +84,7 @@ chaos_types:
 timeline:
   baseline_seconds: 30
   warmup_seconds: 30
-  fault_duration_seconds: 90
+  fault_duration_seconds: 150
   post_recovery_observation_seconds: 180
   sampling_interval_seconds: 5
 
@@ -97,9 +97,13 @@ load_profile:
   spawn_rate: 5
   grace_seconds: 30
 
+# error_rate is in PERCENT (0-100): 5.0 == 5 %. Relative factors raise the
+# effective threshold to max(absolute, factor x run baseline) per run.
 slo:
-  error_rate_threshold: 0.05
+  error_rate_threshold: 5.0
+  error_rate_relative_factor: 3.0
   latency_p95_threshold_ms: 800
+  latency_p95_relative_factor: 1.5
   recovery_tolerance_pct: 0.20
   max_recovery_seconds: 600
 

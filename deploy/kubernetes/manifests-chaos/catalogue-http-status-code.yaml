@@ -97,7 +97,7 @@ spec:
                     - name: NETWORK_INTERFACE
                       value: 'eth0'
                     - name: TOTAL_CHAOS_DURATION
-                      value: '60'
+                      value: '120'
                     - name: RAMP_TIME
                       value: ''
                     - name: DEFAULT_HEALTH_CHECK
@@ -168,7 +168,7 @@ spec:
                             - name: NETWORK_INTERFACE
                               value: eth0
                             - name: TOTAL_CHAOS_DURATION
-                              value: "60"
+                              value: "120"
                             - name: CONTAINER_RUNTIME
                               value: docker
                             - name: SOCKET_PATH

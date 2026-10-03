@@ -189,6 +189,64 @@ concluídos com ground-truth e quality gates aprovados; não use runs sem
 cobertura de traces para pontuar o especialista de traces. O plano está em
 [`research/planos/2026-09-25-plano-llm-multiagente.md`](../../../research/planos/2026-09-25-plano-llm-multiagente.md).
 
+## Campanha rápida de avaliação
+
+`run_quick_campaign.py` executa uma amostra de cada falha compatível com o
+cluster, em sete serviços diferentes: memory-hog, cpu-hog, pod-delete,
+network-latency, network-loss, http-status-code e container-kill. A estimativa
+é de cerca de 60 minutos, incluindo margem para templates Litmus ausentes e
+finalização dos ChaosResults. A fase de fault dura 150 s para absorver o
+start-up do ChaosResult e preservar os 60 s configurados de injeção. DNS e IO ficam de fora por incompatibilidade
+conhecida com WSL2.
+
+Prévia sem tocar no cluster:
+
+```bash
+python -m experiment.eval.memory_hog.run_quick_campaign
+```
+
+Para executar, carregue `sch_netem` e use `--run`:
+
+```bash
+make chaos-enable-netem
+python -m experiment.eval.memory_hog.run_quick_campaign --run
+```
+
+Os sete runs são held-out (`test`), não entram no corpus RCA. O script salva
+ledger, configuração, manifests e `effect_validation.json` em
+`out/quick_campaign/`; o relatório combina o veredito de injeção com sinais
+de efeito no serviço-alvo. A execução só começa com `--run`.
+
+## Campanha Longa de Aproximadamente 10 Horas
+
+`run_diverse_campaign.py` prepara 48 células: os sete tipos de falha que rodam
+neste cluster, variando entre sete serviços. Cada fault é configurado para
+300 s; HTTP fica fora do `front-end`, cujo tráfego usa a porta 8079. O cronograma
+reserva margem para o start-up do Litmus e estima 10h10–10h22, usando o tempo
+medido na primeira execução quick. `dns-error` e `io-stress` ficam excluídas
+porque falham no WSL2 atual (`dns_interceptor`/netns e `O_DIRECT`/overlayfs).
+
+Inspecione a matriz sem tocar no cluster:
+
+```bash
+python experiment/eval/memory_hog/run_diverse_campaign.py
+```
+
+Para executar, confirme antes que os deployments estão saudáveis e que
+`sch_netem` está carregado; o preflight também verifica os limites de CPU e
+memória dos alvos:
+
+```bash
+make chaos-enable-netem
+python experiment/eval/memory_hog/run_diverse_campaign.py --run --wait-for-idle
+```
+
+A execução usa ID, configuração e ledger exclusivos em
+`out/diverse_campaign/<campaign-id>/`, sem avaliação LLM. Com
+`--wait-for-idle`, aguarda outras execuções da plataforma terminarem antes de
+injetar faults; esse tempo de espera não entra nas 10 horas estimadas. Sem essa
+opção, o script falha antes de iniciar se houver outro run ativo.
+
 ## Troubleshooting
 
 * **`HTTP 400` on `/api/runs/start`** — likely the Argo workflow template

@@ -12,25 +12,52 @@ Um servidor MCP (Model Context Protocol) com FastMCP para consultas em Prometheu
 
 ### Investigator Tools
 - `check_oom_kills` - Detectar OOMKills por serviço em uma janela fechada
-- `check_pod_restarts` - Contar restarts por serviço estritamente na janela
+- `check_pod_restarts` - Contar incrementos por pod/container na janela e informar o intervalo entre scrapes observado
+- `check_service_readiness` - Comparar prontidão por serviço/fase e registrar transições observadas entre scrapes
 - `get_cpu_saturation_top` - Top serviços por saturação de CPU
 - `get_memory_saturation_top` - Top serviços por saturação de memória
 - `check_http_error_rate_top` - Top serviços por taxa de erro HTTP 5xx
 - `check_request_latency_top` - Top serviços por latência P95
+- `check_network_packet_drops` - Comparar drops de receive/transmit por interface entre baseline e fault
 
-Essas tools são as mais adequadas para agentes pequenos, porque escondem a
-PromQL crua e devolvem JSON estável com `found`, `count`, `top`, `query` e
-`window`.
+As tools de investigação escondem a PromQL crua e devolvem contratos JSON
+estáveis. As ferramentas de evento incluem `found`, `count`, `top`, `query` e
+`window`; `check_network_packet_drops` retorna métricas e cobertura por fase.
+`check_network_packet_drops` recebe janelas fechadas de baseline e fault e
+informa cobertura por fase; esses contadores são do nó/interface, não de um
+serviço específico, e não identificam sozinhos a causa raiz.
+`check_service_readiness` usa `kube_pod_status_ready` e reporta cobertura e
+percentual médio pronto por serviço; transições incluem faixa UTC observada,
+nunca um instante exato inferido. `check_pod_restarts` preserva contagens
+existentes e acrescenta observações por container com limites entre scrapes;
+uma primeira amostra alta não comprova restart dentro da janela. `no_data` não
+significa indisponibilidade.
 
 ### Loki Tools
 - `loki_query` - Consultas LogQL instantâneas
 - `loki_range_query` - Consultas LogQL em intervalos de tempo
 - `loki_get_labels` - Listar labels disponíveis
 - `loki_get_label_values` - Valores de labels específicos
+- `check_service_logs` - Amostras saneadas e limitadas por serviço nas fases baseline/fault/post, com cobertura e assinaturas observadas
+- `capture_run_log_snapshot` - Captura agregada dos serviços/fases sob um limite global de linhas; destinada ao host da plataforma
+
+`check_service_logs` exige janelas fechadas e serviço/namespace validados; o
+cliente RCA não fornece LogQL livre. Mensagens e tokens são redigidos antes de
+serem incluídos em exemplos, inclusive credenciais em query parameters.
+Contagens são das linhas recuperadas e podem estar
+truncadas; uma resposta vazia não comprova que o serviço não gerou logs.
+`capture_run_log_snapshot` distribui o orçamento global igualmente por serviço
+e fase, limita a 1200 linhas por captura e rejeita budgets que não reservem ao
+menos uma linha para cada combinação pedida.
 
 ### Tempo Tools
 - `tempo_search_traces` - Buscar traces no Tempo
 - `tempo_get_trace` - Obter trace completo por trace ID
+
+O resumo `tempo_service_graph_phases` preserva também as assinaturas de falha
+já extraídas dos traces, com trace ID, destino, operação e fase, dentro de um
+limite por fase. Ausência de assinatura ou de aresta não prova ausência de
+falha ou dependência.
 
 ### Golden Metrics (RED Method)
 - `get_golden_metrics` - Listar métricas de ouro

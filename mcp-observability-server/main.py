@@ -7,10 +7,15 @@ from config import settings
 from fastmcp import FastMCP
 from investigators import check_oom_kills as _inv_check_oom_kills
 from investigators import check_pod_restarts as _inv_check_pod_restarts
+from investigators import check_service_readiness as _inv_check_service_readiness
 from investigators import check_http_error_rate_top as _inv_http_error_rate_top
 from investigators import check_request_latency_top as _inv_request_latency_top
 from investigators import get_cpu_saturation_top as _inv_cpu_top
 from investigators import get_memory_saturation_top as _inv_memory_top
+from investigators import get_run_golden_signals as _inv_run_golden_signals
+from investigators import check_network_packet_drops as _inv_network_packet_drops
+from log_investigator import capture_run_log_snapshot as _inv_capture_run_log_snapshot
+from log_investigator import check_service_logs as _inv_check_service_logs
 from loki_client import LokiClient
 from prometheus_client import PrometheusClient
 from service_graph import diff_graph_summaries, summarize_trace_graph
@@ -40,6 +45,56 @@ def init_clients():
 # ============================================================================
 # PROMETHEUS TOOLS
 # ============================================================================
+
+
+@mcp.tool()
+def get_run_golden_signals(
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    namespace: str = "sock-shop",
+    step: str = "15s",
+    k: int = 10,
+) -> str:
+    """Compare RED and resource saturation signals across run phases."""
+    if not prometheus:
+        init_clients()
+    result = _inv_run_golden_signals(
+        prometheus,
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        fault_start=fault_start,
+        fault_end=fault_end,
+        namespace=namespace,
+        step=step,
+        k=k,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def check_network_packet_drops(
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    step: str = "15s",
+    k: int = 5,
+) -> str:
+    """Compare node-interface packet-drop rates across baseline and fault windows."""
+    if not prometheus:
+        init_clients()
+    result = _inv_network_packet_drops(
+        prometheus,
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        fault_start=fault_start,
+        fault_end=fault_end,
+        step=step,
+        k=k,
+    )
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -148,6 +203,66 @@ def loki_range_query(
     if not loki:
         init_clients()
     result = loki.query_range(query, start, end, limit)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def check_service_logs(
+    service: str,
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    post_start: str = "",
+    post_end: str = "",
+    namespace: str = "sock-shop",
+    limit_per_phase: int = 300,
+) -> str:
+    """Return bounded, redacted log signatures for one service by run phase."""
+    if not loki:
+        init_clients()
+    result = _inv_check_service_logs(
+        loki,
+        service=service,
+        namespace=namespace,
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        fault_start=fault_start,
+        fault_end=fault_end,
+        post_start=post_start,
+        post_end=post_end,
+        limit_per_phase=limit_per_phase,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def capture_run_log_snapshot(
+    services: list[str],
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    post_start: str = "",
+    post_end: str = "",
+    namespace: str = "sock-shop",
+    max_total_lines: int = 1200,
+) -> str:
+    """Capture redacted logs across services/phases under one global budget."""
+    if not loki:
+        init_clients()
+    result = _inv_capture_run_log_snapshot(
+        loki,
+        services=services,
+        namespace=namespace,
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        fault_start=fault_start,
+        fault_end=fault_end,
+        post_start=post_start,
+        post_end=post_end,
+        max_total_lines=max_total_lines,
+    )
     return json.dumps(result, indent=2)
 
 
@@ -386,12 +501,18 @@ def _tempo_analyzed_traces(
     if search.get("status") == "error":
         return search
 
+    search_traces = search.get("traces", []) or []
     analyzed = []
-    for item in search.get("traces", []) or []:
+    trace_id_count = 0
+    trace_fetch_error_count = 0
+    for item in search_traces:
         trace_id = item.get("traceID") or item.get("traceId")
         if not trace_id:
             continue
+        trace_id_count += 1
         trace_data = tempo.get_trace(trace_id)
+        if trace_data.get("status") == "error":
+            trace_fetch_error_count += 1
         features = (
             extract_features(trace_data)
             if trace_data.get("status") != "error"
@@ -407,7 +528,43 @@ def _tempo_analyzed_traces(
                 "features": features,
             }
         )
-    return {"traces": analyzed, "search_count": len(search.get("traces", []) or [])}
+    return {
+        "traces": analyzed,
+        "search_count": len(search_traces),
+        "collection": {
+            "search_count": len(search_traces),
+            "trace_id_count": trace_id_count,
+            "missing_trace_id_count": len(search_traces) - trace_id_count,
+            "trace_fetch_error_count": trace_fetch_error_count,
+            "analyzed_count": trace_id_count - trace_fetch_error_count,
+        },
+    }
+
+
+def _trace_failure_evidence(traces: list, limit: int = 20) -> tuple[list, int]:
+    evidence = []
+    for trace in traces:
+        if not isinstance(trace, dict):
+            continue
+        features = trace.get("features") or {}
+        for signature in features.get("failure_signatures") or []:
+            if not isinstance(signature, dict):
+                continue
+            evidence.append(
+                {
+                    "trace_id": trace.get("trace_id"),
+                    "start_time_unix_nano": trace.get("start_time_unix_nano"),
+                    **{
+                        key: signature.get(key)
+                        for key in (
+                            "signature", "endpoint", "affected_service", "operations",
+                            "occurrence_count", "max_duration_ms",
+                        )
+                        if key in signature
+                    },
+                }
+            )
+    return evidence[:limit], max(0, len(evidence) - limit)
 
 
 @mcp.tool()
@@ -460,6 +617,7 @@ def tempo_service_graph_window(
     summary["query"] = trace_query
     summary["limit"] = limit
     summary["search_count"] = window.get("search_count")
+    summary["collection"] = window.get("collection", {})
     return json.dumps(summary, indent=2)
 
 
@@ -511,6 +669,14 @@ def tempo_service_graph_phases(
         phase="fault",
         top_k=top_k,
     )
+    baseline["collection"] = baseline_raw.get("collection", {})
+    fault["collection"] = fault_raw.get("collection", {})
+    baseline["failure_signatures"], baseline["omitted_failure_signature_count"] = (
+        _trace_failure_evidence(baseline_raw.get("traces") or [])
+    )
+    fault["failure_signatures"], fault["omitted_failure_signature_count"] = (
+        _trace_failure_evidence(fault_raw.get("traces") or [])
+    )
     post = None
     if post_start and post_end:
         post_raw = _tempo_analyzed_traces(
@@ -524,6 +690,10 @@ def tempo_service_graph_phases(
             window_end=post_end,
             phase="post",
             top_k=top_k,
+        )
+        post["collection"] = post_raw.get("collection", {})
+        post["failure_signatures"], post["omitted_failure_signature_count"] = (
+            _trace_failure_evidence(post_raw.get("traces") or [])
         )
 
     delta = diff_graph_summaries(baseline, fault, recovery=post, top_k=top_k)
@@ -824,6 +994,34 @@ def check_pod_restarts(
         prometheus,
         start=start,
         end=end,
+        namespace=namespace,
+        step=step,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def check_service_readiness(
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    post_start: str = "",
+    post_end: str = "",
+    namespace: str = "sock-shop",
+    step: str = "15s",
+) -> str:
+    """Compare per-service Kubernetes pod readiness across run phases."""
+    if not prometheus:
+        init_clients()
+    result = _inv_check_service_readiness(
+        prometheus,
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        fault_start=fault_start,
+        fault_end=fault_end,
+        post_start=post_start,
+        post_end=post_end,
         namespace=namespace,
         step=step,
     )

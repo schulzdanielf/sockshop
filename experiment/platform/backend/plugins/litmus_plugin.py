@@ -7,14 +7,19 @@ namespace (via ``kubectl``) to inject faults into target services.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
 class LitmusChaosPlugin:
+    _STATUS_POLL_INTERVAL_SECONDS = 2
+    _STATUS_WAIT_TIMEOUT_SECONDS = 120
+
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -63,7 +68,12 @@ class LitmusChaosPlugin:
 
         # ── Path 2: Litmus UI workflow template (Argo Workflow resubmit) ─────
         workflow_template = config["chaos_engine"]  # e.g. "delete-user"
-        created_name = self._submit_workflow(workflow_template)
+        resource_chaos = config.get("resource_chaos")
+        created_name = self._submit_workflow(
+            workflow_template,
+            resource_chaos,
+            config.get("fault_duration_seconds"),
+        )
         return {
             "provider": "litmus",
             "mode": "argo_workflow",
@@ -75,9 +85,86 @@ class LitmusChaosPlugin:
             "chaos_result": None,
             "manifest_path": None,
             "injected_at": self._now(),
+            "resource_chaos": resource_chaos,
         }
 
-    def _submit_workflow(self, workflow_template: str) -> str:
+    @staticmethod
+    def _apply_resource_chaos(spec: Dict[str, Any], resource_chaos: Dict[str, Any]) -> None:
+        import yaml
+
+        experiment_name = resource_chaos["experiment_name"]
+        overrides = resource_chaos["environment"]
+        updated = 0
+        for template in spec.get("templates", []):
+            for artifact in template.get("inputs", {}).get("artifacts", []):
+                raw = artifact.get("raw", {}).get("data")
+                if not isinstance(raw, str) or "kind: ChaosEngine" not in raw:
+                    continue
+                engine = yaml.safe_load(raw)
+                for experiment in engine.get("spec", {}).get("experiments", []):
+                    if experiment.get("name") != experiment_name:
+                        continue
+                    env = experiment.setdefault("spec", {}).setdefault(
+                        "components", {}
+                    ).setdefault("env", [])
+                    for name, value in overrides.items():
+                        setting = next(
+                            (item for item in env if item.get("name") == name), None
+                        )
+                        if setting is None:
+                            env.append({"name": name, "value": str(value)})
+                        else:
+                            setting["value"] = str(value)
+                    artifact["raw"]["data"] = yaml.safe_dump(
+                        engine, sort_keys=False, default_flow_style=False
+                    )
+                    updated += 1
+        if updated != 1:
+            raise RuntimeError(
+                f"Expected one embedded {experiment_name!r} ChaosEngine, found {updated}"
+            )
+
+    @staticmethod
+    def _apply_fault_duration(spec: Dict[str, Any], duration_seconds: int) -> None:
+        import yaml
+
+        updated = 0
+        for template in spec.get("templates", []):
+            for artifact in template.get("inputs", {}).get("artifacts", []):
+                raw = artifact.get("raw", {}).get("data")
+                if not isinstance(raw, str) or "kind: ChaosEngine" not in raw:
+                    continue
+                engine = yaml.safe_load(raw)
+                for experiment in engine.get("spec", {}).get("experiments", []):
+                    env = experiment.setdefault("spec", {}).setdefault(
+                        "components", {}
+                    ).setdefault("env", [])
+                    setting = next(
+                        (item for item in env if item.get("name") == "TOTAL_CHAOS_DURATION"),
+                        None,
+                    )
+                    if setting is None:
+                        env.append(
+                            {
+                                "name": "TOTAL_CHAOS_DURATION",
+                                "value": str(duration_seconds),
+                            }
+                        )
+                    else:
+                        setting["value"] = str(duration_seconds)
+                    updated += 1
+                artifact["raw"]["data"] = yaml.safe_dump(
+                    engine, sort_keys=False, default_flow_style=False
+                )
+        if updated == 0:
+            raise RuntimeError("Expected an embedded ChaosEngine to set its duration")
+
+    def _submit_workflow(
+        self,
+        workflow_template: str,
+        resource_chaos: Optional[Dict[str, Any]] = None,
+        fault_duration_seconds: Optional[int] = None,
+    ) -> str:
         """Find the latest Argo Workflow for *workflow_template*, clone its spec
         and submit a new run. Returns the newly created workflow name."""
         cmd = ["kubectl", "get", "workflows.argoproj.io", "-n", "litmus", "-o", "json"]
@@ -113,6 +200,12 @@ class LitmusChaosPlugin:
                 "Run the experiment at least once from the Litmus UI to create the template."
             )
 
+        workflow_spec = copy.deepcopy(latest_item["spec"])
+        if resource_chaos:
+            self._apply_resource_chaos(workflow_spec, resource_chaos)
+        elif fault_duration_seconds is not None:
+            self._apply_fault_duration(workflow_spec, int(fault_duration_seconds))
+
         new_wf = {
             "apiVersion": "argoproj.io/v1alpha1",
             "kind": "Workflow",
@@ -126,7 +219,7 @@ class LitmusChaosPlugin:
                     or k == "workflows.argoproj.io/controller-instanceid"
                 },
             },
-            "spec": latest_item["spec"],
+            "spec": workflow_spec,
         }
 
         create_proc = subprocess.run(
@@ -153,6 +246,11 @@ class LitmusChaosPlugin:
         # Argo Workflow mode
         workflow_name = handle.get("workflow_name")
         if workflow_name and handle.get("mode") == "argo_workflow":
+            try:
+                final_status = self._wait_for_terminal_status(context, handle)
+            except (RuntimeError, json.JSONDecodeError, OSError) as exc:
+                final_status = {"state": "unknown", "reason": str(exc)}
+            handle["final_status"] = final_status
             cmd = [
                 "kubectl",
                 "delete",
@@ -198,6 +296,30 @@ class LitmusChaosPlugin:
             "reason": "no workflow_name or manifest_path configured",
         }
 
+    def _wait_for_terminal_status(
+        self, context: Dict[str, Any], handle: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        deadline = time.monotonic() + self._STATUS_WAIT_TIMEOUT_SECONDS
+        terminal_workflow_phases = {"Succeeded", "Failed", "Error"}
+        terminal_chaos_phases = {
+            "Completed",
+            "Completed_With_Probe_Failure",
+            "Error",
+            "Failed",
+        }
+        while True:
+            status = self.status(context, handle)
+            if (
+                status.get("state") in {"completed", "failed"}
+                or status.get("workflow_phase") in terminal_workflow_phases
+                or status.get("chaos_phase") in terminal_chaos_phases
+            ):
+                return status
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return status
+            time.sleep(min(self._STATUS_POLL_INTERVAL_SECONDS, remaining))
+
     def status(self, context: Dict[str, Any], handle: Dict[str, Any]) -> Dict[str, Any]:
         # ── Argo Workflow mode ────────────────────────────────────────────────
         workflow_name = handle.get("workflow_name")
@@ -219,10 +341,22 @@ class LitmusChaosPlugin:
             wf_data = json.loads(proc.stdout)
             phase = wf_data.get("status", {}).get("phase")
             wf_uid = wf_data.get("metadata", {}).get("uid", "")
+            # Argo step that hosts the Litmus runner: its lifetime brackets the
+            # real injection even when the ChaosResult is not yet terminal.
+            step_started_at: Optional[str] = None
+            step_finished_at: Optional[str] = None
+            for node in (wf_data.get("status", {}).get("nodes") or {}).values():
+                if node.get("type") == "Pod" and node.get("templateName") == "run-chaos":
+                    step_started_at = node.get("startedAt")
+                    step_finished_at = node.get("finishedAt")
+                    break
 
             # Try to find the ChaosResult created by this workflow run
             chaos_verdict: Optional[str] = None
             chaos_phase: Optional[str] = None
+            chaos_started_at: Optional[str] = None
+            chaos_result_created_at: Optional[str] = None
+            chaos_window_confirmed = False
             if wf_uid:
                 cr_proc = subprocess.run(
                     [
@@ -243,11 +377,23 @@ class LitmusChaosPlugin:
                 if cr_proc.returncode == 0:
                     cr_items = json.loads(cr_proc.stdout).get("items", [])
                     if cr_items:
+                        chaos_result_created_at = cr_items[0].get("metadata", {}).get(
+                            "creationTimestamp"
+                        )
                         exp_st = (
                             cr_items[0].get("status", {}).get("experimentStatus", {})
                         )
                         chaos_verdict = exp_st.get("verdict")
                         chaos_phase = exp_st.get("phase")
+                        # The experiment pod creates the ChaosResult when it starts
+                        # injecting; Running is enough to trust the start time.
+                        chaos_window_confirmed = chaos_phase in {
+                            "Running",
+                            "Completed",
+                            "Completed_With_Probe_Failure",
+                        }
+                        if chaos_window_confirmed:
+                            chaos_started_at = chaos_result_created_at
 
             state_map = {
                 "Running": "running",
@@ -261,6 +407,11 @@ class LitmusChaosPlugin:
                 "workflow_phase": phase,
                 "chaos_phase": chaos_phase,
                 "chaos_verdict": chaos_verdict,
+                "chaos_started_at": chaos_started_at,
+                "chaos_result_created_at": chaos_result_created_at,
+                "chaos_window_confirmed": chaos_window_confirmed,
+                "chaos_step_started_at": step_started_at,
+                "chaos_step_finished_at": step_finished_at,
                 "litmus_url": f"http://localhost:9091/chaos-center/experiments/run/{workflow_name}",
             }
 
@@ -316,6 +467,7 @@ class LitmusChaosPlugin:
                     "litmus_ui_url": "http://localhost:9091",
                     "injected_at": handle.get("injected_at"),
                     "stopped_at": handle.get("stopped_at"),
+                    "final_status": handle.get("final_status"),
                     "cleanup": handle.get("cleanup"),
                 }
             )

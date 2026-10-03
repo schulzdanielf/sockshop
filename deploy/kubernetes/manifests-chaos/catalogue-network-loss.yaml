@@ -85,7 +85,7 @@ spec:
                     - name: NETWORK_PACKET_LOSS_PERCENTAGE
                       value: '100'
                     - name: TOTAL_CHAOS_DURATION
-                      value: '60'
+                      value: '120'
                     - name: RAMP_TIME
                       value: ''
                     - name: PODS_AFFECTED_PERC
@@ -154,7 +154,7 @@ spec:
                             - name: NETWORK_PACKET_LOSS_PERCENTAGE
                               value: "100"
                             - name: TOTAL_CHAOS_DURATION
-                              value: "60"
+                              value: "120"
                             - name: CONTAINER_RUNTIME
                               value: docker
                             - name: SOCKET_PATH

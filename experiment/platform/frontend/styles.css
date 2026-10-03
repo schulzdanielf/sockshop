@@ -256,7 +256,16 @@ button:hover {
   color: #b8d0ca;
 }
 
+.filter-result-count {
+  display: block;
+  min-height: 1em;
+  margin-top: 0.25rem;
+  color: #91b4ad;
+  font-size: 0.72rem;
+}
+
 .chat-toolbar select,
+.chat-toolbar input,
 .chat-composer input {
   background: #10201f;
   border-color: #376a63;
@@ -327,6 +336,16 @@ button:hover {
 .chat-composer button {
   width: auto;
   min-width: 92px;
+}
+
+.chat-composer #telemetryRcaBtn {
+  min-width: 76px;
+  background: #206f70;
+}
+
+.chat-composer button:disabled {
+  cursor: wait;
+  opacity: 0.62;
 }
 
 .chat-suggestions {

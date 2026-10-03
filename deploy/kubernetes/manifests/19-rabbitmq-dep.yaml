@@ -38,6 +38,11 @@ spec:
           readOnlyRootFilesystem: true
       - name: rabbitmq-exporter
         image: kbudde/rabbitmq-exporter
+        env:
+        # Recent exporter images default to 9419; the Service/annotation
+        # scrape 9090, so pin the listener to keep the target reachable.
+        - name: PUBLISH_PORT
+          value: "9090"
         ports:
         - containerPort: 9090
           name: exporter

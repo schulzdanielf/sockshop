@@ -34,8 +34,10 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -49,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+from experiment.eval.memory_hog.resource_intensity import resource_chaos_environment
 
 # ── Module-level constants ──────────────────────────────────────────────────
 HERE = Path(__file__).resolve().parent
@@ -56,6 +59,8 @@ ROOT = HERE.parents[2]
 CONFIG_PATH = HERE / "config.yaml"
 
 TERMINAL_STATUSES = {"completed", "failed"}
+# Control (sham) cell: same schedule and load, no injection.
+SHAM_CHAOS_TYPE = "none"
 DEFAULT_EVAL_LLM_REQUEST_TIMEOUT_SECONDS = int(
     os.environ.get("EVAL_LLM_REQUEST_TIMEOUT_SECONDS", "180")
 )
@@ -114,10 +119,51 @@ class ApiClient:
 # ── Chaos-type lookup ────────────────────────────────────────────────────
 def _chaos_type_entry(cfg: Dict[str, Any], chaos_type: str) -> Dict[str, Any]:
     """Find the ``chaos_types`` config entry for *chaos_type*."""
+    if chaos_type == SHAM_CHAOS_TYPE:
+        return {
+            "name": SHAM_CHAOS_TYPE,
+            "template_suffix": SHAM_CHAOS_TYPE,
+            "short": "sham",
+            "fault_category": "none",
+            "env": {},
+        }
     for entry in cfg.get("chaos_types", []) or []:
         if entry.get("name") == chaos_type:
             return entry
     raise KeyError(f"chaos_type {chaos_type!r} not declared in config.chaos_types")
+
+
+def _target_container_limits(service: str, namespace: str) -> Dict[str, str]:
+    """Read limits from the application container, excluding any sidecars."""
+    proc = _kubectl("get", "deployment", service, "-n", namespace, "-o", "json")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"kubectl get deployment {service!r} failed: {proc.stderr.strip()}"
+        )
+    deployment = json.loads(proc.stdout)
+    containers = (
+        deployment.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    target = next(
+        (container for container in containers if container.get("name") == service),
+        None,
+    )
+    if target is None:
+        names = [container.get("name") for container in containers]
+        raise ValueError(
+            f"deployment {service!r} has no application container named {service!r}; "
+            f"available containers: {names}"
+        )
+    limits = target.get("resources", {}).get("limits", {})
+    if not limits.get("cpu") or not limits.get("memory"):
+        raise ValueError(
+            f"deployment {service!r} container {service!r} must define positive CPU "
+            "and memory limits for resource chaos"
+        )
+    return {"cpu": str(limits["cpu"]), "memory": str(limits["memory"])}
 
 
 def _fault_category_for(cfg: Dict[str, Any], chaos_type: str) -> str:
@@ -143,7 +189,7 @@ CHAOS_NAMESPACE = "litmus"
 _TS_SUFFIX_RE = re.compile(r"-\d{13}$")
 # These faults are applied as Kubernetes manifests by the platform and do not
 # require an Argo workflow template to be primed in the litmus namespace.
-MANIFEST_CHAOS_TYPES = {"http-status-code"}
+MANIFEST_CHAOS_TYPES = {"http-status-code", SHAM_CHAOS_TYPE}
 
 
 def _kubectl(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -292,19 +338,58 @@ def build_spec(
     # http-status-code sob Istio: o pod-http-status-code (proxy) é contornado
     # pelo Envoy (ERRO 2, erros-experimentos.md). Usamos um VirtualService de
     # fault injection (manifest_path), que injeta o erro no próprio mesh.
+    results_dir = Path(cfg["output"]["results_dir"])
+    if not results_dir.is_absolute():
+        results_dir = ROOT / results_dir
     manifests_dir = Path(cfg["output"]["manifests_dir"])
     if not manifests_dir.is_absolute():
-        manifests_dir = ROOT / "experiment" / "eval" / "memory_hog" / "out" / manifests_dir.name
+        manifests_dir = results_dir / manifests_dir
     vs_manifest = manifests_dir / f"{service}-{suffix}.yaml"
     use_virtualservice = chaos_type == "http-status-code" and vs_manifest.exists()
 
-    chaos_profile = {
-        "provider": "litmus",
-        "namespace": cfg["cluster"]["app_namespace"],
-        "manifest_path": str(vs_manifest) if use_virtualservice else None,
-        "chaos_engine": None if use_virtualservice else chaos_engine,
-        "chaos_result": None,
-    }
+    resource_profile = None
+    if chaos_type in {"cpu-hog", "memory-hog"}:
+        limits = _target_container_limits(service, cfg["cluster"]["app_namespace"])
+        environment = resource_chaos_environment(
+            chaos_type, limits, cfg.get("resource_chaos", {})
+        )
+        environment["TARGET_CONTAINER"] = service
+        resource_profile = {
+            "experiment_name": "pod-cpu-hog" if chaos_type == "cpu-hog" else "pod-memory-hog",
+            "target_container": service,
+            "container_limits": limits,
+            "environment": environment,
+        }
+
+    chaos_duration = (
+        cfg.get("resource_chaos", {}).get("duration_seconds")
+        if chaos_type in {"cpu-hog", "memory-hog"}
+        else ct.get("env", {}).get("total_chaos_duration_seconds")
+    )
+    if chaos_type == SHAM_CHAOS_TYPE:
+        chaos_profile: Dict[str, Any] = {
+            "provider": "none",
+            "namespace": cfg["cluster"]["app_namespace"],
+            "manifest_path": None,
+            "chaos_engine": None,
+            "chaos_result": None,
+            "fault_duration_seconds": None,
+            "resource_chaos": None,
+        }
+    else:
+        chaos_profile = {
+            "provider": "litmus",
+            "namespace": cfg["cluster"]["app_namespace"],
+            "manifest_path": str(vs_manifest) if use_virtualservice else None,
+            "chaos_engine": None if use_virtualservice else chaos_engine,
+            "chaos_result": None,
+            "fault_duration_seconds": int(chaos_duration) if chaos_duration else None,
+            "resource_chaos": resource_profile,
+        }
+    timeline = dict(cfg["timeline"])
+    if use_virtualservice and chaos_duration:
+        timeline["fault_duration_seconds"] = int(chaos_duration)
+    ns = cfg["cluster"]["app_namespace"]
     return {
         "schema_version": "1.0.0",
         "experiment": {
@@ -326,13 +411,14 @@ def build_spec(
                 f"target:{service}",
                 f"replica:{replica_idx}",
                 "harness:multi-chaos-eval",
+                *(["control:sham"] if chaos_type == SHAM_CHAOS_TYPE else []),
             ],
         },
         "scope": {
             "environment": "staging",
             "namespace": cfg["cluster"]["app_namespace"],
         },
-        "timeline": dict(cfg["timeline"]),
+        "timeline": timeline,
         "load_profile": {
             **cfg["load_profile"],
             "extra_args": [],
@@ -356,7 +442,7 @@ def build_spec(
                         "id": "traffic",
                         "query": (
                             'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown"}[5m])) by (destination_workload)'
+                            'destination_workload!="unknown"}[30s])) by (destination_workload)'
                         ),
                     },
                     # ── Errors ──
@@ -365,12 +451,12 @@ def build_spec(
                         "query": (
                             '100 * ('
                             'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown",response_code=~"5.."}[5m])) by (destination_workload)'
+                            'destination_workload!="unknown",response_code=~"5.."}[30s])) by (destination_workload)'
                             ' or on(destination_workload) 0 * '
                             'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown"}[5m])) by (destination_workload)'
+                            'destination_workload!="unknown"}[30s])) by (destination_workload)'
                             ') / clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown"}[5m])) by (destination_workload), 0.0001)'
+                            'destination_workload!="unknown"}[30s])) by (destination_workload), 0.0001)'
                         ),
                     },
                     # ── Latency (RED) — three percentiles ──
@@ -379,7 +465,7 @@ def build_spec(
                         "query": (
                             'histogram_quantile(0.50, sum(rate(istio_request_duration_milliseconds_bucket{'
                             'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            '[5m])) by (le,destination_workload))'
+                            '[30s])) by (le,destination_workload))'
                         ),
                     },
                     {
@@ -387,7 +473,7 @@ def build_spec(
                         "query": (
                             'histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{'
                             'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            '[5m])) by (le,destination_workload))'
+                            '[30s])) by (le,destination_workload))'
                         ),
                     },
                     {
@@ -395,47 +481,47 @@ def build_spec(
                         "query": (
                             'histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{'
                             'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            '[5m])) by (le,destination_workload))'
+                            '[30s])) by (le,destination_workload))'
                         ),
                     },
                     # ── Network signals ─────────────────────────────────
                     # Interface-level counters are collected by cAdvisor and
-                    # grouped by pod in per_label_hotspots. They are kept
-                    # target-agnostic so they cannot leak the injected service.
+                    # grouped by pod in per_label_hotspots, then normalized
+                    # to the parent service for target-specific effect checks.
                     {
                         "id": "network_receive_bytes_rate",
                         "query": (
-                            "sum(rate(container_network_receive_bytes_total[1m]))"
+                            "sum by (pod) (rate(container_network_receive_bytes_total[30s]))"
                         ),
                     },
                     {
                         "id": "network_transmit_bytes_rate",
                         "query": (
-                            "sum(rate(container_network_transmit_bytes_total[1m]))"
+                            "sum by (pod) (rate(container_network_transmit_bytes_total[30s]))"
                         ),
                     },
                     {
                         "id": "network_receive_errors_rate",
                         "query": (
-                            "sum(rate(container_network_receive_errors_total[1m]))"
+                            "sum by (pod) (rate(container_network_receive_errors_total[30s]))"
                         ),
                     },
                     {
                         "id": "network_transmit_errors_rate",
                         "query": (
-                            "sum(rate(container_network_transmit_errors_total[1m]))"
+                            "sum by (pod) (rate(container_network_transmit_errors_total[30s]))"
                         ),
                     },
                     {
                         "id": "network_receive_dropped_rate",
                         "query": (
-                            "sum(rate(container_network_receive_packets_dropped_total[1m]))"
+                            "sum by (pod) (rate(container_network_receive_packets_dropped_total[30s]))"
                         ),
                     },
                     {
                         "id": "network_transmit_dropped_rate",
                         "query": (
-                            "sum(rate(container_network_transmit_packets_dropped_total[1m]))"
+                            "sum by (pod) (rate(container_network_transmit_packets_dropped_total[30s]))"
                         ),
                     },
                     # ── Saturation: CPU ──
@@ -447,7 +533,7 @@ def build_spec(
                         "query": (
                             "rate(container_cpu_usage_seconds_total"
                             f'{{namespace="{cfg["cluster"]["app_namespace"]}",'
-                            'cpu="total"}[1m])'
+                            'cpu="total"}[30s])'
                         ),
                     },
                     # CPU% of limit using spec quota/period (present only when
@@ -455,13 +541,11 @@ def build_spec(
                     {
                         "id": "cpu_saturation_pct",
                         "query": (
-                            "100 * rate(container_cpu_usage_seconds_total"
-                            f'{{namespace="{cfg["cluster"]["app_namespace"]}",'
-                            'cpu="total"}[1m]) / on(pod) group_left() '
-                            "(container_spec_cpu_quota"
-                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}} '
-                            "/ container_spec_cpu_period"
-                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}})'
+                            "100 * sum by (pod) (rate(container_cpu_usage_seconds_total"
+                            f'{{namespace="{ns}",job="kubernetes-cadvisor",cpu="total"}}[30s])) '
+                            "/ on(pod) sum by (pod) (container_spec_cpu_quota"
+                            f'{{namespace="{ns}",job="kubernetes-cadvisor"}} / container_spec_cpu_period'
+                            f'{{namespace="{ns}",job="kubernetes-cadvisor"}})'
                         ),
                     },
                     # CPU throttled seconds/s per pod — fires on cpu-hog even
@@ -471,7 +555,7 @@ def build_spec(
                         "id": "cpu_throttled",
                         "query": (
                             "rate(container_cpu_cfs_throttled_seconds_total"
-                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}}[1m])'
+                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}}[30s])'
                         ),
                     },
                     # ── Saturation: Memory ──
@@ -489,11 +573,10 @@ def build_spec(
                     {
                         "id": "memory_saturation_pct",
                         "query": (
-                            "100 * container_memory_working_set_bytes"
-                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}} '
-                            "/ on(pod) group_left() "
-                            "(container_spec_memory_limit_bytes"
-                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}} > 0)'
+                            "100 * sum by (pod) (container_memory_working_set_bytes"
+                            f'{{namespace="{ns}",job="kubernetes-cadvisor"}}) '
+                            "/ on(pod) (sum by (pod) (container_spec_memory_limit_bytes"
+                            f'{{namespace="{ns}",job="kubernetes-cadvisor"}}) > 0)'
                         ),
                     },
                     # ── Pod health (pod-failure / OOM-kill signal) ──
@@ -504,7 +587,7 @@ def build_spec(
                         "query": (
                             "sum by (pod) (changes("
                             "kube_pod_container_status_restarts_total"
-                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}}[5m]))'
+                            f'{{namespace="{cfg["cluster"]["app_namespace"]}"}}[30s]))'
                         ),
                     },
                     # 2) Cumulative restart counter, range-queried across the
@@ -524,6 +607,14 @@ def build_spec(
                             f'{{namespace="{cfg["cluster"]["app_namespace"]}"}})'
                         ),
                     },
+                    {
+                        "id": "pod_ready",
+                        "query": (
+                            "sum by (pod) (kube_pod_status_ready"
+                            f'{{namespace="{cfg["cluster"]["app_namespace"]}",'
+                            'condition="true"})'
+                        ),
+                    },
                     # 3) OOMKilled flag — gauge that is 1 if the *last*
                     #    container termination reason was OOMKilled. Going
                     #    0→1 within the experiment window is a strong,
@@ -536,6 +627,59 @@ def build_spec(
                             "kube_pod_container_status_last_terminated_reason"
                             f'{{namespace="{cfg["cluster"]["app_namespace"]}",'
                             'reason="OOMKilled"})'
+                        ),
+                    },
+                    # ── Runtime metrics (mechanism-specific, independent of
+                    # OOMKilled/cAdvisor). Label ``name`` = service.
+                    {
+                        "id": "jvm_heap_used_pct",
+                        "query": (
+                            '100 * sum by (name) (jvm_memory_bytes_used{area="heap",'
+                            f'kubernetes_namespace="{ns}"}}) / clamp_min(sum by (name) '
+                            f'(jvm_memory_bytes_max{{area="heap",kubernetes_namespace="{ns}"}} > 0), 1)'
+                        ),
+                    },
+                    {
+                        "id": "jvm_gc_seconds_rate",
+                        "query": (
+                            "sum by (name) (rate(jvm_gc_collection_seconds_sum"
+                            f'{{kubernetes_namespace="{ns}"}}[30s]))'
+                        ),
+                    },
+                    {
+                        "id": "nodejs_eventloop_lag_seconds",
+                        "query": (
+                            "max by (name) (nodejs_eventloop_lag_seconds"
+                            f'{{kubernetes_namespace="{ns}"}})'
+                        ),
+                    },
+                    {
+                        "id": "go_goroutines",
+                        "query": (
+                            "sum by (name) (go_goroutines"
+                            f'{{kubernetes_namespace="{ns}",job="kubernetes-service-endpoints"}})'
+                        ),
+                    },
+                    {
+                        "id": "process_cpu_seconds_rate",
+                        "query": (
+                            "sum by (name) (rate(process_cpu_seconds_total"
+                            f'{{kubernetes_namespace="{ns}",job="kubernetes-service-endpoints"}}[30s]))'
+                        ),
+                    },
+                    # ── AMQP path (queue-master/shipping → rabbitmq) via Istio TCP.
+                    {
+                        "id": "amqp_tcp_sent_bytes_rate",
+                        "query": (
+                            "sum by (source_workload) (rate(istio_tcp_sent_bytes_total"
+                            f'{{destination_workload="rabbitmq",destination_workload_namespace="{ns}"}}[30s]))'
+                        ),
+                    },
+                    {
+                        "id": "amqp_tcp_received_bytes_rate",
+                        "query": (
+                            "sum by (source_workload) (rate(istio_tcp_received_bytes_total"
+                            f'{{destination_workload="rabbitmq",destination_workload_namespace="{ns}"}}[30s]))'
                         ),
                     },
                 ],
@@ -596,6 +740,15 @@ class RunRecord:
     ended_at: Optional[str] = None
     notes: str = ""
     chaos_type: str = "memory-hog"  # injected fault type (default = legacy)
+    # Manipulation check persisted as a covariate (never used to drop runs).
+    effect_observed: Optional[bool] = None
+    effect_reason: str = ""
+    fault_window_source: str = ""
+    verdict: str = ""
+    attempt: int = 1
+    order_idx: Optional[int] = None
+    jitter_seconds: int = 0
+    env_fingerprint_sha: str = ""
 
 
 def create_and_start_run(
@@ -632,7 +785,8 @@ def create_and_start_run(
             "idempotency_key": f"{spec['experiment']['id']}-{uuid.uuid4().hex[:8]}",
             # Flag the run as training-corpus or held-out test. The backend uses
             # this to gate RAG retrieval so test rows never leak as neighbours.
-            "is_training": (phase == "train"),
+            # Sham controls have no fault label and must not seed the corpus.
+            "is_training": (phase == "train" and chaos_type != SHAM_CHAOS_TYPE),
         },
     )
     rec.run_id = resp["run_id"]
@@ -858,6 +1012,14 @@ RUN_FIELDS = [
     "started_at",
     "ended_at",
     "notes",
+    "effect_observed",
+    "effect_reason",
+    "fault_window_source",
+    "verdict",
+    "attempt",
+    "order_idx",
+    "jitter_seconds",
+    "env_fingerprint_sha",
 ]
 EVAL_FIELDS = [
     "run_id",
@@ -911,6 +1073,7 @@ def _load_runs_csv(path: Path) -> List[RunRecord]:
     out: List[RunRecord] = []
     with path.open("r", encoding="utf-8") as f:
         for r in csv.DictReader(f):
+            effect_raw = (r.get("effect_observed") or "").strip().lower()
             out.append(
                 RunRecord(
                     service=r["service"],
@@ -925,6 +1088,16 @@ def _load_runs_csv(path: Path) -> List[RunRecord]:
                     notes=r.get("notes") or "",
                     # Back-compat: rows from the single-chaos era default to memory-hog
                     chaos_type=(r.get("chaos_type") or "memory-hog"),
+                    effect_observed=(
+                        None if effect_raw in ("", "none") else effect_raw == "true"
+                    ),
+                    effect_reason=r.get("effect_reason") or "",
+                    fault_window_source=r.get("fault_window_source") or "",
+                    verdict=r.get("verdict") or "",
+                    attempt=int(r.get("attempt") or 1),
+                    order_idx=int(r["order_idx"]) if (r.get("order_idx") or "").strip() else None,
+                    jitter_seconds=int(r.get("jitter_seconds") or 0),
+                    env_fingerprint_sha=r.get("env_fingerprint_sha") or "",
                 )
             )
     return out
@@ -934,6 +1107,187 @@ def _load_runs_csv(path: Path) -> List[RunRecord]:
 def _flush_runs(runs_csv: Path, records: List[RunRecord]) -> None:
     """Persist runs.csv after every cell so a Ctrl-C doesn't lose progress."""
     _write_csv(runs_csv, [r.__dict__ for r in records], RUN_FIELDS)
+
+
+def _expand_cells(
+    cells: List[Dict[str, str]], replicas: int, cfg: Dict[str, Any]
+) -> List[tuple]:
+    """Expand ``cells × replicas`` into an ordered list of ``(cell, rep)``.
+
+    ``cfg.ordering.shuffle`` interleaves services, fault types and sham
+    controls deterministically (``cfg.ordering.seed``) so cluster drift over a
+    long session is not confounded with any single cell.
+    """
+    expanded = [(cell, rep) for cell in cells for rep in range(replicas)]
+    order_cfg = cfg.get("ordering") or {}
+    if order_cfg.get("shuffle"):
+        random.Random(int(order_cfg.get("seed", 0))).shuffle(expanded)
+    return expanded
+
+
+# Metrics whose fault-vs-baseline increase *at the injected target* is the
+# expected mechanism of each fault. Used only as a manipulation-check
+# covariate; runs are never dropped on this basis.
+_EFFECT_METRICS: Dict[str, List[str]] = {
+    "memory-hog": [
+        "memory_working_set_bytes",
+        "memory_saturation_pct",
+        "jvm_heap_used_pct",
+        "oom_killed",
+        "pod_restarts",
+    ],
+    "cpu-hog": [
+        "cpu_usage_cores",
+        "cpu_saturation_pct",
+        "cpu_throttled",
+        "process_cpu_seconds_rate",
+        "latency_p95",
+    ],
+    "pod-delete": ["pod_restarts", "pod_restarts_total", "error_rate"],
+    "container-kill": ["pod_restarts", "pod_restarts_total", "error_rate"],
+    "network-latency": ["latency_p95", "latency_p50", "latency_p99"],
+    "network-loss": ["error_rate", "latency_p95", "network_transmit_dropped_rate"],
+    "http-status-code": ["error_rate"],
+}
+_EFFECT_MIN_RELATIVE_INCREASE = 0.20
+
+
+def _label_matches_service(label: Any, service: str) -> bool:
+    text = str(label or "")
+    return text == service or text.startswith(f"{service}-")
+
+
+def _manipulation_check(
+    api: ApiClient, rec: RunRecord
+) -> tuple:
+    """Did the injected fault visibly reach its target?
+
+    Returns ``(effect_observed, effect_reason, fault_window_source, verdict)``.
+    ``effect_observed`` is ``None`` when the check is not applicable (sham),
+    data is unavailable, or the target is absent from the persisted top-K.
+    Reads only what the platform persisted.
+    """
+    try:
+        run = api.get(f"/api/runs/{rec.run_id}") or {}
+    except Exception as exc:
+        return None, f"run_fetch_failed: {exc}"[:200], "", ""
+    timings = run.get("timings") or {}
+    window = str(timings.get("fault_window_source") or "")
+    verdict = str(run.get("verdict") or "")
+
+    if rec.chaos_type == SHAM_CHAOS_TYPE:
+        return None, f"sham: no effect expected (verdict={verdict or 'n/a'})", window, verdict
+
+    try:
+        feats = api.get(f"/api/runs/{rec.run_id}/features") or {}
+    except Exception as exc:
+        return None, f"features_fetch_failed: {exc}"[:200], window, verdict
+    hotspots = feats.get("metric_hotspots") or {}
+    if not hotspots:
+        return None, "no_hotspot_data", window, verdict
+
+    matched: List[str] = []
+    missing: List[str] = []
+    target_observations: List[str] = []
+    for metric_id in _EFFECT_METRICS.get(rec.chaos_type, ["error_rate", "latency_p95"]):
+        entry = hotspots.get(metric_id) or {}
+        rows = [
+            r
+            for r in (entry.get("top") or [])
+            if _label_matches_service(r.get("label"), rec.chaos_target)
+        ]
+        if not rows:
+            missing.append(metric_id)
+            continue
+        row = rows[0]
+        target_observations.append(metric_id)
+        base = float(row.get("baseline_mean") or 0.0)
+        fault = float(row.get("fault_mean") or 0.0)
+        increased = (fault > 0.0) if base <= 0.0 else (
+            fault >= base * (1.0 + _EFFECT_MIN_RELATIVE_INCREASE)
+        )
+        if increased:
+            matched.append(f"{metric_id}:{base:.3g}->{fault:.3g}")
+    if matched:
+        return True, "effect_on_target " + ",".join(matched), window, verdict
+    if not target_observations:
+        return None, "target_not_in_top_k " + ",".join(missing), window, verdict
+    return (
+        False,
+        "no_expected_increase_on_target " + ",".join(target_observations),
+        window,
+        verdict,
+    )
+
+
+def collect_environment_fingerprint(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
+    """Snapshot the host/cluster state that can confound a long campaign.
+
+    Written once per harness invocation to ``<out_dir>/env_fingerprint.json``;
+    the SHA-256 of the sorted JSON is stamped on every run record so sessions
+    with different images/kernels/netem state can be told apart afterwards.
+    """
+    ns = cfg["cluster"]["app_namespace"]
+    fp: Dict[str, Any] = {
+        "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "harness_git_head": "",
+        "harness_git_dirty": None,
+        "node": {},
+        "images": {},
+        "sch_netem_loaded": None,
+        "prometheus_url": None,
+    }
+    git = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=ROOT, check=False
+    )
+    if git.returncode == 0:
+        fp["harness_git_head"] = git.stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=ROOT, check=False
+    )
+    if dirty.returncode == 0:
+        fp["harness_git_dirty"] = bool(dirty.stdout.strip())
+    try:
+        nodes = _kubectl("get", "nodes", "-o", "json")
+        if nodes.returncode == 0:
+            items = json.loads(nodes.stdout).get("items") or []
+            fp["node"] = {
+                n["metadata"]["name"]: {
+                    "kubelet": n["status"]["nodeInfo"].get("kubeletVersion"),
+                    "kernel": n["status"]["nodeInfo"].get("kernelVersion"),
+                    "runtime": n["status"]["nodeInfo"].get("containerRuntimeVersion"),
+                }
+                for n in items
+            }
+        pods = _kubectl("get", "pods", "-n", ns, "-o", "json")
+        if pods.returncode == 0:
+            images: Dict[str, str] = {}
+            for pod in json.loads(pods.stdout).get("items") or []:
+                for cs in pod.get("status", {}).get("containerStatuses") or []:
+                    images[cs["name"]] = cs.get("imageID") or cs.get("image") or ""
+            fp["images"] = dict(sorted(images.items()))
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError, KeyError):
+        pass
+    # sch_netem lives in the node kernel. On docker-desktop the harness host
+    # shares the WSL2 kernel, so /proc/modules is a usable proxy; elsewhere
+    # the value stays None (unknown) rather than guessing.
+    try:
+        modules = Path("/proc/modules").read_text(encoding="utf-8")
+        fp["sch_netem_loaded"] = any(
+            line.split(" ", 1)[0] == "sch_netem" for line in modules.splitlines()
+        )
+    except OSError:
+        pass
+    fp["prometheus_url"] = (cfg.get("observability") or {}).get("prometheus_url")
+    payload = json.dumps(
+        {k: v for k, v in fp.items() if k != "collected_at"}, sort_keys=True
+    )
+    fp["sha256"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "env_fingerprint.json").write_text(
+        json.dumps(fp, indent=2), encoding="utf-8"
+    )
+    return fp
 
 
 def _run_chaos_loop(
@@ -946,6 +1300,7 @@ def _run_chaos_loop(
     completed: Dict[tuple, RunRecord],
     all_records: List[RunRecord],
     runs_csv: Path,
+    prior_attempts: Optional[Dict[tuple, int]] = None,
 ) -> None:
     """Run chaos for every (service, chaos_type, replica) cell.
 
@@ -956,67 +1311,94 @@ def _run_chaos_loop(
     """
     poll_s = int(cfg["platform"]["poll_interval_seconds"])
     timeout_s = int(cfg["platform"]["run_timeout_seconds"])
-    for cell in cells:
+    order_cfg = cfg.get("ordering") or {}
+    jitter_max = int(order_cfg.get("start_jitter_max_seconds", 0) or 0)
+    jitter_rng = random.Random(int(order_cfg.get("seed", 0)) + 1)
+    fingerprint_sha = str((cfg.get("_env_fingerprint") or {}).get("sha256") or "")
+    attempts: Dict[tuple, int] = dict(prior_attempts or {})
+    for order_idx, (cell, rep) in enumerate(_expand_cells(cells, replicas, cfg)):
         service = cell["service"]
         chaos_type = cell["chaos_type"]
-        for rep in range(replicas):
-            key = (phase, chaos_type, service, rep)
-            prior = completed.get(key)
-            if prior is not None:
-                print(
-                    f"  [{log_prefix}] skip   chaos={chaos_type} service={service} "
-                    f"replica={rep} (already completed run_id={prior.run_id})"
-                )
-                all_records.append(prior)
-                _flush_runs(runs_csv, all_records)
-                continue
+        key = (phase, chaos_type, service, rep)
+        prior = completed.get(key)
+        if prior is not None:
             print(
-                f"  [{log_prefix}] start  chaos={chaos_type} service={service} "
-                f"replica={rep}"
+                f"  [{log_prefix}] skip   chaos={chaos_type} service={service} "
+                f"replica={rep} (already completed run_id={prior.run_id})"
             )
-            try:
-                rec = create_and_start_run(api, cfg, service, rep, phase, chaos_type)
-            except Exception as exc:
-                rec = RunRecord(
-                    service=service,
-                    replica_idx=rep,
-                    phase=phase,
-                    chaos_target=service,
-                    experiment_id="",
-                    notes=f"start_failed: {exc}"[:500],
-                    chaos_type=chaos_type,
-                )
-                all_records.append(rec)
-                _flush_runs(runs_csv, all_records)
-                print(
-                    f"  [{log_prefix}] FAIL   chaos={chaos_type} service={service} "
-                    f"replica={rep}: {exc}"
-                )
-                continue
-            try:
-                final = wait_for_run(
-                    api, rec.run_id, poll_s=poll_s, timeout_s=timeout_s
-                )
-                rec.status = final.get("status", rec.status)
-                rec.started_at = final.get("started_at")
-                rec.ended_at = final.get("ended_at")
-                print(
-                    f"  [{log_prefix}] done   run_id={rec.run_id} status={rec.status}"
-                )
-            except Exception as exc:
-                rec.notes = f"wait_failed: {exc}"[:500]
-                print(f"  [{log_prefix}] TIMEOUT run_id={rec.run_id}: {exc}")
+            all_records.append(prior)
+            _flush_runs(runs_csv, all_records)
+            continue
+        attempt = attempts.get(key, 0) + 1
+        attempts[key] = attempt
+        jitter = jitter_rng.randint(0, jitter_max) if jitter_max > 0 else 0
+        if jitter:
+            print(f"  [{log_prefix}] jitter {jitter}s before start …")
+            time.sleep(jitter)
+        print(
+            f"  [{log_prefix}] start  chaos={chaos_type} service={service} "
+            f"replica={rep} attempt={attempt} order={order_idx}"
+        )
+        try:
+            rec = create_and_start_run(api, cfg, service, rep, phase, chaos_type)
+        except Exception as exc:
+            rec = RunRecord(
+                service=service,
+                replica_idx=rep,
+                phase=phase,
+                chaos_target=service,
+                experiment_id="",
+                notes=f"start_failed: {exc}"[:500],
+                chaos_type=chaos_type,
+                attempt=attempt,
+                order_idx=order_idx,
+                jitter_seconds=jitter,
+                env_fingerprint_sha=fingerprint_sha,
+            )
             all_records.append(rec)
             _flush_runs(runs_csv, all_records)
-            # Cooldown between runs: give pods time to fully recover (restart
-            # backoff, readinessProbe pass) before the next chaos injection.
-            # Without this, a pod OOM-killed by memory-hog may still be in
-            # CrashLoopBackOff when the next run's baseline phase samples
-            # metrics, inflating the background error_rate artificially.
-            cooldown_s = int(cfg["platform"].get("inter_run_cooldown_seconds", 0))
-            if cooldown_s > 0:
-                print(f"  [{log_prefix}] cooldown {cooldown_s}s …")
-                time.sleep(cooldown_s)
+            print(
+                f"  [{log_prefix}] FAIL   chaos={chaos_type} service={service} "
+                f"replica={rep}: {exc}"
+            )
+            continue
+        rec.attempt = attempt
+        rec.order_idx = order_idx
+        rec.jitter_seconds = jitter
+        rec.env_fingerprint_sha = fingerprint_sha
+        try:
+            final = wait_for_run(
+                api, rec.run_id, poll_s=poll_s, timeout_s=timeout_s
+            )
+            rec.status = final.get("status", rec.status)
+            rec.started_at = final.get("started_at")
+            rec.ended_at = final.get("ended_at")
+            if rec.status == "completed":
+                (
+                    rec.effect_observed,
+                    rec.effect_reason,
+                    rec.fault_window_source,
+                    rec.verdict,
+                ) = _manipulation_check(api, rec)
+            print(
+                f"  [{log_prefix}] done   run_id={rec.run_id} status={rec.status} "
+                f"verdict={rec.verdict or '-'} effect={rec.effect_observed} "
+                f"window={rec.fault_window_source or '-'}"
+            )
+        except Exception as exc:
+            rec.notes = f"wait_failed: {exc}"[:500]
+            print(f"  [{log_prefix}] TIMEOUT run_id={rec.run_id}: {exc}")
+        all_records.append(rec)
+        _flush_runs(runs_csv, all_records)
+        # Cooldown between runs: give pods time to fully recover (restart
+        # backoff, readinessProbe pass) before the next chaos injection.
+        # Without this, a pod OOM-killed by memory-hog may still be in
+        # CrashLoopBackOff when the next run's baseline phase samples
+        # metrics, inflating the background error_rate artificially.
+        cooldown_s = int(cfg["platform"].get("inter_run_cooldown_seconds", 0))
+        if cooldown_s > 0:
+            print(f"  [{log_prefix}] cooldown {cooldown_s}s …")
+            time.sleep(cooldown_s)
 
 
 def phase_chaos(
@@ -1031,19 +1413,25 @@ def phase_chaos(
     is 'completed' are kept as-is; everything else is re-attempted.
     """
     completed: Dict[tuple, RunRecord] = {}
+    prior_attempts: Dict[tuple, int] = {}
     if retry_failed:
         prior = _load_runs_csv(runs_csv)
         for rec in prior:
+            key = (rec.phase, rec.chaos_type, rec.service, rec.replica_idx)
+            # Failed tries still count so the ledger records total tries per cell.
+            prior_attempts[key] = max(prior_attempts.get(key, 0), rec.attempt)
             if rec.status == "completed" and rec.run_id:
-                completed[(rec.phase, rec.chaos_type, rec.service, rec.replica_idx)] = (
-                    rec
-                )
+                completed[key] = rec
         print(
             f"[retry-failed] keeping {len(completed)} completed cell(s) "
             f"from previous run"
         )
 
     all_records: List[RunRecord] = []
+    cfg["_env_fingerprint"] = collect_environment_fingerprint(cfg, runs_csv.parent)
+    print(f"[env] fingerprint sha={cfg['_env_fingerprint']['sha256']} "
+          f"netem={cfg['_env_fingerprint']['sch_netem_loaded']} "
+          f"harness={cfg['_env_fingerprint']['harness_git_head'][:8]}")
     print("--- PHASE 1: TRAIN (RAG corpus seeding) ---")
     _run_chaos_loop(
         api,
@@ -1055,6 +1443,7 @@ def phase_chaos(
         completed,
         all_records,
         runs_csv,
+        prior_attempts=prior_attempts,
     )
     print("--- PHASE 2: TEST (held-out runs) ---")
     _run_chaos_loop(
@@ -1067,6 +1456,7 @@ def phase_chaos(
         completed,
         all_records,
         runs_csv,
+        prior_attempts=prior_attempts,
     )
     print(f"Wrote {len(all_records)} run records to {_display_path(runs_csv)}")
     return all_records

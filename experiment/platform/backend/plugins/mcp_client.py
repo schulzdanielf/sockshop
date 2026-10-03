@@ -141,6 +141,7 @@ class MCPToolClient:
         *,
         tool_call_id: Optional[str] = None,
         tool_description: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> Any:
         tracer = get_tracer()
         started = time.monotonic()
@@ -161,7 +162,12 @@ class MCPToolClient:
                 {"tool.name": name, "argument_count": len(arguments or {})},
             )
             try:
-                raw = asyncio.run(self._call_tool_async(name, arguments))
+                call = self._call_tool_async(name, arguments)
+                raw = asyncio.run(
+                    asyncio.wait_for(call, timeout=timeout_seconds)
+                    if timeout_seconds is not None
+                    else call
+                )
                 payload = _extract_mcp_payload(raw)
                 span.set_attribute("rca.mcp.result_type", type(payload).__name__)
                 span.set_attribute("rca.mcp.success", True)

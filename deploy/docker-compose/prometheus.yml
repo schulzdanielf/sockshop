@@ -4,7 +4,7 @@ global:
     # How long until a scrape request times out.
     scrape_timeout: 10s
     # How frequently to evaluate rules.
-    evaluation_interval: 1m
+    evaluation_interval: 30s
 
 rule_files:
     - "/etc/prometheus/alert.rules"

@@ -30,6 +30,7 @@ Design goals
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 # ── Pod-name → service-name normalisation ───────────────────────────────
@@ -74,6 +75,16 @@ def _iter_series(payload: Any):
             except (ValueError, TypeError, IndexError):
                 continue
         yield labels, points
+
+
+def _coverage_summary(payload: Any) -> Dict[str, int]:
+    series_count = 0
+    sample_count = 0
+    for _, points in _iter_series(payload):
+        if points:
+            series_count += 1
+            sample_count += len(points)
+    return {"series_count": series_count, "sample_count": sample_count}
 
 
 def _aggregate_by_service(
@@ -142,6 +153,12 @@ def _counter_increments(points: List[tuple]) -> float:
     return increments
 
 
+def _sample_time_iso(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
 def _restart_rollup(payload: Any) -> Dict[str, Dict[str, Any]]:
     """Sum reset-aware counter increments by pod and service.
 
@@ -149,23 +166,52 @@ def _restart_rollup(payload: Any) -> Dict[str, Dict[str, Any]]:
     The query selects its canonical job; the check here also guards test or
     nonstandard payloads from counting duplicate scrape sources.
     """
-    per_pod: Dict[str, float] = {}
+    container_samples: Dict[tuple, Dict[float, float]] = {}
     for labels, points in _iter_series(payload):
         if labels.get("job") not in (None, "kube-state-metrics"):
             continue
         pod = str(labels.get("pod") or "")
         if not pod or pod == "unknown":
             continue
-        per_pod[pod] = per_pod.get(pod, 0.0) + _counter_increments(points)
+        container = str(labels.get("container") or "unknown")
+        samples = container_samples.setdefault((pod, container), {})
+        for timestamp, value in points:
+            samples[timestamp] = max(value, samples.get(timestamp, value))
 
     per_service: Dict[str, Dict[str, Any]] = {}
-    for pod, count in per_pod.items():
+    for (pod, container), samples in container_samples.items():
+        points = sorted(samples.items())
+        count = _counter_increments(points)
         service = _pod_to_service(pod)
         row = per_service.setdefault(
             service, {"service": service, "value": 0.0, "pods": []}
         )
         row["value"] += count
-        row["pods"].append({"pod": pod, "value": round(count, 4)})
+        observations = []
+        for (previous_time, previous), (current_time, current) in zip(
+            points, points[1:]
+        ):
+            delta = current - previous if current >= previous else current
+            if delta <= 0:
+                continue
+            observations.append(
+                {
+                    "observed_from": _sample_time_iso(previous_time),
+                    "observed_to": _sample_time_iso(current_time),
+                    "restart_count_delta": round(delta, 4),
+                    "counter_reset": current < previous,
+                    "timestamp_precision": "between_scrapes",
+                }
+            )
+        row["pods"].append(
+            {
+                "pod": pod,
+                "container": container,
+                "value": round(count, 4),
+                "restart_observations": observations[:20],
+                "omitted_restart_observation_count": max(0, len(observations) - 20),
+            }
+        )
     return per_service
 
 
@@ -193,14 +239,17 @@ def _service_level_series_top(
     raw = prometheus.query_range(query, start, end, step)
     if not isinstance(raw, dict) or raw.get("status") == "error":
         return {
+            "status": "tool_error",
             "found": False,
             "count": 0,
             "top": [],
             "error": raw.get("error") if isinstance(raw, dict) else "no data",
             "query": query,
             "window": {"start": start, "end": end},
+            "coverage": {"series_count": 0, "sample_count": 0},
         }
 
+    coverage = _coverage_summary(raw)
     means = _aggregate_by_service(raw, mode="mean")
     maxes = _aggregate_by_service(raw, mode="max")
     rows: List[Dict[str, Any]] = []
@@ -215,11 +264,14 @@ def _service_level_series_top(
         )
     rows.sort(key=lambda r: r[max_key], reverse=True)
     return {
+        "status": "ok" if coverage["series_count"] else "no_data",
         "found": any(r[max_key] > found_floor for r in rows),
         "count": sum(1 for r in rows if r[max_key] > found_floor),
+        "signal_detected": any(r[max_key] > found_floor for r in rows),
         "top": rows[:k],
         "query": query,
         "window": {"start": start, "end": end},
+        "coverage": coverage,
     }
 
 
@@ -251,13 +303,16 @@ def check_oom_kills(
     raw = prometheus.query_range(query, start, end, step)
     if not isinstance(raw, dict) or raw.get("status") == "error":
         return {
+            "status": "tool_error",
             "found": False,
             "count": 0,
             "top": [],
             "error": raw.get("error") if isinstance(raw, dict) else "no data",
             "query": query,
             "window": {"start": start, "end": end},
+            "coverage": {"series_count": 0, "sample_count": 0},
         }
+    coverage = _coverage_summary(raw)
     transitions = _aggregate_by_service(raw, mode="max_minus_min")
     still_high = _aggregate_by_service(raw, mode="max")
     rows: List[Dict[str, Any]] = []
@@ -274,11 +329,14 @@ def check_oom_kills(
     rows.sort(key=lambda r: r["delta"], reverse=True)
     transitioned = [r for r in rows if r["transitioned_in_window"]]
     return {
+        "status": "ok" if coverage["series_count"] else "no_data",
         "found": len(transitioned) > 0,
         "count": len(transitioned),
+        "signal_detected": len(transitioned) > 0,
         "top": rows[:5],
         "query": query,
         "window": {"start": start, "end": end},
+        "coverage": coverage,
     }
 
 
@@ -305,21 +363,26 @@ def check_pod_restarts(
     raw = prometheus.query_range(query, start, end, step)
     if not isinstance(raw, dict) or raw.get("status") == "error":
         return {
+            "status": "tool_error",
             "found": False,
             "count": 0,
             "top": [],
             "error": raw.get("error") if isinstance(raw, dict) else "no data",
             "query": query,
             "window": {"start": start, "end": end},
+            "coverage": {"series_count": 0, "sample_count": 0},
         }
+    coverage = _coverage_summary(raw)
     rollup = _restart_rollup(raw)
     # Return all observed services so a targeted question can distinguish a
     # zero count from a service omitted by a top-5 cutoff.
     top = _top_k(rollup, k=len(rollup))
     nonzero = [r for r in top if r["value"] > 0.5]
     return {
+        "status": "ok" if coverage["series_count"] else "no_data",
         "found": len(nonzero) > 0,
         "count": len(nonzero),
+        "signal_detected": len(nonzero) > 0,
         "top": [
             {
                 "service": r["service"],
@@ -330,7 +393,113 @@ def check_pod_restarts(
         ],
         "query": query,
         "window": {"start": start, "end": end},
+        "coverage": coverage,
     }
+
+
+def check_service_readiness(
+    prometheus,
+    *,
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    post_start: str = "",
+    post_end: str = "",
+    namespace: str = "sock-shop",
+    step: str = "15s",
+) -> Dict[str, Any]:
+    """Compare per-service pod readiness across bounded run phases."""
+    query = (
+        "kube_pod_status_ready"
+        f'{{namespace="{namespace}",condition="true",job="kube-state-metrics"}}'
+    )
+    windows = {
+        "baseline": (baseline_start, baseline_end),
+        "fault": (fault_start, fault_end),
+    }
+    if post_start and post_end:
+        windows["post"] = (post_start, post_end)
+
+    phases: Dict[str, Any] = {}
+    for phase, (start, end) in windows.items():
+        raw = prometheus.query_range(query, start, end, step)
+        if not isinstance(raw, dict) or raw.get("status") == "error":
+            phases[phase] = {
+                "status": "tool_error",
+                "error": raw.get("error") if isinstance(raw, dict) else "no data",
+                "coverage": {"series_count": 0, "sample_count": 0},
+                "services": [],
+            }
+            continue
+
+        coverage = _coverage_summary(raw)
+        pods: Dict[str, Dict[str, Any]] = {}
+        for labels, points in _iter_series(raw):
+            pod = str(labels.get("pod") or "")
+            if not pod or not points:
+                continue
+            service = _pod_to_service(pod)
+            ready_pct = 100.0 * sum(value >= 0.5 for _, value in points) / len(points)
+            ordered_points = sorted(set(points), key=lambda point: point[0])
+            transitions = []
+            for (previous_time, previous), (current_time, current) in zip(
+                ordered_points, ordered_points[1:]
+            ):
+                if (previous >= 0.5) == (current >= 0.5):
+                    continue
+                transitions.append(
+                    {
+                        "transition": (
+                            "ready_to_not_ready" if previous >= 0.5 else "not_ready_to_ready"
+                        ),
+                        "observed_from": _sample_time_iso(previous_time),
+                        "observed_to": _sample_time_iso(current_time),
+                        "timestamp_precision": "between_scrapes",
+                    }
+                )
+            row = pods.setdefault(service, {"service": service, "pods": []})
+            row["pods"].append(
+                {
+                    "pod": pod,
+                    "ready_pct": round(ready_pct, 2),
+                    "sample_count": len(points),
+                    "transitions": transitions[:20],
+                    "omitted_transition_count": max(0, len(transitions) - 20),
+                }
+            )
+
+        services = []
+        for row in pods.values():
+            pod_rows = row["pods"]
+            services.append(
+                {
+                    "service": row["service"],
+                    "pod_count": len(pod_rows),
+                    "ready_mean_pct": round(
+                        sum(pod["ready_pct"] for pod in pod_rows) / len(pod_rows), 2
+                    ),
+                    "pods": pod_rows,
+                }
+            )
+        services.sort(key=lambda row: (row["ready_mean_pct"], row["service"]))
+        phases[phase] = {
+            "status": "ok" if coverage["series_count"] else "no_data",
+            "coverage": coverage,
+            "services": services,
+            "window": {"start": start, "end": end},
+        }
+
+    phase_statuses = [phase["status"] for phase in phases.values()]
+    if all(status == "ok" for status in phase_statuses):
+        status = "ok"
+    elif any(status == "ok" for status in phase_statuses):
+        status = "partial"
+    elif any(status == "tool_error" for status in phase_statuses):
+        status = "tool_error"
+    else:
+        status = "no_data"
+    return {"status": status, "query": query, "step": step, "phases": phases}
 
 
 def _saturation_top(
@@ -383,13 +552,16 @@ def _saturation_top(
     raw = prometheus.query_range(query, start, end, step)
     if not isinstance(raw, dict) or raw.get("status") == "error":
         return {
+            "status": "tool_error",
             "found": False,
             "count": 0,
             "top": [],
             "error": raw.get("error") if isinstance(raw, dict) else "no data",
             "query": query,
             "window": {"start": start, "end": end},
+            "coverage": {"series_count": 0, "sample_count": 0},
         }
+    coverage = _coverage_summary(raw)
     # We use ``mean`` for "typical" saturation and ``max`` to flag spikes.
     means = _aggregate_by_service(raw, mode="mean")
     maxes = _aggregate_by_service(raw, mode="max")
@@ -405,11 +577,14 @@ def _saturation_top(
         )
     rows.sort(key=lambda r: r["saturation_max_pct"], reverse=True)
     return {
+        "status": "ok" if coverage["series_count"] else "no_data",
         "found": any(r["saturation_max_pct"] > 50 for r in rows),
         "count": sum(1 for r in rows if r["saturation_max_pct"] > 50),
+        "signal_detected": any(r["saturation_max_pct"] > 50 for r in rows),
         "top": rows[:k],
         "query": query,
         "window": {"start": start, "end": end},
+        "coverage": coverage,
     }
 
 
@@ -524,3 +699,349 @@ def check_request_latency_top(
         max_key="latency_p95_max_seconds",
         found_floor=0.25,
     )
+
+
+def _golden_metric_query(metric: str, namespace: str) -> str:
+    escaped_namespace = namespace.replace("\\", "\\\\").replace('"', '\\"')
+    if metric == "request_rate":
+        return (
+            "sum by (destination_workload) (rate(istio_requests_total{"
+            f'destination_workload_namespace="{escaped_namespace}",'
+            'destination_workload!="unknown"}[1m]))'
+        )
+    if metric == "error_rate":
+        return (
+            "100 * ("
+            "sum by (destination_workload) (rate(istio_requests_total{"
+            f'destination_workload_namespace="{escaped_namespace}",'
+            'destination_workload!="unknown",response_code=~"5.."}[1m])) '
+            "or on(destination_workload) 0 * sum by (destination_workload) "
+            "(rate(istio_requests_total{"
+            f'destination_workload_namespace="{escaped_namespace}",'
+            'destination_workload!="unknown"}[1m]))'
+            ") / clamp_min(sum by (destination_workload) (rate(istio_requests_total{"
+            f'destination_workload_namespace="{escaped_namespace}",'
+            'destination_workload!="unknown"}[1m])), 0.0001)'
+        )
+    if metric == "latency_p95":
+        return (
+            "histogram_quantile(0.95, sum(rate("
+            "istio_request_duration_milliseconds_bucket{"
+            f'destination_workload_namespace="{escaped_namespace}",'
+            'destination_workload!="unknown"}[1m])) '
+            "by (le, destination_workload)) / 1000"
+        )
+    if metric == "cpu_saturation_pct":
+        return (
+            "100 * sum by (pod) (rate(container_cpu_usage_seconds_total"
+            f'{{namespace="{escaped_namespace}",cpu="total"}}[1m]))'
+            " / on(pod) group_left() (sum by (pod) (container_spec_cpu_quota"
+            f'{{namespace="{escaped_namespace}",job="kubernetes-cadvisor"}}'
+            " / container_spec_cpu_period"
+            f'{{namespace="{escaped_namespace}",job="kubernetes-cadvisor"}}))'
+        )
+    if metric == "memory_saturation_pct":
+        return (
+            "100 * sum by (pod) (container_memory_working_set_bytes"
+            f'{{namespace="{escaped_namespace}",job="kubernetes-cadvisor"}})'
+            " / on(pod) group_left() (sum by (pod) (container_spec_memory_limit_bytes"
+            f'{{namespace="{escaped_namespace}",job="kubernetes-cadvisor"}} > 0))'
+        )
+    raise ValueError(f"unknown golden metric: {metric!r}")
+
+
+def _golden_phase_values(
+    prometheus,
+    *,
+    query: str,
+    start: str,
+    end: str,
+    step: str,
+) -> Dict[str, Any]:
+    raw = prometheus.query_range(query, start, end, step)
+    if not isinstance(raw, dict) or raw.get("status") == "error":
+        return {
+            "status": "tool_error",
+            "error": raw.get("error") if isinstance(raw, dict) else "invalid response",
+            "series_count": 0,
+            "sample_count": 0,
+            "services": {},
+        }
+
+    sample_count = 0
+    series_count = 0
+    for _, points in _iter_series(raw):
+        if points:
+            series_count += 1
+            sample_count += len(points)
+
+    if not series_count:
+        return {
+            "status": "no_data",
+            "series_count": 0,
+            "sample_count": 0,
+            "services": {},
+        }
+
+    means = _aggregate_by_service(raw, mode="mean")
+    maxes = _aggregate_by_service(raw, mode="max")
+    services = {
+        service: {
+            "mean": means[service]["value"],
+            "max": maxes.get(service, {}).get("value", 0.0),
+        }
+        for service in means
+    }
+    return {
+        "status": "ok",
+        "series_count": series_count,
+        "sample_count": sample_count,
+        "services": services,
+    }
+
+
+def get_run_golden_signals(
+    prometheus,
+    *,
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    namespace: str = "sock-shop",
+    step: str = "15s",
+    k: int = 10,
+) -> Dict[str, Any]:
+    """Compare RED and resource-saturation signals across run phases."""
+    windows = {
+        "baseline": {"start": baseline_start, "end": baseline_end},
+        "fault": {"start": fault_start, "end": fault_end},
+    }
+    definitions = {
+        "request_rate": "req/s",
+        "error_rate": "%",
+        "latency_p95": "s",
+        "cpu_saturation_pct": "%",
+        "memory_saturation_pct": "%",
+    }
+    metrics: Dict[str, Any] = {}
+    for metric, unit in definitions.items():
+        query = _golden_metric_query(metric, namespace)
+        phases = {
+            phase: _golden_phase_values(
+                prometheus,
+                query=query,
+                start=window["start"],
+                end=window["end"],
+                step=step,
+            )
+            for phase, window in windows.items()
+        }
+        baseline = phases["baseline"]
+        fault = phases["fault"]
+        if "tool_error" in {baseline["status"], fault["status"]}:
+            status = "tool_error"
+        elif baseline["status"] == "no_data" and fault["status"] == "no_data":
+            status = "no_data"
+        elif baseline["status"] != "ok" or fault["status"] != "ok":
+            status = "partial"
+        else:
+            status = "ok"
+
+        rows = []
+        for service in set(baseline["services"]) | set(fault["services"]):
+            before = baseline["services"].get(service)
+            during = fault["services"].get(service)
+            delta = round(during["mean"] - before["mean"], 4) if before and during else None
+            delta_pct = (
+                round(100.0 * delta / abs(before["mean"]), 2)
+                if delta is not None and before["mean"] != 0
+                else None
+            )
+            rows.append(
+                {
+                    "service": service,
+                    "baseline_mean": before["mean"] if before else None,
+                    "fault_mean": during["mean"] if during else None,
+                    "baseline_max": before["max"] if before else None,
+                    "fault_max": during["max"] if during else None,
+                    "delta_abs": delta,
+                    "delta_pct": delta_pct,
+                }
+            )
+        rows.sort(
+            key=lambda row: abs(row["delta_abs"]) if row["delta_abs"] is not None else -1,
+            reverse=True,
+        )
+        metrics[metric] = {
+            "status": status,
+            "signal_detected": any(
+                row["delta_abs"] is not None and abs(row["delta_abs"]) > 0.0001
+                for row in rows
+            ),
+            "unit": unit,
+            "query": query,
+            "phases": {
+                phase: {
+                    "window": windows[phase],
+                    "status": result["status"],
+                    "series_count": result["series_count"],
+                    "sample_count": result["sample_count"],
+                    **({"error": result["error"]} if result.get("error") else {}),
+                }
+                for phase, result in phases.items()
+            },
+            "top": rows[:k],
+        }
+
+    metric_statuses = {result["status"] for result in metrics.values()}
+    status = (
+        "ok" if metric_statuses == {"ok"}
+        else "tool_error" if "tool_error" in metric_statuses
+        else "partial" if "ok" in metric_statuses or "partial" in metric_statuses
+        else "no_data"
+    )
+    return {
+        "status": status,
+        "namespace": namespace,
+        "step": step,
+        "phases": windows,
+        "metrics": metrics,
+    }
+
+
+def check_network_packet_drops(
+    prometheus,
+    *,
+    baseline_start: str,
+    baseline_end: str,
+    fault_start: str,
+    fault_end: str,
+    step: str = "15s",
+    k: int = 5,
+) -> Dict[str, Any]:
+    """Compare node-interface packet-drop rates across baseline and fault windows."""
+    windows = {
+        "baseline": {"start": baseline_start, "end": baseline_end},
+        "fault": {"start": fault_start, "end": fault_end},
+    }
+    definitions = {
+        "network_receive_dropped_rate": "container_network_receive_packets_dropped_total",
+        "network_transmit_dropped_rate": "container_network_transmit_packets_dropped_total",
+    }
+    metrics: Dict[str, Any] = {}
+    for metric, counter in definitions.items():
+        query = (
+            f'sum by (interface) (rate({counter}'
+            '{job="kubernetes-cadvisor"}[30s]))'
+        )
+
+        phases = {}
+        for phase, window in windows.items():
+            raw = prometheus.query_range(
+                query,
+                start=window["start"],
+                end=window["end"],
+                step=step,
+            )
+            if not isinstance(raw, dict) or raw.get("status") == "error":
+                phases[phase] = {
+                    "status": "tool_error",
+                    "error": raw.get("error") if isinstance(raw, dict) else "invalid response",
+                    "series_count": 0,
+                    "sample_count": 0,
+                    "interfaces": {},
+                }
+                continue
+
+            grouped: Dict[str, List[float]] = {}
+            series_count = 0
+            sample_count = 0
+            for labels, points in _iter_series(raw):
+                if not points:
+                    continue
+                interface = str(
+                    labels.get("interface")
+                    or labels.get("device")
+                    or labels.get("instance")
+                    or "unlabeled"
+                )
+                values = [value for _, value in points]
+                grouped.setdefault(interface, []).extend(values)
+                series_count += 1
+                sample_count += len(values)
+
+            phases[phase] = {
+                "status": "ok" if series_count else "no_data",
+                "series_count": series_count,
+                "sample_count": sample_count,
+                "interfaces": {
+                    interface: {
+                        "mean": sum(values) / len(values),
+                        "max": max(values),
+                    }
+                    for interface, values in grouped.items()
+                },
+            }
+
+        baseline = phases["baseline"]
+        fault = phases["fault"]
+        if "tool_error" in {baseline["status"], fault["status"]}:
+            status = "tool_error"
+        elif baseline["status"] == "no_data" and fault["status"] == "no_data":
+            status = "no_data"
+        elif baseline["status"] != "ok" or fault["status"] != "ok":
+            status = "partial"
+        else:
+            status = "ok"
+
+        rows = []
+        for interface in set(baseline["interfaces"]) | set(fault["interfaces"]):
+            before = baseline["interfaces"].get(interface)
+            during = fault["interfaces"].get(interface)
+            delta = round(during["mean"] - before["mean"], 4) if before and during else None
+            rows.append(
+                {
+                    "interface": interface,
+                    "baseline_mean": before["mean"] if before else None,
+                    "fault_mean": during["mean"] if during else None,
+                    "fault_max": during["max"] if during else None,
+                    "delta_abs": delta,
+                }
+            )
+        rows.sort(
+            key=lambda row: row["delta_abs"] if row["delta_abs"] is not None else -1,
+            reverse=True,
+        )
+        metrics[metric] = {
+            "status": status,
+            "unit": "packets/s",
+            "signal_detected": any(
+                row["delta_abs"] is not None and row["delta_abs"] > 0.01
+                for row in rows
+            ),
+            "phases": {
+                phase: {
+                    "sample_count": result["sample_count"],
+                    "series_count": result["series_count"],
+                    "status": result["status"],
+                }
+                for phase, result in phases.items()
+            },
+            "top": rows[:k],
+        }
+
+    statuses = {metric["status"] for metric in metrics.values()}
+    status = (
+        "ok" if statuses == {"ok"}
+        else "tool_error" if "tool_error" in statuses
+        else "partial" if "ok" in statuses or "partial" in statuses
+        else "no_data"
+    )
+    return {
+        "status": status,
+        "found": any(metric["signal_detected"] for metric in metrics.values()),
+        "step": step,
+        "phases": windows,
+        "interpretation_limit": "node-interface evidence does not identify an application service or prove root cause by itself",
+        "metrics": metrics,
+    }

@@ -1,5 +1,6 @@
 """Tempo client for searching and retrieving traces."""
 from datetime import datetime, timedelta, timezone
+import time
 from typing import Any, Dict, Optional
 
 import httpx
@@ -29,6 +30,27 @@ class TempoClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.client = httpx.Client(timeout=timeout)
+
+    def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        retryable_statuses = {429, 500, 502, 503, 504}
+        for attempt in range(3):
+            try:
+                response = self.client.get(
+                    f"{self.base_url}{path}", params=params
+                )
+                if response.status_code in retryable_statuses and attempt < 2:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except httpx.TransportError as exc:
+                if attempt < 2:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                return {"status": "error", "error": str(exc)}
+            except httpx.HTTPError as exc:
+                return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": "Tempo request failed after retries"}
 
     def search_traces(
         self,
@@ -86,12 +108,7 @@ class TempoClient:
         elif service_name:
             params["q"] = f'{{resource.service.name="{service_name}"}}'
 
-        try:
-            response = self.client.get(f"{self.base_url}/api/search", params=params)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"status": "error", "error": str(e)}
+        return self._get_json("/api/search", params=params)
 
     def get_trace(self, trace_id: str) -> Dict[str, Any]:
         """Get a full trace by ID from Tempo.
@@ -102,12 +119,7 @@ class TempoClient:
         Returns:
             Trace payload from Tempo.
         """
-        try:
-            response = self.client.get(f"{self.base_url}/api/traces/{trace_id}")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"status": "error", "error": str(e)}
+        return self._get_json(f"/api/traces/{trace_id}")
 
     def close(self):
         """Close the HTTP client."""

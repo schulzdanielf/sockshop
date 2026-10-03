@@ -46,6 +46,7 @@ class ManualConclusionRequest(BaseModel):
 class TelemetryChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     use_model: bool = True
+    window_scope: Literal["fault", "run"] = "fault"
     max_steps: int = Field(default=2, ge=1, le=4)
     max_new_tokens: int = Field(default=512, ge=64, le=1024)
 

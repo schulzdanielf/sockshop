@@ -77,10 +77,10 @@ frontend:
         tag: 0.3.12
     resources:
         limits:
-            cpu: 300m
+            cpu: 500m
             memory: 1000Mi
         requests:
-            cpu: 100m
+            cpu: 200m
             memory: 300Mi
 
 loadtest:
