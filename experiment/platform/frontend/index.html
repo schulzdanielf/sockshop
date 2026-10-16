@@ -156,7 +156,9 @@
         <form id="telemetryChatForm" class="chat-composer">
           <input id="telemetryChatInput" autocomplete="off" placeholder="Qual serviço teve a maior taxa de erros?" disabled />
           <button type="submit" id="telemetryChatSendBtn" disabled>Enviar</button>
-          <button type="button" id="telemetryRcaBtn" disabled title="Investigar causa raiz do run selecionado">RCA</button>
+          <button type="button" id="telemetrySkillRcaBtn" disabled title="Investigar com Qwen, telemetria progressiva e corroboração de evidências">Skill RCA</button>
+          <button type="button" id="telemetryMultiagentRcaBtn" disabled title="Investigar o run selecionado com coordenador e especialistas de métricas, logs e traces">Investigação multiagentes</button>
+          <button type="button" id="telemetryRcaBtn" disabled title="Investigar com o fluxo RCA anterior">RCA antiga</button>
         </form>
         <div class="chat-suggestions">
           <button type="button" data-chat-question="Qual serviço teve a maior porcentagem de erros?">maior taxa de erros</button>

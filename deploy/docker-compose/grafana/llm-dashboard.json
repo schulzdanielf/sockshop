@@ -38,7 +38,7 @@
         "id": 1,
         "type": "timeseries",
         "title": "Instrumented requests / second",
-        "description": "Series are split by job: llm-qwen14b is model execution; rca-platform is client-side instrumentation. Do not sum the two jobs as unique requests.",
+        "description": "Series are split by job: llm-qwen14b and llm-qwen35 are model execution; rca-platform is client-side instrumentation. Do not sum the jobs as unique requests.",
         "datasource": {
           "type": "prometheus",
           "uid": "prometheus"
@@ -188,7 +188,7 @@
         "targets": [
           {
             "refId": "A",
-            "expr": "sum by (finish_reason) (count_over_time({service=\"llm-qwen14b\"} | json | event=\"gen_ai.chat\" | regexp \"gen_ai\\\\.response\\\\.finish_reasons.*(?P<finish_reason>stop|length)\" | finish_reason!=\"\" [5m]))",
+            "expr": "sum by (finish_reason) (count_over_time({service=~\"llm-qwen14b|llm-qwen35\"} | json | event=\"gen_ai.chat\" | regexp \"gen_ai\\\\.response\\\\.finish_reasons.*(?P<finish_reason>stop|length)\" | finish_reason!=\"\" [5m]))",
             "legendFormat": "{{finish_reason}}",
             "queryType": "range"
           }
@@ -206,7 +206,7 @@
         "targets": [
           {
             "refId": "A",
-            "expr": "{service=\"llm-qwen14b\"} | json | event=\"gen_ai.chat\" | regexp \"gen_ai\\\\.response\\\\.finish_reasons.*(?P<finish_reason>stop|length)\" | finish_reason!=\"\" | line_format \"model={{.gen_ai_request_model}} finish={{.finish_reason}} input={{.gen_ai_usage_input_tokens}} output={{.gen_ai_usage_output_tokens}} visible={{.rca_llm_visible_output_tokens}} duration={{.gen_ai_client_operation_duration}}s\"",
+            "expr": "{service=~\"llm-qwen14b|llm-qwen35\"} | json | event=\"gen_ai.chat\" | regexp \"gen_ai\\\\.response\\\\.finish_reasons.*(?P<finish_reason>stop|length)\" | finish_reason!=\"\" | line_format \"model={{.gen_ai_request_model}} finish={{.finish_reason}} input={{.gen_ai_usage_input_tokens}} output={{.gen_ai_usage_output_tokens}} visible={{.rca_llm_visible_output_tokens}} duration={{.gen_ai_client_operation_duration}}s\"",
             "queryType": "range"
           }
         ],

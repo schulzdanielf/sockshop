@@ -4,7 +4,7 @@
 # Token budget target: <= 1200 tokens (~4800 chars including YAML overhead).
 
 system_id: sock-shop
-version: "2026-05-23"
+version: "2026-10-16"
 description: >
   Polyglot e-commerce demo (Weaveworks Sock Shop) running on Kubernetes.
   Synchronous HTTP between services, MongoDB/MySQL persistence,
@@ -14,7 +14,7 @@ platform:
   orchestrator: kubernetes
   namespace: sock-shop
   ingress: front-end NodePort / Ingress
-  service_mesh: none
+  service_mesh: istio
 
 services:
 
@@ -24,10 +24,11 @@ services:
     stack: node.js/express
     type: stateless
     upstream: [client]
-    downstream: [catalogue, carts, orders, user, payment]
-    storage: []
+    downstream: [catalogue, carts, orders, user, payment, session-db]
+    storage: [session-db]
     notes:
-      - "Single entry point; pod-delete here drops global RPS by design."
+      - "Single entry point, with front-end-envoy and istio-proxy containers.
+         Application logs and proxy logs are distinct sources."
       - "5xx responses here usually reflect a failed downstream call,
          not a bug in front-end itself."
 
@@ -145,6 +146,14 @@ services:
     downstream: []
     storage: [persistent-volume]
 
+  session-db:
+    role: "Redis backing the front-end session store."
+    stack: redis
+    type: stateful
+    upstream: [front-end]
+    downstream: []
+    storage: []
+
 # Controlled vocabulary the LLM verdict must respect.
 allowed_rca_targets:
   - front-end
@@ -160,6 +169,7 @@ allowed_rca_targets:
   - rabbitmq
   - user
   - user-db
+  - session-db
   - unknown
 
 allowed_fault_categories:

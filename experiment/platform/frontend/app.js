@@ -283,16 +283,82 @@ document.getElementById('refreshHistoryBtn').addEventListener('click', loadHisto
 document.getElementById('historyDisagreementOnly')?.addEventListener('change', loadHistory);
 
 // ── MCP telemetry chat ──────────────────────────────────────────────────────
-function addChatMessage(role, text, meta = '') {
+function addChatMessage(role, text, meta = '', evidence = '', evidenceLabel = 'Evidências consultadas · janelas, logs e traces') {
   const container = document.getElementById('telemetryChatMessages');
   container.querySelector('.chat-empty')?.remove();
   const item = document.createElement('div');
   item.className = `chat-message ${role}`;
   const label = role === 'user' ? 'Você' : 'MCP / Qwen';
-  item.innerHTML = `<div class="chat-message-label">${label}</div><div class="chat-message-body"></div>${meta ? `<div class="chat-message-meta">${meta}</div>` : ''}`;
-  item.querySelector('.chat-message-body').textContent = text;
+  const labelElement = document.createElement('div');
+  labelElement.className = 'chat-message-label';
+  labelElement.textContent = label;
+  const body = document.createElement('div');
+  body.className = 'chat-message-body';
+  body.textContent = text;
+  item.append(labelElement, body);
+  if (meta) {
+    const metaElement = document.createElement('div');
+    metaElement.className = 'chat-message-meta';
+    metaElement.textContent = meta;
+    item.appendChild(metaElement);
+  }
+  if (evidence) {
+    const details = document.createElement('details');
+    details.className = 'chat-message-evidence';
+    const summary = document.createElement('summary');
+    summary.textContent = evidenceLabel;
+    const content = document.createElement('pre');
+    content.textContent = evidence;
+    details.append(summary, content);
+    item.appendChild(details);
+  }
   container.appendChild(item);
   container.scrollTop = container.scrollHeight;
+}
+
+function formatRcaEvidence(bundle) {
+  if (!bundle || typeof bundle !== 'object') return '';
+  const lines = [];
+  for (const [phase, window] of Object.entries(bundle.source_windows || {})) {
+    if (window?.start && window?.end) {
+      lines.push(`${phase}: ${window.start} → ${window.end}`);
+    }
+  }
+  for (const [tool, coverage] of Object.entries(bundle.coverage || {})) {
+    if (/log|loki|tempo/i.test(tool)) {
+      lines.push(`${tool}: ${coverage?.status || 'unknown'} (${coverage?.source || 'live'})`);
+    }
+  }
+  for (const event of (bundle.timeline || []).slice(0, 40)) {
+    if (event.kind === 'log_signature') {
+      lines.push(
+        `Loki ${event.phase} · ${event.service} · ${event.signature} · ${event.count_observed} linhas · ${event.first_seen}–${event.last_seen}`
+      );
+      for (const example of (event.examples || []).slice(0, 2)) {
+        if (example.message) lines.push(`  ${example.timestamp || ''} ${example.message}`);
+      }
+    } else if (event.kind === 'log_sample') {
+      lines.push(`Loki ${event.phase} · ${event.timestamp || ''} · ${event.message || ''}`);
+    } else if (event.kind === 'trace_failure_signature') {
+      lines.push(
+        `Tempo ${event.phase} · ${event.start_time || event.start_time_unix_nano || ''} · ${event.signature || 'falha'} · ${event.affected_service || ''} · trace ${event.trace_id || ''}`
+      );
+    } else if (event.kind === 'trace_error_span') {
+      lines.push(
+        `Span com erro · ${event.phase} · ${event.trace_start_time || ''} · ${event.service || ''}.${event.name || ''} · ${event.duration_ms ?? '?'} ms · trace ${event.trace_id || ''}`
+      );
+      if (event.message) lines.push(`  ${event.message}`);
+    } else if (event.kind === 'trace_critical_path_span') {
+      lines.push(
+        `Caminho crítico · ${event.phase} · ${event.service || ''}.${event.name || ''} · ${event.duration_ms ?? '?'} ms · trace ${event.trace_id || ''}`
+      );
+    } else if (event.kind === 'readiness_transition' || event.kind === 'restart_counter_increment') {
+      lines.push(
+        `${event.kind === 'readiness_transition' ? 'Readiness' : 'Restart'} · ${event.phase || ''} · ${event.service || ''} · ${event.pod || ''} · ${event.transition || event.restart_count_delta || ''}`
+      );
+    }
+  }
+  return lines.join('\n').slice(0, 16000);
 }
 
 function formatDuration(seconds) {
@@ -339,9 +405,13 @@ function setTelemetryRun(runId) {
   const input = document.getElementById('telemetryChatInput');
   const send = document.getElementById('telemetryChatSendBtn');
   const rca = document.getElementById('telemetryRcaBtn');
+  const skillRca = document.getElementById('telemetrySkillRcaBtn');
+  const multiagentRca = document.getElementById('telemetryMultiagentRcaBtn');
   input.disabled = !telemetryRunId || telemetryBusy;
   send.disabled = !telemetryRunId || telemetryBusy;
   rca.disabled = !telemetryRunId || telemetryBusy;
+  skillRca.disabled = !telemetryRunId || telemetryBusy;
+  multiagentRca.disabled = !telemetryRunId || telemetryBusy;
   const run = telemetryRuns.find((item) => item.run_id === telemetryRunId);
   document.getElementById('chatWindowBadge').textContent = run
     ? `${run.run_id} · ${run.status}`
@@ -349,9 +419,25 @@ function setTelemetryRun(runId) {
 }
 
 async function loadTelemetryRuns() {
-  const select = document.getElementById('telemetryRunSelect');
-  telemetryRuns = (await api('/api/runs')).filter((run) => ['completed', 'failed', 'stopped'].includes(run.status));
-  renderTelemetryRuns();
+  const count = document.getElementById('telemetryRunFilterCount');
+  count.textContent = 'Carregando runs…';
+  try {
+    telemetryRuns = (await api('/api/runs'))
+      .filter((run) => ['completed', 'failed', 'stopped'].includes(run.status));
+    if (!telemetryRunId && telemetryRuns.length) {
+      telemetryRunId = telemetryRuns[0].run_id;
+    }
+    renderTelemetryRuns();
+    const empty = document.querySelector('#telemetryChatMessages .chat-empty');
+    if (telemetryRunId && empty?.textContent.includes('Escolha um run concluído')) {
+      empty.textContent = `Run mais recente selecionado (${telemetryRunId}). Faça uma pergunta ou inicie uma investigação.`;
+    }
+  } catch (err) {
+    count.textContent = `Erro ao carregar runs: ${err.message}`;
+    if (!telemetryRunId) {
+      addChatMessage('error', `Não foi possível carregar os runs para análise: ${err.message}`);
+    }
+  }
 }
 
 function renderTelemetryRuns() {
@@ -464,7 +550,8 @@ document.getElementById('telemetryRcaBtn').addEventListener('click', async () =>
     addChatMessage(
       'assistant',
       result.answer,
-      `RCA · ${result.iterations} iterações · ${tools} · ${result.stop_reason}`
+      `RCA · ${result.iterations} iterações · ${tools} · ${result.stop_reason}`,
+      formatRcaEvidence(result.evidence_bundle)
     );
   } catch (err) {
     addChatMessage('error', `Não foi possível investigar a causa raiz: ${err.message}`);
@@ -474,7 +561,134 @@ document.getElementById('telemetryRcaBtn').addEventListener('click', async () =>
     setTelemetryRun(telemetryRunId);
   }
 });
-loadTelemetryRuns().catch(() => {});
+document.getElementById('telemetrySkillRcaBtn').addEventListener('click', async () => {
+  if (!telemetryRunId || telemetryBusy) return;
+  const button = document.getElementById('telemetrySkillRcaBtn');
+  const runId = telemetryRunId;
+  telemetryBusy = true;
+  setTelemetryRun(runId);
+  button.textContent = 'Investigando…';
+  addChatMessage('user', 'Investigue este run com Skill RCA: corrobore telemetrias e explique o motivo dos restarts.');
+  try {
+    const result = await api(`/api/runs/${runId}/skill-rca`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+    const diagnosis = result.diagnosis;
+    const lines = [result.answer];
+    if (diagnosis?.causal_chain?.length) {
+      lines.push(`Cadeia causal: ${diagnosis.causal_chain.join(' → ')}`);
+    }
+    if (diagnosis?.contradicting_evidence?.length) {
+      lines.push(`Evidências contraditórias: ${diagnosis.contradicting_evidence.join(', ')}`);
+    }
+    for (const restart of diagnosis?.restart_analysis || []) {
+      lines.push(`Restart ${restart.service}: ${restart.reason} (${restart.reason_status})`);
+      lines.push(`Suporte: ${restart.supporting_evidence.join(', ') || 'insuficiente'}`);
+      lines.push(`Próximo check: ${restart.next_check}`);
+    }
+    for (const alternative of diagnosis?.alternatives || []) {
+      lines.push(`Hipótese alternativa: ${alternative.hypothesis}\nSuporte: ${alternative.supporting_evidence.join(', ') || 'não observado'}; contradições: ${alternative.contradicting_evidence.join(', ') || 'não observadas'}`);
+    }
+    for (const check of diagnosis?.next_checks || []) lines.push(`Investigar: ${check}`);
+    const evidence = (result.evidence || []).map(item =>
+      `${item.id} · nível ${item.level} · ${item.family} · ${item.tool} · ${item.status} · ${item.fault_observation_count} observações em fault (${item.observation_count} no total)\n${JSON.stringify(item.arguments)}\n${JSON.stringify(item.digest)}`
+    ).join('\n\n');
+    addChatMessage(
+      'assistant',
+      lines.join('\n'),
+      `Skill RCA · ${result.status} · ${result.model} · tentativa ${result.attempt_id} · ${result.artifact_path}`,
+      evidence + '\n' + formatRcaEvidence(result.evidence_bundle)
+    );
+  } catch (err) {
+    addChatMessage('error', `Skill RCA não produziu diagnóstico: ${err.message}`);
+  } finally {
+    telemetryBusy = false;
+    button.textContent = 'Skill RCA';
+    setTelemetryRun(telemetryRunId);
+  }
+});
+document.getElementById('telemetryMultiagentRcaBtn').addEventListener('click', async () => {
+  if (!telemetryRunId || telemetryBusy) return;
+  const button = document.getElementById('telemetryMultiagentRcaBtn');
+  const runId = telemetryRunId;
+  telemetryBusy = true;
+  setTelemetryRun(runId);
+  button.textContent = 'Investigando…';
+  addChatMessage('user', `Investigue ${runId} com coordenador e especialistas de métricas, logs e traces.`);
+  try {
+    const result = await api(`/api/runs/${encodeURIComponent(runId)}/multiagent-rca`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+    const diagnosis = result.diagnosis;
+    const lines = [result.answer];
+    const coverage = result.telemetry_coverage;
+    if (coverage?.missing_fault_families?.length) {
+      lines.push(`Telemetria sem observações em fault: ${coverage.missing_fault_families.join(', ')}`);
+    }
+    for (const [family, detail] of Object.entries(coverage?.families || {})) {
+      if (detail.truncated_queries) lines.push(`${family}: ${detail.truncated_queries} consultas com amostragem truncada.`);
+      if (detail.errors) lines.push(`${family}: ${detail.errors} erros de consulta.`);
+    }
+    for (const probe of result.coverage_probes || []) {
+      lines.push(`Cobertura de traces · ${probe.phase}: ${probe.status}${probe.error ? ` (${probe.error})` : ''}`);
+    }
+    if (coverage?.uncollected_sources?.length) {
+      lines.push(`Fontes não coletadas: ${coverage.uncollected_sources.join(', ')}`);
+    }
+    if (result.stop_reason) lines.push(`Encerramento do aprofundamento: ${result.stop_reason}`);
+    for (const round of result.followup_rounds || []) {
+      lines.push(`Rodada ${round.round} · ${round.status}: ${round.reason}`);
+      if (round.request) {
+        lines.push(`${round.request.tool} · ${round.request.service} · ${round.request.phase}: ${round.request.question}`);
+      }
+      if (round.evidence_id) lines.push(`Evidência: ${round.evidence_id} · ${round.query_status} · ${round.query_ref}`);
+      if (round.error) lines.push(`Erro: ${round.error}`);
+    }
+    if (diagnosis?.causal_chain?.length) {
+      lines.push(`Cadeia causal: ${diagnosis.causal_chain.join(' → ')}`);
+    }
+    for (const restart of diagnosis?.restart_analysis || []) {
+      lines.push(`Restart ${restart.service}: ${restart.reason} (${restart.reason_status})`);
+      lines.push(`Suporte: ${restart.supporting_evidence.join(', ') || 'insuficiente'}`);
+      lines.push(`Próximo check: ${restart.next_check}`);
+    }
+    for (const [index, hypothesis] of (diagnosis?.alternatives || []).entries()) {
+      lines.push(`Hipótese alternativa ${index + 1}: ${hypothesis}`);
+    }
+    for (const check of diagnosis?.next_checks || []) lines.push(`Investigar: ${check}`);
+    if (diagnosis?.limitations?.length) {
+      lines.push('Limitações:', ...diagnosis.limitations.map(item => `• ${item}`));
+    }
+    const specialists = (result.specialists || []).map(item =>
+      `${item.specialist}: ${item.status}${item.error ? ` (${item.error})` : ''}`
+    );
+    const callByEvidence = new Map((result.calls || []).map(item => [item.evidence_id, item]));
+    const evidence = (result.evidence || []).map(item => {
+      const call = callByEvidence.get(item.evidence_id) || {};
+      return `${item.evidence_id} · nível ${item.level} · ${item.family} · ${item.status} · ${call.fault_observation_count || 0} observações em fault · ${item.query_ref}\n${JSON.stringify(call.arguments || {})}\n${JSON.stringify(call.digest || {})}`;
+    }).join('\n\n');
+    if (telemetryRunId === runId) {
+      addChatMessage(
+        'assistant',
+        lines.join('\n'),
+        `Investigação multiagentes · ${result.status} · ${result.model} · ${result.budget?.model_calls_used || 0} chamadas ao modelo · ${result.artifact_path}`,
+        `Contexto da aplicação: ${result.application_context?.version || 'não informado'} · ${result.application_context?.sha256 || ''}\nEspecialistas: ${specialists.join(' · ')}\nOrçamento utilizado: ${JSON.stringify(result.budget)}\nEvidências:\n${evidence}`,
+        'Achados dos especialistas e registro central de evidências'
+      );
+    }
+  } catch (err) {
+    if (telemetryRunId === runId) {
+      addChatMessage('error', `A investigação multiagentes falhou: ${err.message}`);
+    }
+  } finally {
+    telemetryBusy = false;
+    button.textContent = 'Investigação multiagentes';
+    setTelemetryRun(telemetryRunId);
+  }
+});
+loadTelemetryRuns();
 
 // ── Run History ──────────────────────────────────────────────────────────────
 const VERDICT_LABELS = ['resilient', 'degraded_recoverable', 'degraded_persistent', 'unsure'];

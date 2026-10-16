@@ -107,6 +107,70 @@ duas listas e re-rode `generate_chaos_manifests.py`.
 
 ## Run the experiment
 
+### 40 execucoes variadas, com falhas de 3 minutos
+
+A campanha usa 40 combinacoes distintas de servico/falha da matriz suportada:
+sete servicos de aplicacao e sete tipos de falha executaveis. Nenhum par se
+repete e cada execucao consecutiva muda tanto o servico quanto a falha.
+`http-status-code` nao e aplicado ao `front-end` (porta 8079). Bancos de dados,
+RabbitMQ, `io-stress` e `dns-error` ficam fora da matriz.
+
+O comando sem `--run` apenas imprime a matriz e a estimativa, sem criar
+arquivos, consultar o cluster ou aplicar falhas:
+
+```bash
+.venv/bin/python -m experiment.eval.memory_hog.run_forty_faults
+.venv/bin/python -m experiment.eval.memory_hog.run_forty_faults --run
+```
+
+Execute na raiz do repositorio, com a plataforma em `:8010` e os componentes
+de carga/observabilidade dos pre-requisitos ativos.
+
+A duracao da injecao e 180 s; nao garante indisponibilidade continua, pois
+reinicios e recuperacao dependem do Kubernetes. Cada run tem 60 s de baseline,
+30 s de warmup, margem de 90 s para inicializacao/finalizacao do workflow,
+120 s de observacao posterior e 60 s de cooldown. Reserve cerca de 8 h 20 min
+para as 40 execucoes, incluindo o overhead medido da plataforma; essa
+estimativa nao inclui as 40 chamadas RCA feitas depois que todos os runs
+terminarem.
+
+O script verifica a disponibilidade do Sock Shop, limites de CPU/memoria,
+`sch_netem`, ausencia de runs ativos e os templates Litmus necessarios.
+Execute `make chaos-enable-netem` antes, se o modulo ainda nao estiver ativo.
+Nao ha cadastramento automatico de templates: aplicar um template ausente
+dispararia workflows adicionais. Se faltar algum, o preflight aborta com os
+nomes para cadastramento separado.
+
+O harness existente gerencia carga, injecao, limpeza e coleta de telemetria.
+A campanha nao altera a configuracao principal. Depois dos 40 runs, o script
+chama a mesma rota online usada pelo botao de RCA,
+`POST /api/runs/{run_id}/rca`, para cada run concluido. Cada campanha grava
+configuracao, manifestos, `runs.csv`, `effect_validation.json` e
+`rca_evaluation.json` em `out/forty_faults/<campaign_id>/`. O relatorio RCA
+preserva a resposta e a cobertura por ferramenta e resume a precisao de
+localizacao do servico e de classificacao da categoria de falha contra o
+ground truth da matriz. O codigo de saida so e zero se os runs, as verificacoes
+de efeito e as chamadas RCA forem concluidos com sucesso.
+
+## Reavaliar uma campanha existente com a Skill RCA
+
+Para comparar a Skill RCA com o endpoint RCA anterior sem injetar falhas,
+execute o avaliador sobre uma campanha já concluída. Por padrão, ele seleciona
+exatamente os runs completos do relatório `rca_evaluation_retry.json`, chama
+`POST /api/runs/{run_id}/skill-rca` para cada run e grava um relatório separado
+`rca_skill_evaluation.json`, preservando os relatórios da RCA antiga:
+
+```bash
+.venv/bin/python -m experiment.eval.memory_hog.evaluate_skill_rca \
+  --api-base http://127.0.0.1:8010
+```
+
+A plataforma deve estar reiniciada/recarregada com a rota Skill RCA. O comando
+não executa caos. Para outra campanha, informe `--campaign-dir`; o resultado
+exige o relatório baseline `rca_evaluation_retry.json` correspondente e
+recusa sobrescrever um relatório já existente. Cada tentativa salva seu
+artefato próprio na plataforma e o progresso é persistido após cada run.
+
 End-to-end (train → test → eval):
 
 ```bash

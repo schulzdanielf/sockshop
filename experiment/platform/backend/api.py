@@ -11,8 +11,10 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import re
 import sqlite3
 import time
+from uuid import uuid4
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from opentelemetry.trace import Status, StatusCode
+from pydantic import ValidationError
 
 from .adapters.noop_notifier import NoopNotificationAdapter
 from .analysis import (
@@ -57,7 +60,7 @@ from .agent_console import (
     answer_run_rca_mcp,
     rca_reference_phases,
 )
-from .plugins.mcp_client import MCPToolClient
+from .plugins.mcp_client import CompositeMCPToolClient, MCPToolClient
 from .models import (
     ApproveRunRequest,
     CreateExperimentRequest,
@@ -86,6 +89,15 @@ from .plugins.mcp_evidence_snapshot_plugin import (
 from .plugins.mcp_metrics_plugin import MCPPrometheusMetricsPlugin
 from .plugins.mcp_traces_plugin import MCPTempoTracesPlugin
 from .security import require_roles
+from .rca_skill import SkillRCAError, answer_skill_rca
+from .multiagent_rca import (
+    InvestigationBudget,
+    InvestigationContext,
+    InvestigationPlan,
+    answer_multiagent_rca,
+    build_investigation_plan,
+)
+from .analysis.system_card import SystemCardError, load_system_card
 from .storage.sqlite_storage import SqliteStorage
 
 
@@ -103,6 +115,29 @@ def _select_telemetry_windows(
         raise ValueError("telemetry chat requires a fault phase window")
     baseline_window = phases.get("baseline")
     return fault_window, baseline_window if isinstance(baseline_window, dict) else None
+
+
+def _build_multiagent_context(
+    run_id: str, namespace: str, window: dict
+) -> InvestigationContext:
+    if not isinstance(namespace, str) or not re.fullmatch(
+        r"[a-z0-9]+(?:[-.][a-z0-9]+)*", namespace
+    ):
+        raise ValueError("Invalid namespace for multiagent RCA")
+    card = load_system_card(namespace)
+    return InvestigationContext(
+        run_id=run_id,
+        namespace=namespace,
+        known_services=sorted((card.get("services") or {}).keys()),
+        allowed_categories=list(card.get("allowed_fault_categories") or []),
+        phases={
+            name: phase
+            for name, phase in (window.get("phases") or {}).items()
+            if name in {"baseline", "fault", "post"}
+        },
+        phase_sources=window.get("phase_sources") or {},
+        partial=window.get("partial", False),
+    )
 
 
 def create_app() -> FastAPI:
@@ -419,6 +454,15 @@ def create_app() -> FastAPI:
         mcp_client = MCPToolClient(
             str(mcp_url), int(metrics_config.get("timeout_seconds", 10))
         )
+        grafana_mcp_url = os.getenv("GRAFANA_MCP_SSE_URL", "").strip()
+        if req.use_model and grafana_mcp_url:
+            grafana_mcp_timeout = int(os.getenv("GRAFANA_MCP_TIMEOUT_SECONDS", "30"))
+            mcp_client = CompositeMCPToolClient(
+                [
+                    mcp_client,
+                    MCPToolClient(grafana_mcp_url, grafana_mcp_timeout),
+                ]
+            )
 
         tracer = get_tracer()
         with tracer.start_as_current_span("agent.telemetry_chat") as span:
@@ -437,6 +481,10 @@ def create_app() -> FastAPI:
             span.set_attribute("rca.run_window.end", window["window"]["end"])
             span.set_attribute("rca.agent.use_model", req.use_model)
             span.set_attribute("rca.agent.max_steps", req.max_steps)
+            span.set_attribute(
+                "rca.agent.grafana_mcp.enabled",
+                bool(req.use_model and grafana_mcp_url),
+            )
             try:
                 chat_context = {
                     "start": query_window["start"],
@@ -635,8 +683,184 @@ def create_app() -> FastAPI:
             "iterations": result["iterations"],
             "stop_reason": result["stop_reason"],
             "artifact_path": artifact_path,
+            "evidence_bundle": result.get("evidence_bundle", {}),
             "used_mcp": True,
         }
+
+    @app.get("/api/runs/{run_id}/multiagent-rca/plan", response_model=InvestigationPlan)
+    def get_multiagent_rca_plan(run_id: str) -> InvestigationPlan:
+        window = get_observation_window(run_id)
+        try:
+            run = storage.get_run(run_id)
+            experiment = storage.get_experiment(run.experiment_id, run.experiment_version)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        namespace = experiment.spec.get("scope", {}).get("namespace", "sock-shop")
+        try:
+            context = _build_multiagent_context(run_id, namespace, window)
+        except (ValueError, ValidationError, SystemCardError, OSError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Multiagent planning requires valid windows, namespace and system card: {exc}",
+            ) from exc
+        return build_investigation_plan(context)
+
+    @app.post("/api/runs/{run_id}/multiagent-rca")
+    def run_multiagent_rca(run_id: str) -> dict:
+        window = get_observation_window(run_id)
+        try:
+            run = storage.get_run(run_id)
+            experiment = storage.get_experiment(run.experiment_id, run.experiment_version)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        namespace = experiment.spec.get("scope", {}).get("namespace", "sock-shop")
+        try:
+            context = _build_multiagent_context(run_id, namespace, window)
+        except (ValueError, ValidationError, SystemCardError, OSError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Multiagent RCA requires valid windows, namespace and system card: {exc}",
+            ) from exc
+
+        observability = experiment.spec.get("observability") or {}
+        metrics_config = observability.get("metrics") or {}
+        traces_config = observability.get("traces") or {}
+        mcp_url = metrics_config.get("mcp_sse_url") or traces_config.get("mcp_sse_url")
+        if not mcp_url:
+            raise HTTPException(status_code=409, detail="No MCP endpoint for multiagent RCA")
+        timeout = max(
+            int(metrics_config.get("timeout_seconds", 10)),
+            int(traces_config.get("timeout_seconds", 20)),
+        )
+        attempt_id = uuid4().hex
+        with get_tracer().start_as_current_span("agent.multiagent_rca") as span:
+            span.set_attribute("rca.run_id", run_id)
+            span.set_attribute("rca.attempt_id", attempt_id)
+            span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
+            result = answer_multiagent_rca(
+                mcp_client=MCPToolClient(str(mcp_url), timeout),
+                context=context,
+                budget=InvestigationBudget(),
+                model=DEFAULT_LLM_MODEL,
+            )
+            result.update(
+                {
+                    "run_id": run_id,
+                    "attempt_id": attempt_id,
+                    "window": window["window"],
+                    "model": DEFAULT_LLM_MODEL,
+                }
+            )
+            artifact_path = storage.save_artifact(
+                run_id, f"multiagent_rca_{attempt_id}", result
+            )
+            result["artifact_path"] = artifact_path
+            if result["status"] == "error":
+                span.set_status(Status(StatusCode.ERROR, result.get("error") or "Multiagent RCA failed"))
+        storage.append_event(
+            DomainEvent(
+                run_id=run_id,
+                event_type=(
+                    "multiagent_rca_completed"
+                    if result["status"] != "error"
+                    else "multiagent_rca_failed"
+                ),
+                ts=result["generated_at"],
+                payload={
+                    "attempt_id": attempt_id,
+                    "status": result["status"],
+                    "artifact_path": artifact_path,
+                },
+            )
+        )
+        if result["status"] == "error":
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": result.get("error") or "Multiagent RCA failed",
+                    "artifact_path": artifact_path,
+                    "attempt_id": attempt_id,
+                },
+            )
+        return result
+
+    @app.post("/api/runs/{run_id}/skill-rca")
+    def run_skill_rca(run_id: str) -> dict:
+        window = get_observation_window(run_id)
+        phases = window.get("phases") or {}
+        if not {"baseline", "fault"}.issubset(phases):
+            raise HTTPException(
+                status_code=409, detail="Skill RCA requires baseline and fault windows"
+            )
+        try:
+            run = storage.get_run(run_id)
+            experiment = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        observability = experiment.spec.get("observability") or {}
+        metrics_config = observability.get("metrics") or {}
+        traces_config = observability.get("traces") or {}
+        mcp_url = metrics_config.get("mcp_sse_url") or traces_config.get("mcp_sse_url")
+        if not mcp_url:
+            raise HTTPException(status_code=409, detail="No MCP endpoint for Skill RCA")
+        timeout = max(
+            int(metrics_config.get("timeout_seconds", 10)),
+            int(traces_config.get("timeout_seconds", 20)),
+        )
+        attempt_id = uuid4().hex
+        with get_tracer().start_as_current_span("agent.skill_rca") as span:
+            span.set_attribute("rca.run_id", run_id)
+            span.set_attribute("rca.attempt_id", attempt_id)
+            span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
+            try:
+                result = answer_skill_rca(
+                    mcp_client=MCPToolClient(str(mcp_url), timeout),
+                    phases=phases,
+                    namespace=str(experiment.spec.get("scope", {}).get("namespace", "sock-shop")),
+                    window_metadata={
+                        key: window[key]
+                        for key in ("phase_sources", "partial", "sampling_interval_seconds")
+                        if key in window
+                    },
+                )
+            except (SkillRCAError, OSError) as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            result.update(
+                {
+                    "run_id": run_id,
+                    "attempt_id": attempt_id,
+                    "window": window["window"],
+                    "model": DEFAULT_LLM_MODEL,
+                }
+            )
+            artifact_path = storage.save_artifact(
+                run_id, f"skill_rca_{attempt_id}", result
+            )
+            result["artifact_path"] = artifact_path
+            if result["status"] == "error":
+                span.set_status(Status(StatusCode.ERROR, result["error"]))
+        storage.append_event(
+            DomainEvent(
+                run_id=run_id,
+                event_type="skill_rca_completed" if result["status"] != "error" else "skill_rca_failed",
+                ts=result["generated_at"],
+                payload={
+                    "attempt_id": attempt_id,
+                    "status": result["status"],
+                    "artifact_path": artifact_path,
+                },
+            )
+        )
+        if result["status"] == "error":
+            raise HTTPException(
+                status_code=502,
+                detail={"error": result["error"], "artifact_path": artifact_path, "attempt_id": attempt_id},
+            )
+        return result
 
     @app.get("/api/runs/{run_id}/summary")
     def get_run_summary(run_id: str) -> dict:

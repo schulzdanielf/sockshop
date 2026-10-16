@@ -391,6 +391,8 @@ def call_llm_tool_messages(
     model: str = DEFAULT_LLM_MODEL,
     api_style: Optional[str] = None,
     api_key: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
+    response_format: Optional[Dict[str, Any]] = None,
     usage: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Call an OpenAI-compatible chat endpoint with tools and return its message."""
@@ -410,6 +412,10 @@ def call_llm_tool_messages(
         "tool_choice": tool_choice,
         "parallel_tool_calls": parallel_tool_calls,
     }
+    if chat_template_kwargs is not None:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    if response_format is not None:
+        payload["response_format"] = response_format
     usage_data: Dict[str, Any] = {}
     started = time.perf_counter()
     with get_tracer().start_as_current_span("gen_ai.chat") as span:

@@ -202,7 +202,7 @@ def _kubectl(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
     )
 
 
-def _existing_workflow_bases(namespace: str = CHAOS_NAMESPACE) -> set:
+def existing_workflow_bases(namespace: str = CHAOS_NAMESPACE) -> set[str]:
     """Base names (sans ``-<13-digit-ts>`` suffix) of Argo Workflows in
     *namespace* — i.e. the templates ``_submit_workflow`` is able to clone."""
     proc = _kubectl(
@@ -259,7 +259,7 @@ def ensure_chaos_templates(cfg: Dict[str, Any]) -> None:
     )
 
     try:
-        existing = _existing_workflow_bases()
+        existing = existing_workflow_bases()
     except (RuntimeError, FileNotFoundError, subprocess.SubprocessError) as exc:
         print(f"[prime] WARNING: could not list workflow templates: {exc}")
         print("[prime] skipping priming — cells without a template will fail")

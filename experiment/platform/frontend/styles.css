@@ -329,8 +329,33 @@ button:hover {
   margin-top: 0.55rem;
 }
 
+.chat-message-evidence {
+  margin-top: 0.55rem;
+  color: #a9cec6;
+  font-size: 0.78rem;
+}
+
+.chat-message-evidence summary {
+  cursor: pointer;
+}
+
+.chat-message-evidence pre {
+  max-height: 320px;
+  overflow: auto;
+  margin: 0.45rem 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 0.68rem "IBM Plex Mono", monospace;
+  line-height: 1.45;
+}
+
 .chat-composer input {
   flex: 1;
+  min-width: 180px;
+}
+
+.chat-composer {
+  flex-wrap: wrap;
 }
 
 .chat-composer button {
@@ -344,7 +369,7 @@ button:hover {
 }
 
 .chat-composer button:disabled {
-  cursor: wait;
+  cursor: not-allowed;
   opacity: 0.62;
 }
 

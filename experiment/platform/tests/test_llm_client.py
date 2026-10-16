@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 from experiment.platform.backend.analysis import llm_client
 
 
@@ -320,7 +322,13 @@ def test_call_llm_messages_reads_qwen_usage(monkeypatch):
     assert usage["source"] == "measured"
 
 
-def test_call_llm_tool_messages_sends_tools_and_returns_tool_calls(monkeypatch):
+@pytest.mark.parametrize("response_format", [
+    None,
+    {"type": "json_schema", "json_schema": {
+        "name": "Answer", "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+    }},
+])
+def test_call_llm_tool_messages_sends_tools_and_returns_tool_calls(monkeypatch, response_format):
     captured = {}
     tracer = MagicMock()
     span = tracer.start_as_current_span.return_value.__enter__.return_value
@@ -366,13 +374,19 @@ def test_call_llm_tool_messages_sends_tools_and_returns_tool_calls(monkeypatch):
         parallel_tool_calls=False,
         url="http://localhost:8001/v1/chat/completions",
         api_style="openai",
+        chat_template_kwargs={"enable_thinking": False},
+        response_format=response_format,
         usage=usage,
     )
 
     assert captured["payload"]["tools"] == tools
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert captured["payload"]["tool_choice"] == "auto"
     assert captured["payload"]["parallel_tool_calls"] is False
-    assert "response_format" not in captured["payload"]
+    if response_format is None:
+        assert "response_format" not in captured["payload"]
+    else:
+        assert captured["payload"]["response_format"] == response_format
     assert captured["timeout"] == llm_client.DEFAULT_LLM_TIMEOUT
     assert message["tool_calls"][0]["function"]["name"] == "get_cpu"
     assert usage["total_tokens"] == 18

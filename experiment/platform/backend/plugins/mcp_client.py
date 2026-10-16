@@ -13,7 +13,7 @@ import socket
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -134,6 +134,7 @@ class MCPToolClient:
                     int((time.monotonic() - started) * 1000),
                 )
 
+
     def call_tool_json(
         self,
         name: str,
@@ -190,3 +191,51 @@ class MCPToolClient:
                     "rca.mcp.duration_ms",
                     int((time.monotonic() - started) * 1000),
                 )
+
+
+class CompositeMCPToolClient:
+    """Expose tools from multiple MCP servers through one client interface."""
+
+    def __init__(self, clients: List[Any]):
+        if not clients:
+            raise ValueError("at least one MCP client is required")
+        self._clients = tuple(clients)
+        self._tool_clients: Dict[str, Any] = {}
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        tools = []
+        tool_clients = {}
+        for client in self._clients:
+            for tool in client.list_tools():
+                name = tool.get("name")
+                if not isinstance(name, str) or not name:
+                    raise RuntimeError("MCP server returned a tool without a name")
+                if name in tool_clients:
+                    raise RuntimeError(f"multiple MCP servers expose tool {name!r}")
+                tool_clients[name] = client
+                tools.append(tool)
+        self._tool_clients = tool_clients
+        return tools
+
+    def call_tool_json(
+        self,
+        name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        *,
+        tool_call_id: Optional[str] = None,
+        tool_description: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> Any:
+        client = self._tool_clients.get(name)
+        if client is None:
+            self.list_tools()
+            client = self._tool_clients.get(name)
+        if client is None:
+            raise KeyError(f"MCP tool {name!r} is not exposed by any configured server")
+        return client.call_tool_json(
+            name,
+            arguments,
+            tool_call_id=tool_call_id,
+            tool_description=tool_description,
+            timeout_seconds=timeout_seconds,
+        )

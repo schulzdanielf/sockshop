@@ -12,6 +12,8 @@ block once per system card version.
 from __future__ import annotations
 
 from functools import lru_cache
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -114,6 +116,45 @@ def render_system_card(system_id: str) -> str:
         )
 
     return "\n".join(parts)
+
+
+def application_context(system_id: str, services: List[str]) -> Dict[str, Any]:
+    card = load_system_card(system_id)
+    if not card:
+        raise SystemCardError(f"system card unavailable: {system_id}")
+    catalog = card.get("services") or {}
+    selected = {name for name in services if name in catalog}
+    neighbors = {
+        neighbor
+        for name in selected
+        for field in ("upstream", "downstream", "storage")
+        for neighbor in catalog[name].get(field, [])
+        if neighbor in catalog
+    }
+    payload = {
+        "kind": "application_context",
+        "version": card.get("version"),
+        "system_id": card.get("system_id", system_id),
+        "platform": {
+            key: value for key, value in (card.get("platform") or {}).items()
+            if key in {"orchestrator", "namespace", "service_mesh"}
+        },
+        "services": {
+            name: {
+                key: value for key, value in catalog[name].items()
+                if key in {"role", "stack", "type", "upstream", "downstream", "storage"}
+            }
+            for name in sorted(selected | neighbors)
+        },
+        "limitations": [
+            "Contexto estatico versionado, nao evidencia de falha nem topologia historica comprovada.",
+            "Dependencia declarada nao comprova propagacao; identidades de telemetria precisam de cobertura.",
+        ],
+    }
+    payload["sha256"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def list_system_cards() -> List[str]:

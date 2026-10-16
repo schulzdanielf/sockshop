@@ -1995,6 +1995,247 @@ def test_run_rca_queries_service_logs_after_locking_location():
     assert not valid(changed_location, result["calls"], expected_service="user")
 
 
+def test_run_rca_fetches_bounded_redacted_fault_trace_details():
+    trace_ids = ["a" * 32, "b" * 32, "c" * 32]
+
+    class _FakeMCPClient:
+        def __init__(self):
+            self.calls = []
+
+        def list_tools(self):
+            return [
+                {"name": "get_run_golden_signals", "inputSchema": {"properties": {}}},
+                {
+                    "name": "tempo_service_graph_phases",
+                    "inputSchema": {
+                        "properties": {
+                            "baseline_start": {},
+                            "baseline_end": {},
+                            "fault_start": {},
+                            "fault_end": {},
+                            "namespace": {},
+                            "limit": {},
+                            "top_k": {},
+                        }
+                    },
+                },
+                {
+                    "name": "tempo_analyze_trace",
+                    "inputSchema": {"properties": {"trace_id": {}}},
+                },
+            ]
+
+        def call_tool_json(self, name, arguments, **_kwargs):
+            self.calls.append((name, arguments))
+            if name == "get_run_golden_signals":
+                return {"status": "ok", "metrics": {}}
+            if name == "tempo_service_graph_phases":
+                return {
+                    "phases": {
+                        "baseline": {"failure_signatures": []},
+                        "fault": {
+                            "failure_signatures": [
+                                {
+                                    "trace_id": trace_id,
+                                    "start_time_unix_nano": "1790935330000000000",
+                                    "signature": "NETWORK_TIMEOUT",
+                                    "affected_service": "user",
+                                    "endpoint": "catalogue:80",
+                                    "operations": ["user.GET /"],
+                                }
+                                for trace_id in trace_ids
+                            ]
+                        },
+                    }
+                }
+            return {
+                "trace_duration_ms": 1250,
+                "span_count": 4,
+                "critical_path": [
+                    {
+                        "service": "user",
+                        "name": "GET /",
+                        "duration_ms": 1250,
+                        "exclusive_duration_ms": 800,
+                    }
+                ],
+                "error_spans": [
+                    {
+                        "service": "user",
+                        "name": "GET /",
+                        "duration_ms": 1250,
+                        "exclusive_duration_ms": 800,
+                        "message": "Authorization: Bearer trace-secret",
+                    }
+                ],
+                "failure_signatures": [],
+                "dependency_map": [{"from": "user", "to": "catalogue"}],
+                "service_latency": [],
+            }
+
+    client = _FakeMCPClient()
+    model_messages = []
+
+    def llm(messages, tools, **kwargs):
+        model_messages.append(messages)
+        names = [tool["function"]["name"] for tool in tools]
+        assert "tempo_analyze_trace" not in names
+        assert kwargs["max_new_tokens"] == 1024
+        return {
+            "content": (
+                "Localização provável: user\n"
+                "Causa provável: falha upstream observada nos spans"
+            )
+        }
+
+    phases = {
+        "baseline": {
+            "start": "2026-10-02T10:00:00Z",
+            "end": "2026-10-02T10:01:00Z",
+        },
+        "fault": {
+            "start": "2026-10-02T10:02:00Z",
+            "end": "2026-10-02T10:03:00Z",
+        },
+    }
+    result = agent_console.answer_run_rca_mcp(
+        mcp_client=client,
+        phases=phases,
+        namespace="sock-shop",
+        max_iterations=5,
+        llm=llm,
+    )
+
+    assert [name for name, _args in client.calls] == [
+        "get_run_golden_signals",
+        "tempo_service_graph_phases",
+        "tempo_analyze_trace",
+        "tempo_analyze_trace",
+    ]
+    assert [args["trace_id"] for name, args in client.calls if name == "tempo_analyze_trace"] == trace_ids[:2]
+    assert "trace-secret" not in json.dumps(result["calls"])
+    assert "trace-secret" not in json.dumps(model_messages)
+    assert "[REDACTED]" in json.dumps(result["evidence_bundle"]["timeline"])
+    assert sum(
+        item["kind"] == "trace_error_span"
+        for item in result["evidence_bundle"]["timeline"]
+    ) == 2
+    assert result["evidence_bundle"]["source_windows"]["fault"] == phases["fault"]
+
+
+def test_run_rca_uses_host_bounded_loki_range_query_when_phase_tool_is_missing():
+    class _FakeMCPClient:
+        def __init__(self):
+            self.calls = []
+
+        def list_tools(self):
+            return [
+                {
+                    "name": "get_run_golden_signals",
+                    "inputSchema": {"properties": {"namespace": {}}},
+                },
+                {
+                    "name": "loki_range_query",
+                    "inputSchema": {
+                        "properties": {
+                            "query": {},
+                            "start": {},
+                            "end": {},
+                            "limit": {},
+                        }
+                    },
+                },
+            ]
+
+        def call_tool_json(self, name, arguments, **_kwargs):
+            self.calls.append((name, arguments))
+            if name == "get_run_golden_signals":
+                return {"status": "ok", "metrics": {}}
+            timestamp_ns = "1790935330000000000"
+            return {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "stream": {
+                                "pod": "user-abcde-12345",
+                                "container": "user",
+                            },
+                            "values": [
+                                [
+                                    timestamp_ns,
+                                    "connection timeout authorization: Bearer loki-secret",
+                                ]
+                            ],
+                        }
+                    ]
+                },
+            }
+
+    client = _FakeMCPClient()
+    model_messages = []
+    replies = iter(
+        [
+            {
+                "content": (
+                    "Localização provável: user\n"
+                    "Causa provável: timeout upstream"
+                )
+            },
+            {
+                "content": (
+                    "Localização provável: user\n"
+                    "Causa provável: timeout upstream observado nos logs"
+                )
+            },
+        ]
+    )
+
+    def llm(messages, tools, **_kwargs):
+        model_messages.append(messages)
+        assert "loki_range_query" not in [
+            tool["function"]["name"] for tool in tools
+        ]
+        return next(replies)
+
+    phases = {
+        "baseline": {
+            "start": "2026-10-02T10:00:00Z",
+            "end": "2026-10-02T10:01:00Z",
+        },
+        "fault": {
+            "start": "2026-10-02T10:02:00Z",
+            "end": "2026-10-02T10:03:00Z",
+        },
+    }
+    result = agent_console.answer_run_rca_mcp(
+        mcp_client=client,
+        phases=phases,
+        namespace="sock-shop",
+        max_iterations=4,
+        llm=llm,
+    )
+
+    assert [name for name, _args in client.calls] == [
+        "get_run_golden_signals",
+        "loki_range_query",
+    ]
+    query_args = client.calls[1][1]
+    assert query_args == {
+        "query": '{namespace="sock-shop",pod=~"^user(-[a-z0-9]+)*$",container!=""}',
+        "start": "1790935320000000000",
+        "end": "1790935380000000000",
+        "limit": 300,
+    }
+    assert "loki-secret" not in json.dumps(result["calls"])
+    assert "loki-secret" not in json.dumps(model_messages)
+    assert "TIMEOUT" in json.dumps(model_messages)
+    timeline = result["evidence_bundle"]["timeline"]
+    assert timeline[0]["kind"] == "log_signature"
+    assert timeline[0]["examples"][0]["message"].endswith("[REDACTED]")
+    assert result["evidence_bundle"]["coverage"]["loki_range_query"]["status"] == "ok"
+
+
 def test_mcp_chat_falls_back_to_restart_and_oom_tools_after_qwen_502():
     class _FakeMCPClient:
         def __init__(self):

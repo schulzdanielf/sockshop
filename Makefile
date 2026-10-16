@@ -30,16 +30,36 @@ FRONT_END_IMAGE ?= weaveworksdemos/front-end:node18-otel
 NODE_IP         ?= $(shell kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)
 OTEL_ENDPOINT   ?= http://localhost:4318
 DEPLOYMENT_ENV  ?= local
-MODEL_HOST      ?= 0.0.0.0
+MODEL_HOST      ?= 127.0.0.1
 MODEL_PORT      ?= 8001
+MODEL_PROXY_HOST ?= 127.0.0.1
+MODEL_PROXY_PORT ?= 8011
+QWEN35_LAUNCHER ?= $(HOME)/.local/bin/qwen35-grafana
+QWEN35_MCP_SERVERS_CONFIG ?= $(CURDIR)/model/qwen35_grafana_mcp.json
+QWEN35_MODEL ?= qwen3.5-9b-grafana
+QWEN35_UPSTREAM_URL ?= http://127.0.0.1:$(MODEL_PORT)
+QWEN35_LLM_URL ?= http://$(MODEL_PROXY_HOST):$(MODEL_PROXY_PORT)/v1/chat/completions
+QWEN35_PROXY_HEALTH_URL ?= http://$(MODEL_PROXY_HOST):$(MODEL_PROXY_PORT)/health
+QWEN35_OTEL_ENDPOINT ?= http://127.0.0.1:30318
+QWEN35_AUDIT_PATH ?= $(HOME)/.local/share/qwen35-grafana/qwen35-audit.jsonl
+PLATFORM_AUDIT_PATH ?= $(HOME)/.local/share/qwen35-grafana/platform-audit.jsonl
+GRAFANA_MCP_IMAGE ?= grafana/mcp-grafana@sha256:2ed63c4d9d67557c8ea6cc6988743ddd9008e248bd9842e760fec378a0b61062
+GRAFANA_MCP_CONTAINER ?= qwen-grafana-mcp
+GRAFANA_MCP_PORT ?= 18081
+GRAFANA_MCP_SSE_URL ?= http://127.0.0.1:$(GRAFANA_MCP_PORT)/sse
+GRAFANA_MCP_TIMEOUT_SECONDS ?= 30
+GRAFANA_MCP_ENABLED_TOOLS ?= search,dashboard,datasource,prometheus,loki,tempo,navigation
 
 # ── Full experiment orchestration (make experiment-run) ────────────────────────
 # Interpreter used to launch the model server, platform and harness.
 PYTHON               ?= .venv/bin/python
 # Health endpoints used to decide whether a service is already up.
-LLM_HEALTH_URL       ?= http://localhost:$(MODEL_PORT)/health
+LLM_HEALTH_URL       ?= http://127.0.0.1:$(MODEL_PORT)/health
 PLATFORM_BASE        ?= http://127.0.0.1:8010
 PLATFORM_HEALTH_URL  ?= $(PLATFORM_BASE)/api/health
+# The platform runs in WSL but is opened from the notebook/browser host.
+# Override with 127.0.0.1 to restrict it to the WSL loopback interface.
+PLATFORM_BIND_HOST   ?= 0.0.0.0
 # Local port the MCP observability server is port-forwarded to (see `port-forward`).
 MCP_LOCAL_PORT       ?= 18080
 # Experiment harness wiring.
@@ -228,6 +248,11 @@ port-forward:
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/loki 3100:3100 >/tmp/pf-loki.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/tempo 3200:3200 >/tmp/pf-tempo.log 2>&1 &
 	nohup kubectl port-forward --address 127.0.0.1 -n monitoring svc/otel-collector 4318:4318 >/tmp/pf-otel-collector.log 2>&1 &
+	@if curl -sf --max-time 3 http://127.0.0.1:$(MODEL_PORT)/health >/dev/null 2>&1; then \
+		echo ">> Qwen3.5 llama-server: http://127.0.0.1:$(MODEL_PORT)"; \
+	else \
+		echo ">> Qwen3.5 llama-server is not running; start it with 'make model'."; \
+	fi
 .PHONY: port-forward-stop
 port-forward-stop:
 	pkill -f "^kubectl port-forward .* -n sock-shop svc/front-end" || true
@@ -279,23 +304,42 @@ cluster-up: app-up observability-up loadtest-up
 cluster-restart: cluster-down cluster-up port-forward
 
 .PHONY: model-serve
-## Start the LLM server with OpenTelemetry traces → otel-collector NodePort.
-## Requires the cluster to be running and 29-otel-collector-svc.yaml applied.
+## Start the isolated Qwen3.5 llama.cpp server in the foreground.
 model-serve:
-	OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) \
-	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=1 \
-	DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
-	.venv/bin/python -m uvicorn model.server:app \
-		--host $(MODEL_HOST) --port $(MODEL_PORT)
+	QWEN35_MCP_SERVERS_CONFIG=$(QWEN35_MCP_SERVERS_CONFIG) \
+	QWEN35_HOST=$(MODEL_HOST) QWEN35_PORT=$(MODEL_PORT) $(QWEN35_LAUNCHER)
 
+.PHONY: model-otel-proxy-serve
+## Start the Qwen3.5 OpenTelemetry proxy in the foreground.
+model-otel-proxy-serve:
+	OTEL_SERVICE_NAME=llm-qwen35 \
+	OTEL_EXPORTER_OTLP_ENDPOINT=$(QWEN35_OTEL_ENDPOINT) \
+	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=0 \
+	DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
+	LLM_MODEL=$(QWEN35_MODEL) \
+	QWEN35_UPSTREAM_URL=$(QWEN35_UPSTREAM_URL) \
+	LLM_IO_AUDIT_PATH="$(QWEN35_AUDIT_PATH)" \
+	$(PYTHON) -m uvicorn model.qwen35_otel_proxy:app \
+		--host $(MODEL_PROXY_HOST) --port $(MODEL_PROXY_PORT)
+
+.PHONY: model
+## Ensure the Qwen3.5 model server and OTel proxy are running in the background.
+model: ensure-model
 
 .PHONY: experiment-platform-up
 ## Start the experiment platform (FastAPI backend + GUI) on http://localhost:8010
-experiment-platform-up:
-	OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) \
+experiment-platform-up: ensure-model ensure-grafana-mcp
+	LLM_URL=$(QWEN35_LLM_URL) \
+	LLM_MODEL=$(QWEN35_MODEL) \
+	GRAFANA_MCP_SSE_URL=$(GRAFANA_MCP_SSE_URL) \
+	GRAFANA_MCP_TIMEOUT_SECONDS=$(GRAFANA_MCP_TIMEOUT_SECONDS) \
+	LLM_IO_AUDIT_PATH="$(PLATFORM_AUDIT_PATH)" \
+	OTEL_SERVICE_NAME=rca-platform \
+	OTEL_EXPORTER_OTLP_ENDPOINT=$(QWEN35_OTEL_ENDPOINT) \
+	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=0 \
 	DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
 	.venv/bin/python -m uvicorn experiment.platform.backend.main:app \
-		--host 0.0.0.0 --port 8010 --reload
+		--host $(PLATFORM_BIND_HOST) --port 8010 --reload
 
 # ── Full experiment orchestration ──────────────────────────────────────────────
 # `make experiment-run` brings up every dependency a complete experiment needs
@@ -309,23 +353,42 @@ experiment-platform-up:
 #   make experiment-run RUN_ARGS="--dry-run"         # print first spec and exit
 
 .PHONY: model-serve-bg
-## Start the LLM model server in the background (used by `experiment-run`).
+## Start the Qwen3.5 llama.cpp server in the background.
 model-serve-bg:
-	@echo ">> Starting LLM model server on :$(MODEL_PORT) (log: /tmp/model-serve.log)"
-	@OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) \
-		OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=1 \
+	@echo ">> Starting Qwen3.5 llama.cpp server on :$(MODEL_PORT) (log: /tmp/model-serve.log)"
+	@QWEN35_MCP_SERVERS_CONFIG=$(QWEN35_MCP_SERVERS_CONFIG) \
+		QWEN35_HOST=$(MODEL_HOST) QWEN35_PORT=$(MODEL_PORT) \
+		nohup $(QWEN35_LAUNCHER) >/tmp/model-serve.log 2>&1 &
+
+.PHONY: model-otel-proxy-bg
+## Start the Qwen3.5 OpenTelemetry proxy in the background.
+model-otel-proxy-bg:
+	@echo ">> Starting Qwen3.5 OTel proxy on :$(MODEL_PROXY_PORT) (log: /tmp/model-otel-proxy.log)"
+	@OTEL_SERVICE_NAME=llm-qwen35 \
+		OTEL_EXPORTER_OTLP_ENDPOINT=$(QWEN35_OTEL_ENDPOINT) \
+		OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=0 \
 		DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
-		nohup $(PYTHON) -m uvicorn model.server:app \
-			--host $(MODEL_HOST) --port $(MODEL_PORT) \
-			>/tmp/model-serve.log 2>&1 &
+		LLM_MODEL=$(QWEN35_MODEL) \
+		QWEN35_UPSTREAM_URL=$(QWEN35_UPSTREAM_URL) \
+		LLM_IO_AUDIT_PATH="$(QWEN35_AUDIT_PATH)" \
+		nohup $(PYTHON) -m uvicorn model.qwen35_otel_proxy:app \
+			--host $(MODEL_PROXY_HOST) --port $(MODEL_PROXY_PORT) \
+			>/tmp/model-otel-proxy.log 2>&1 &
 
 .PHONY: experiment-platform-up-bg
-## Start the experiment platform in the background (used by `experiment-run`).
-experiment-platform-up-bg:
-	@echo ">> Starting experiment platform on :8010 (log: /tmp/experiment-platform.log)"
-	@OTEL_EXPORTER_OTLP_ENDPOINT=$(OTEL_ENDPOINT) DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
+## Start the experiment platform in the background.
+experiment-platform-up-bg: ensure-model ensure-grafana-mcp
+	@echo ">> Starting experiment platform on $(PLATFORM_BIND_HOST):8010 (log: /tmp/experiment-platform.log)"
+	@LLM_URL=$(QWEN35_LLM_URL) LLM_MODEL=$(QWEN35_MODEL) \
+		GRAFANA_MCP_SSE_URL=$(GRAFANA_MCP_SSE_URL) \
+		GRAFANA_MCP_TIMEOUT_SECONDS=$(GRAFANA_MCP_TIMEOUT_SECONDS) \
+		LLM_IO_AUDIT_PATH="$(PLATFORM_AUDIT_PATH)" \
+		OTEL_SERVICE_NAME=rca-platform \
+		OTEL_EXPORTER_OTLP_ENDPOINT=$(QWEN35_OTEL_ENDPOINT) \
+		OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=0 \
+		DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
 		nohup $(PYTHON) -m uvicorn experiment.platform.backend.main:app \
-		--host 0.0.0.0 --port 8010 >/tmp/experiment-platform.log 2>&1 &
+		--host $(PLATFORM_BIND_HOST) --port 8010 >/tmp/experiment-platform.log 2>&1 &
 
 .PHONY: ensure-cluster
 ## Fail fast if the Kubernetes cluster is unreachable.
@@ -347,28 +410,83 @@ ensure-port-forward:
 	fi
 
 .PHONY: ensure-model
-## Ensure the LLM model server is healthy, starting it if necessary.
+## Ensure the Qwen3.5 runtime and its OTel proxy are healthy.
 ensure-model:
 	@if curl -sf --max-time 3 $(LLM_HEALTH_URL) >/dev/null 2>&1; then \
-		echo ">> LLM model server already healthy at $(LLM_HEALTH_URL)."; \
+		echo ">> Qwen3.5 model server already healthy at $(LLM_HEALTH_URL)."; \
 	else \
-		echo ">> LLM model server down — starting it (model load may take minutes)..."; \
+		echo ">> Qwen3.5 model server down — starting it (model load may take minutes)..."; \
 		$(MAKE) model-serve-bg; \
 		i=0; \
 		until curl -sf --max-time 3 $(LLM_HEALTH_URL) >/dev/null 2>&1; do \
 			i=$$((i+1)); \
 			if [ $$i -ge $(MODEL_BOOT_RETRIES) ]; then \
-				echo "ERROR: LLM model not healthy after $$((MODEL_BOOT_RETRIES*HEALTH_DELAY))s. See /tmp/model-serve.log" >&2; \
+				echo "ERROR: Qwen3.5 model not healthy after $$((MODEL_BOOT_RETRIES*HEALTH_DELAY))s. See /tmp/model-serve.log" >&2; \
 				exit 1; \
 			fi; \
 			sleep $(HEALTH_DELAY); \
 		done; \
-		echo ">> LLM model server is healthy."; \
+		echo ">> Qwen3.5 model server is healthy."; \
 	fi
+	@$(MAKE) ensure-model-otel-proxy
+
+.PHONY: ensure-model-otel-proxy
+## Ensure the Qwen3.5 OTel proxy is healthy, starting it if necessary.
+ensure-model-otel-proxy:
+	@if curl -sf --max-time 3 $(QWEN35_PROXY_HEALTH_URL) >/dev/null 2>&1; then \
+		echo ">> Qwen3.5 OTel proxy already healthy at $(QWEN35_PROXY_HEALTH_URL)."; \
+	else \
+		echo ">> Qwen3.5 OTel proxy down — starting it..."; \
+		$(MAKE) model-otel-proxy-bg; \
+		i=0; \
+		until curl -sf --max-time 3 $(QWEN35_PROXY_HEALTH_URL) >/dev/null 2>&1; do \
+			i=$$((i+1)); \
+			if [ $$i -ge $(HEALTH_RETRIES) ]; then \
+				echo "ERROR: Qwen3.5 OTel proxy not healthy after $$((HEALTH_RETRIES*HEALTH_DELAY))s. See /tmp/model-otel-proxy.log" >&2; \
+				exit 1; \
+			fi; \
+			sleep $(HEALTH_DELAY); \
+		done; \
+		echo ">> Qwen3.5 OTel proxy is healthy."; \
+	fi
+
+.PHONY: ensure-grafana-mcp
+## Ensure the official read-only Grafana MCP SSE container is healthy.
+ensure-grafana-mcp:
+	@test -f .env || { echo "ERROR: .env is required for the Grafana MCP service." >&2; exit 1; }
+	@grep -Eq '^GRAFANA_URL=.+$$' .env || { echo "ERROR: .env must define GRAFANA_URL." >&2; exit 1; }
+	@grep -Eq '^GRAFANA_SERVICE_ACCOUNT_TOKEN=.+$$' .env || { echo "ERROR: .env must define GRAFANA_SERVICE_ACCOUNT_TOKEN." >&2; exit 1; }
+	@if docker inspect $(GRAFANA_MCP_CONTAINER) >/dev/null 2>&1; then \
+		if [ "$$(docker inspect --format '{{.State.Running}}' $(GRAFANA_MCP_CONTAINER))" != "true" ]; then \
+			docker start $(GRAFANA_MCP_CONTAINER) >/dev/null; \
+		fi; \
+	else \
+		docker run --detach --name $(GRAFANA_MCP_CONTAINER) \
+			--restart unless-stopped \
+			--publish 127.0.0.1:$(GRAFANA_MCP_PORT):8000 \
+			--env GRAFANA_URL \
+			--env GRAFANA_SERVICE_ACCOUNT_TOKEN \
+			$(GRAFANA_MCP_IMAGE) \
+			--usage-stats=disabled \
+			--disable-write \
+			--disable-api \
+			--enabled-tools $(GRAFANA_MCP_ENABLED_TOOLS) \
+			--allowed-hosts=localhost:$(GRAFANA_MCP_PORT),127.0.0.1:$(GRAFANA_MCP_PORT) \
+			>/dev/null; \
+	fi
+	@i=0; until curl -sf --max-time 3 http://127.0.0.1:$(GRAFANA_MCP_PORT)/healthz >/dev/null; do \
+		i=$$((i+1)); \
+		if [ $$i -ge 30 ]; then \
+			echo "ERROR: Grafana MCP not healthy at $(GRAFANA_MCP_SSE_URL). Check 'docker logs $(GRAFANA_MCP_CONTAINER)'." >&2; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo ">> Official read-only Grafana MCP is healthy at $(GRAFANA_MCP_SSE_URL)."
 
 .PHONY: ensure-platform
 ## Ensure the experiment platform is healthy, starting it if necessary.
-ensure-platform:
+ensure-platform: ensure-grafana-mcp
 	@if curl -sf --max-time 3 $(PLATFORM_HEALTH_URL) >/dev/null 2>&1; then \
 		echo ">> Experiment platform already healthy at $(PLATFORM_HEALTH_URL)."; \
 	else \
