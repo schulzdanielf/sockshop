@@ -14,7 +14,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -40,8 +40,10 @@ def build_quick_config(
     source: dict[str, Any],
     campaign_id: str = CAMPAIGN_ID,
     campaign_dir: Path = CAMPAIGN_DIR,
+    cells: Optional[List[Dict[str, str]]] = None,
 ) -> dict[str, Any]:
     """Return a short, held-out config without changing the main campaign."""
+    cells = targeted.TARGET_CELLS if cells is None else cells
     config = json.loads(json.dumps(source))
     config["experiment_campaign_id"] = campaign_id
     config["platform"]["initiated_by"] = "quick-chaos-evaluation"
@@ -60,12 +62,12 @@ def build_quick_config(
             "sampling_interval_seconds": 5,
         }
     )
-    selected_faults = {cell["chaos_type"] for cell in targeted.TARGET_CELLS}
+    selected_faults = {cell["chaos_type"] for cell in cells}
     for entry in config.get("chaos_types", []):
         if entry.get("name") in selected_faults:
             entry.setdefault("env", {})["total_chaos_duration_seconds"] = 60
     config["train_experiments"] = []
-    config["test_experiments"] = [dict(cell) for cell in targeted.TARGET_CELLS]
+    config["test_experiments"] = [dict(cell) for cell in cells]
     config["replicas"] = 1
     config["ordering"] = {
         "shuffle": True,
@@ -106,8 +108,13 @@ def duration_estimate_seconds(config: dict[str, Any]) -> int:
     )
 
 
-def preflight(config: dict[str, Any]) -> list[str]:
-    if not targeted.netem_is_loaded():
+def preflight(
+    config: dict[str, Any],
+    cells: Optional[List[Dict[str, str]]] = None,
+) -> list[str]:
+    cells = targeted.TARGET_CELLS if cells is None else cells
+    uses_netem = any(cell["chaos_type"] in targeted.NETEM_TYPES for cell in cells)
+    if uses_netem and not targeted.netem_is_loaded():
         raise RuntimeError(
             "sch_netem is not loaded; run `make chaos-enable-netem` before the campaign"
         )
@@ -125,7 +132,7 @@ def preflight(config: dict[str, Any]) -> list[str]:
         item["metadata"]["name"]: item
         for item in json.loads(result.stdout).get("items", [])
     }
-    services = sorted({cell["service"] for cell in targeted.TARGET_CELLS})
+    services = sorted({cell["service"] for cell in cells})
     unavailable = [
         service
         for service in services
@@ -134,15 +141,17 @@ def preflight(config: dict[str, Any]) -> list[str]:
     if unavailable:
         raise RuntimeError(f"target deployments are missing or unavailable: {', '.join(unavailable)}")
 
-    for cell in targeted.TARGET_CELLS:
-        if cell["chaos_type"] not in {"cpu-hog", "memory-hog"}:
-            continue
-        target_container_limits(cell["service"], config["cluster"]["app_namespace"])
-    return [
-        f"all {len(services)} target deployments available",
-        "resource limits present for CPU/memory targets",
-        "sch_netem loaded",
+    resource_targets = [
+        cell for cell in cells if cell["chaos_type"] in {"cpu-hog", "memory-hog"}
     ]
+    for cell in resource_targets:
+        target_container_limits(cell["service"], config["cluster"]["app_namespace"])
+    checks = [f"all {len(services)} target deployments available"]
+    if resource_targets:
+        checks.append("resource limits present for CPU/memory targets")
+    if uses_netem:
+        checks.append("sch_netem loaded")
+    return checks
 
 
 def main() -> int:
@@ -197,14 +206,17 @@ def main() -> int:
 
     reports = targeted.validate_runs(
         campaign_dir / config["output"]["runs_csv"],
-        cells=targeted.TARGET_CELLS,
+        cells=cells,
         replicas=1,
         phase="test",
     )
     report_path = campaign_dir / "effect_validation.json"
-    report_path.write_text(json.dumps(reports, indent=2), encoding="utf-8")
+    report_path.write_text(
+        json.dumps(targeted.json_safe(reports), indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
     for report in reports:
-        print(json.dumps(report, ensure_ascii=False))
+        print(json.dumps(targeted.json_safe(report), ensure_ascii=False, allow_nan=False))
     print(f"Effect report: {report_path.relative_to(ROOT)}")
     return 0 if runner_result.returncode == 0 and reports and all(item.get("passed") for item in reports) else 1
 

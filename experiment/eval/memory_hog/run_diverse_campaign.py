@@ -21,6 +21,11 @@ from urllib.request import urlopen
 
 import yaml
 
+try:
+    from . import generate_chaos_manifests as genmod
+except ImportError:  # running as a script rather than a package module
+    import generate_chaos_manifests as genmod  # type: ignore
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 SOURCE_CONFIG = HERE / "config.yaml"
@@ -131,6 +136,16 @@ def build_campaign_config(
         "manifests_dir": "manifests",
     }
     return config
+
+
+def generate_campaign_manifests(config: dict[str, Any]) -> list[Path]:
+    output_dir = Path(config["output"]["results_dir"])
+    if not output_dir.is_absolute():
+        output_dir = ROOT / output_dir
+    manifests_dir = Path(config["output"]["manifests_dir"])
+    if not manifests_dir.is_absolute():
+        manifests_dir = output_dir / manifests_dir
+    return genmod.generate(config, manifests_dir)
 
 
 def _active_runs(api_base: str) -> list[dict[str, Any]]:
@@ -325,6 +340,13 @@ def main() -> int:
     campaign_dir.mkdir(parents=True, exist_ok=False)
     config_path = campaign_dir / "config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    try:
+        manifests = generate_campaign_manifests(config)
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        print(f"Manifest generation failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"Generated {len(manifests)} campaign manifest(s).")
+
     command = [
         PYTHON,
         "-m",

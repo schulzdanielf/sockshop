@@ -1,0 +1,70 @@
+# Candidate settings: one stress-ng worker at full duty cycle requests
+# enough work to fill a sub-1-core container quota. This is not prior proof
+# that every service will sustain 100%; the run enforces and records attainment.
+policy:
+  sustained_ratio: 1.25
+  sustained_seconds: 60
+  minimum_cpu_delta_cores: 0.05
+
+front-end:
+  cpu:
+    cores: 1
+    load: 100
+    target_quota_fraction: 1.0
+    target_tolerance_fraction: 0.05
+    calibration_status: candidate
+    rationale: "One stress-ng worker at full duty; verify 95-105% of the live application-container quota during the run."
+
+catalogue:
+  cpu:
+    cores: 1
+    load: 100
+    target_quota_fraction: 1.0
+    target_tolerance_fraction: 0.05
+    calibration_status: candidate
+    rationale: "One stress-ng worker at full duty; verify 95-105% of the live application-container quota during the run."
+
+carts:
+  cpu:
+    cores: 1
+    load: 100
+    target_quota_fraction: 1.0
+    target_tolerance_fraction: 0.05
+    calibration_status: candidate
+    rationale: "One stress-ng worker at full duty; verify 95-105% of the live application-container quota during the run."
+
+orders:
+  cpu:
+    cores: 1
+    load: 100
+    target_quota_fraction: 1.0
+    target_tolerance_fraction: 0.05
+    calibration_status: candidate
+    rationale: "One stress-ng worker at full duty; verify 95-105% of the live application-container quota during the run."
+
+payment:
+  cpu:
+    cores: 1
+    load: 100
+    target_quota_fraction: 1.0
+    target_tolerance_fraction: 0.05
+    calibration_status: candidate
+    rationale: "One stress-ng worker at full duty; verify 95-105% of the live application-container quota during the run."
+
+shipping:
+  cpu:
+    cores: 1
+    load: 100
+    target_quota_fraction: 1.0
+    target_tolerance_fraction: 0.05
+    calibration_status: candidate
+    rationale: "One stress-ng worker at full duty; verify 95-105% of the live application-container quota during the run."
+
+user:
+  cpu:
+    cores: 1
+    load: 100
+    target_quota_fraction: 1.0
+    target_tolerance_fraction: 0.05
+    calibration_status: candidate
+    rationale: "One stress-ng worker at full duty; verify 95-105% of the live application-container quota during the run."

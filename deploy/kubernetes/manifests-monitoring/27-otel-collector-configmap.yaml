@@ -9,7 +9,8 @@ data:
       filelog:
         include:
           - /var/log/containers/*_sock-shop_*.log
-        start_at: beginning
+        start_at: end
+        storage: file_storage/tempo_queue
         include_file_path: true
         include_file_name: true
         operators:
@@ -37,18 +38,7 @@ data:
             regex: '^.*/(?P<pod>[^_]+)_(?P<namespace>[^_]+)_(?P<container>.+)-[a-f0-9]{64}\.log$'
             parse_to: attributes
             on_error: send
-      prometheus:
-        config:
-          scrape_configs:
-            - job_name: prometheus-federation
-              honor_labels: true
-              metrics_path: /federate
-              params:
-                'match[]':
-                  - '{__name__=~".+"}'
-              static_configs:
-                - targets:
-                    - prometheus.monitoring.svc.cluster.local:9090
+        max_log_size: 64KiB
       otlp:
         protocols:
           grpc:
@@ -61,7 +51,7 @@ data:
     processors:
       attributes/log_source:
         actions:
-          - action: upsert
+          - action: insert
             key: log_source
             value: otel_filelog
       transform/log_enrichment:
@@ -70,6 +60,11 @@ data:
             statements:
               - set(attributes["service"], resource.attributes["service.name"]) where resource.attributes["service.name"] != nil
               - set(attributes["service"], attributes["container"]) where attributes["service"] == nil and attributes["container"] != nil
+              - set(resource.attributes["service.name"], attributes["service"]) where resource.attributes["service.name"] == nil and attributes["service"] != nil
+              - set(resource.attributes["service.namespace"], attributes["namespace"]) where resource.attributes["service.namespace"] == nil and attributes["namespace"] != nil
+              - set(resource.attributes["k8s.namespace.name"], attributes["namespace"]) where attributes["namespace"] != nil
+              - set(resource.attributes["k8s.pod.name"], attributes["pod"]) where attributes["pod"] != nil
+              - set(resource.attributes["k8s.container.name"], attributes["container"]) where attributes["container"] != nil
               - replace_pattern(body, "\\x1b\\[[0-9;]*m", "")
               - set(attributes["level"], "error") where IsMatch(body, "(status[_-]?code?|result|HTTP/[0-9.]+)[ =:\"]+5[0-9]{2}[^0-9]|\\s5[0-9]{2}\\s")
               - set(attributes["level"], "warn") where attributes["level"] == nil and IsMatch(body, "(status[_-]?code?|result|HTTP/[0-9.]+)[ =:\"]+4[0-9]{2}[^0-9]|\\s4[0-9]{2}\\s")
@@ -77,7 +72,7 @@ data:
               - set(attributes["level"], "warn") where attributes["level"] == nil and IsMatch(body, "(?i)warn(ing)?")
               - set(attributes["level"], "info") where attributes["level"] == nil
               - set(attributes["msg"], body)
-              - set(attributes["msg"], ExtractPatterns(body, "^[^#]*#\\s*(?P<clean>.*)$")["clean"]) where IsMatch(body, "^[^#]*#\\s*.+")
+              - replace_pattern(attributes["msg"], "^[^#]*#\\s*", "") where IsMatch(attributes["msg"], "^[^#]*#\\s*.+")
               - set(attributes["error_type"], "exception") where IsMatch(body, "(?i)exception")
               - set(attributes["error_type"], "fatal") where attributes["error_type"] == nil and IsMatch(body, "(?i)fatal")
               - set(attributes["error_type"], "error") where attributes["error_type"] == nil and IsMatch(body, "(?i)error")
@@ -90,6 +85,25 @@ data:
               - set(attributes["eval_target"], ExtractPatterns(body, "\"eval_target\":\\s*\"(?P<val>[^\"]+)\"")["val"]) where IsMatch(body, "\"eval_target\"")
               - set(attributes["eval_fault"], ExtractPatterns(body, "\"eval_fault\":\\s*\"(?P<val>[^\"]+)\"")["val"]) where IsMatch(body, "\"eval_fault\"")
               - set(attributes["eval_strategy"], ExtractPatterns(body, "\"eval_strategy\":\\s*\"(?P<val>[^\"]+)\"")["val"]) where IsMatch(body, "\"eval_strategy\"")
+      transform/log_sampling:
+        log_statements:
+          - context: log
+            statements:
+              - set(attributes["log_sampling_key"], observed_time_unix_nano) where attributes["service"] == "rabbitmq" and attributes["level"] == "info"
+              - set(attributes["log_sampling_priority"], 10) where attributes["service"] == "rabbitmq" and attributes["level"] == "info"
+              - set(attributes["log_sampling_priority"], 100) where attributes["service"] != "rabbitmq" or attributes["level"] != "info"
+      probabilistic_sampler/logs:
+        sampling_percentage: 10
+        hash_seed: 42
+        attribute_source: record
+        from_attribute: log_sampling_key
+        sampling_priority: log_sampling_priority
+      transform/log_sampling_cleanup:
+        log_statements:
+          - context: log
+            statements:
+              - delete_key(attributes, "log_sampling_key")
+              - delete_key(attributes, "log_sampling_priority")
       attributes/loki_format:
         actions:
           - action: upsert
@@ -106,36 +120,246 @@ data:
             statements:
               - set(attributes["peer.service"], attributes["net.peer.name"]) where attributes["db.system"] != nil and attributes["net.peer.name"] != nil
               - set(attributes["db.name"], attributes["net.peer.name"]) where attributes["db.system"] != nil and attributes["net.peer.name"] != nil
-      batch: {}
+      tail_sampling/rca:
+        decision_wait: 30s
+        num_traces: 20000
+        expected_new_traces_per_sec: 200
+        policies:
+          - name: keep-rca-platform
+            type: and
+            and:
+              and_sub_policy:
+                - name: rca-services
+                  type: string_attribute
+                  string_attribute:
+                    key: service.name
+                    values: [rca-platform, llm-qwen35]
+                - name: rca-non-probe-route
+                  type: string_attribute
+                  string_attribute:
+                    key: http.route
+                    values: [/health, /metrics]
+                    invert_match: true
+                - name: rca-non-probe-url
+                  type: string_attribute
+                  string_attribute:
+                    key: http.url
+                    values: ['.*/(health|metrics)(/|\?.*)?$']
+                    enabled_regex_matching: true
+                    invert_match: true
+          - name: keep-java-errors
+            type: and
+            and:
+              and_sub_policy:
+                - name: java-error-services
+                  type: string_attribute
+                  string_attribute:
+                    key: service.name
+                    values: [front-end, carts, orders, queue-master, shipping]
+                - name: java-error-non-probe
+                  type: string_attribute
+                  string_attribute:
+                    key: http.route
+                    values: [/health, /metrics]
+                    invert_match: true
+                - name: java-error-non-probe-url
+                  type: string_attribute
+                  string_attribute:
+                    key: http.url
+                    values: ['.*/(health|metrics)(/|\?.*)?$']
+                    enabled_regex_matching: true
+                    invert_match: true
+                - name: java-error-status
+                  type: status_code
+                  status_code:
+                    status_codes: [ERROR]
+          - name: keep-java-slow
+            type: and
+            and:
+              and_sub_policy:
+                - name: java-slow-services
+                  type: string_attribute
+                  string_attribute:
+                    key: service.name
+                    values: [front-end, carts, orders, queue-master, shipping]
+                - name: java-slow-non-probe
+                  type: string_attribute
+                  string_attribute:
+                    key: http.route
+                    values: [/health, /metrics]
+                    invert_match: true
+                - name: java-slow-non-probe-url
+                  type: string_attribute
+                  string_attribute:
+                    key: http.url
+                    values: ['.*/(health|metrics)(/|\?.*)?$']
+                    enabled_regex_matching: true
+                    invert_match: true
+                - name: java-slow-latency
+                  type: latency
+                  latency:
+                    threshold_ms: 800
+          - name: sample-java-traffic
+            type: and
+            and:
+              and_sub_policy:
+                - name: java-sampled-services
+                  type: string_attribute
+                  string_attribute:
+                    key: service.name
+                    values: [front-end, carts, orders, queue-master, shipping]
+                - name: java-sampled-non-probe
+                  type: string_attribute
+                  string_attribute:
+                    key: http.route
+                    values: [/health, /metrics]
+                    invert_match: true
+                - name: java-sampled-non-probe-url
+                  type: string_attribute
+                  string_attribute:
+                    key: http.url
+                    values: ['.*/(health|metrics)(/|\?.*)?$']
+                    enabled_regex_matching: true
+                    invert_match: true
+                - name: java-probabilistic-sample
+                  type: probabilistic
+                  probabilistic:
+                    sampling_percentage: 5
+          - name: keep-legacy-errors
+            type: and
+            and:
+              and_sub_policy:
+                - name: legacy-error-services
+                  type: string_attribute
+                  string_attribute:
+                    key: service.name
+                    values: [catalogue, payment, user]
+                - name: legacy-error-non-probe
+                  type: string_attribute
+                  string_attribute:
+                    key: http.url
+                    values: ['.*/(health|metrics)(/|\?.*)?$']
+                    enabled_regex_matching: true
+                    invert_match: true
+                - name: legacy-error-non-probe-route
+                  type: string_attribute
+                  string_attribute:
+                    key: http.route
+                    values: [/health, /metrics]
+                    invert_match: true
+                - name: legacy-error-status
+                  type: status_code
+                  status_code:
+                    status_codes: [ERROR]
+          - name: keep-legacy-slow
+            type: and
+            and:
+              and_sub_policy:
+                - name: legacy-slow-services
+                  type: string_attribute
+                  string_attribute:
+                    key: service.name
+                    values: [catalogue, payment, user]
+                - name: legacy-slow-non-probe
+                  type: string_attribute
+                  string_attribute:
+                    key: http.url
+                    values: ['.*/(health|metrics)(/|\?.*)?$']
+                    enabled_regex_matching: true
+                    invert_match: true
+                - name: legacy-slow-non-probe-route
+                  type: string_attribute
+                  string_attribute:
+                    key: http.route
+                    values: [/health, /metrics]
+                    invert_match: true
+                - name: legacy-slow-latency
+                  type: latency
+                  latency:
+                    threshold_ms: 800
+          - name: sample-legacy-traffic
+            type: and
+            and:
+              and_sub_policy:
+                - name: legacy-sampled-services
+                  type: string_attribute
+                  string_attribute:
+                    key: service.name
+                    values: [catalogue, payment, user]
+                - name: legacy-sampled-non-probe
+                  type: string_attribute
+                  string_attribute:
+                    key: http.url
+                    values: ['.*/(health|metrics)(/|\?.*)?$']
+                    enabled_regex_matching: true
+                    invert_match: true
+                - name: legacy-sampled-non-probe-route
+                  type: string_attribute
+                  string_attribute:
+                    key: http.route
+                    values: [/health, /metrics]
+                    invert_match: true
+                - name: legacy-probabilistic-sample
+                  type: probabilistic
+                  probabilistic:
+                    sampling_percentage: 5
+      batch:
+        send_batch_size: 512
+        send_batch_max_size: 1024
+        timeout: 2s
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 400
+        spike_limit_mib: 100
 
     exporters:
-      debug/logs:
-        verbosity: detailed
       loki:
         endpoint: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 2048
+          storage: file_storage/tempo_queue
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 0s
       prometheusremotewrite:
         endpoint: http://prometheus-v3.monitoring.svc.cluster.local:9090/api/v1/write
       otlp/tempo:
         endpoint: tempo.monitoring.svc.cluster.local:4317
         tls:
           insecure: true
-
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 2048
+          storage: file_storage/tempo_queue
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 0s
     extensions:
       health_check:
         endpoint: 0.0.0.0:13133
+      file_storage/tempo_queue:
+        directory: /var/lib/otelcol/storage
+        fsync: true
 
     service:
-      extensions: [health_check]
+      extensions: [health_check, file_storage/tempo_queue]
       pipelines:
         metrics:
-          receivers: [prometheus, otlp]
-          processors: [batch]
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
           exporters: [prometheusremotewrite]
         traces:
           receivers: [otlp, zipkin]
-          processors: [transform/db_peer_service, batch]
+          processors: [memory_limiter, transform/db_peer_service, tail_sampling/rca, batch]
           exporters: [otlp/tempo]
         logs:
           receivers: [otlp, filelog]
-          processors: [attributes/log_source, transform/log_enrichment, attributes/loki_format, attributes/loki_labels, batch]
-          exporters: [debug/logs, loki]
+          processors: [memory_limiter, attributes/log_source, transform/log_enrichment, transform/log_sampling, probabilistic_sampler/logs, transform/log_sampling_cleanup, attributes/loki_format, attributes/loki_labels, batch]
+          exporters: [loki]

@@ -1,0 +1,17 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    environment:
+      discovery.type: single-node
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    mem_limit: 2g
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - rca_opensearch_data:/usr/share/opensearch/data
+
+volumes:
+  rca_opensearch_data:
+    name: sockshop-rca-eval-opensearch-data

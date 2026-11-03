@@ -12,6 +12,9 @@ vector provider behind the same call.
 """
 from __future__ import annotations
 
+import math
+import re
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -100,6 +103,124 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     if denom == 0.0:
         return 0.0
     return float(np.dot(a, b) / denom)
+
+
+_TEXT_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:@/-]+")
+
+
+def _text_tokens(text: str) -> list[str]:
+    return [token.lower() for token in _TEXT_TOKEN_RE.findall(text)]
+
+
+def rank_hybrid_text(
+    query_vec: np.ndarray,
+    query_text: str,
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    limit: int,
+    min_score: float = 0.0,
+    rrf_constant: int = 60,
+) -> List[Dict[str, Any]]:
+    """Fuse dense and BM25 rankings without treating either score as confidence."""
+    if limit < 1 or rrf_constant < 1:
+        raise ValueError("limit and rrf_constant must be positive")
+    if not math.isfinite(min_score) or min_score < 0 or min_score > 1:
+        raise ValueError("min_score must be finite and between zero and one")
+    query_tokens = _text_tokens(query_text)
+    documents = [_text_tokens(str(item.get("text", ""))) for item in candidates]
+    document_count = len(documents)
+    average_length = (
+        sum(len(document) for document in documents) / document_count
+        if document_count
+        else 0.0
+    )
+    document_frequencies: Counter[str] = Counter()
+    for document in documents:
+        document_frequencies.update(set(document))
+
+    dense_scores: dict[int, float] = {}
+    lexical_scores: dict[int, float] = {}
+    query_vector = np.asarray(query_vec)
+    for index, (candidate, document) in enumerate(zip(candidates, documents)):
+        vector = candidate.get("vector")
+        if isinstance(vector, np.ndarray) and vector.shape == query_vector.shape:
+            dense_scores[index] = cosine_similarity(query_vector, vector)
+        if not query_tokens or not document or average_length <= 0:
+            lexical_scores[index] = 0.0
+            continue
+        frequencies = Counter(document)
+        score = 0.0
+        for token in set(query_tokens):
+            term_frequency = frequencies[token]
+            if not term_frequency:
+                continue
+            document_frequency = document_frequencies[token]
+            inverse_frequency = math.log(
+                1.0
+                + (document_count - document_frequency + 0.5)
+                / (document_frequency + 0.5)
+            )
+            denominator = term_frequency + 1.5 * (
+                1.0 - 0.75 + 0.75 * len(document) / average_length
+            )
+            score += (
+                inverse_frequency
+                * term_frequency
+                * 2.5
+                / denominator
+            )
+        lexical_scores[index] = score
+
+    def rank(scores: dict[int, float], *, positive_only: bool) -> dict[int, int]:
+        ranked = sorted(
+            (
+                index
+                for index, score in scores.items()
+                if not positive_only or score > 0
+            ),
+            key=lambda index: (
+                -scores[index],
+                str(candidates[index].get("pair_id", index)),
+            ),
+        )
+        return {index: position for position, index in enumerate(ranked, 1)}
+
+    dense_ranks = rank(dense_scores, positive_only=True)
+    lexical_ranks = rank(lexical_scores, positive_only=True)
+    maximum_fusion = 2.0 / (rrf_constant + 1)
+    scored = []
+    for index, candidate in enumerate(candidates):
+        ranks = {
+            "dense": dense_ranks.get(index),
+            "bm25": lexical_ranks.get(index),
+        }
+        reciprocal_score = sum(
+            1.0 / (rrf_constant + position)
+            for position in ranks.values()
+            if position is not None
+        )
+        score = reciprocal_score / maximum_fusion
+        if score < min_score:
+            continue
+        item = {
+            key: value
+            for key, value in candidate.items()
+            if key not in {"vector", "text"}
+        }
+        item.update(
+            score=round(score, 6),
+            score_components={
+                "dense_cosine": round(dense_scores[index], 6)
+                if index in dense_scores
+                else None,
+                "bm25": round(lexical_scores[index], 6),
+                "dense_rank": ranks["dense"],
+                "bm25_rank": ranks["bm25"],
+            },
+        )
+        scored.append(item)
+    scored.sort(key=lambda item: (-item["score"], str(item.get("pair_id", ""))))
+    return scored[:limit]
 
 
 # --------------------------------------------------------------------------

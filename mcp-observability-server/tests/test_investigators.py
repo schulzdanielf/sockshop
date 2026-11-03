@@ -92,7 +92,82 @@ def test_counter_increments_handles_resets_inside_window():
     assert inv._counter_increments(points) == 5.0
 
 
+def test_restart_collection_uses_raw_history_not_repeated_evaluation_points():
+    start = inv._iso_timestamp_seconds("2026-10-28T19:00:00Z", "start")
+
+    class RawPrometheus(_FakePrometheus):
+        def query_raw_range(self, query, query_start, query_end):
+            self.calls.append({"query": query, "start": query_start, "end": query_end})
+            return self.payload
+
+        def query_range(self, *args):
+            pytest.fail("lifecycle counters must retain actual scrape timestamps")
+
+    prom = RawPrometheus({"data": {"result": [{
+        "metric": {"pod": "user-aaaaa-bbbbb", "container": "user", "uid": "pod-1"},
+        "values": [[start - 35, "10"], [start + 25, "11"]],
+    }]}})
+    result = inv.check_pod_restarts(
+        prom, start="2026-10-28T19:00:00Z", end="2026-10-28T19:00:03Z"
+    )
+    assert result["query_window"] == {
+        "start": "2026-10-28T18:59:00Z", "end": "2026-10-28T19:01:03Z"
+    }
+    assert result["found"]
+    assert result["sample_timestamp_kind"] == "scrape"
+    assert result["observed_services"] == ["user"]
+    pod = result["top"][0]["pods"][0]
+    assert pod["uid"] == "pod-1"
+    assert pod["restart_observations"][0]["window_attribution"] == "overlap_only"
+    assert result["raw_coverage"] == {"series_count": 1, "sample_count": 2}
+
+
+def test_restart_does_not_join_different_pod_uids_or_count_post_boundary():
+    start = inv._iso_timestamp_seconds("2026-10-28T19:00:00Z", "start")
+    prom = _FakePrometheus({"data": {"result": [
+        {"metric": {"pod": "user-0", "container": "user", "uid": "old"},
+         "values": [[start - 15, "5"]]},
+        {"metric": {"pod": "user-0", "container": "user", "uid": "new"},
+         "values": [[start + 3, "0"], [start + 18, "1"]]},
+    ]}})
+    result = inv.check_pod_restarts(
+        prom, start="2026-10-28T19:00:00Z", end="2026-10-28T19:00:03Z"
+    )
+    assert not result["found"]
+    assert result["status"] == "partial"
+
+
+def test_oom_reason_disappearing_is_not_a_new_oom():
+    prom = _FakePrometheus({"data": {"result": [{
+        "metric": {"pod": "user-aaaaa-bbbbb"},
+        "values": [[1, "1"], [2, "0"]],
+    }]}})
+    result = inv.check_oom_kills(
+        prom, start="2026-01-01T00:00:00Z", end="2026-01-01T00:01:00Z"
+    )
+    assert not result["found"]
+    assert result["top"][0]["max_in_window"] == 1
+
+
+@pytest.mark.parametrize("query_builder", ["top", "golden"])
+def test_cpu_saturation_excludes_duplicate_jobs_and_nonpositive_quota(query_builder):
+    prom = _FakePrometheus({"data": {"result": []}})
+    if query_builder == "top":
+        inv.get_cpu_saturation_top(
+            prom, start="2026-01-01T00:00:00Z", end="2026-01-01T00:01:00Z"
+        )
+        query = prom.calls[0]["query"]
+    else:
+        query = inv._golden_metric_query("cpu_saturation_pct", "sock-shop")
+    assert 'cpu="total",job="kubernetes-cadvisor"' in query
+    assert " > 0" in query
+
+
 def test_check_pod_restarts_ignores_duplicate_scrape_and_counts_window_deltas():
+    query_start = 1767225585
+    window_start = 1767225600
+    window_end = 1767225900
+    query_end = 1767225930
     prom = _FakePrometheus(
         {
             "data": {
@@ -103,7 +178,11 @@ def test_check_pod_restarts_ignores_duplicate_scrape_and_counts_window_deltas():
                             "container": "rabbitmq",
                             "job": "kube-state-metrics",
                         },
-                        "values": [[1.0, "60"], [2.0, "60"], [3.0, "60"]],
+                        "values": [
+                            [query_start, "60"],
+                            [window_start, "60"],
+                            [query_end, "60"],
+                        ],
                     },
                     {
                         "metric": {
@@ -111,7 +190,11 @@ def test_check_pod_restarts_ignores_duplicate_scrape_and_counts_window_deltas():
                             "container": "rabbitmq",
                             "job": "kubernetes-nodes",
                         },
-                        "values": [[1.0, "60"], [2.0, "179"], [3.0, "60"]],
+                        "values": [
+                            [query_start, "60"],
+                            [window_start, "179"],
+                            [query_end, "60"],
+                        ],
                     },
                     {
                         "metric": {
@@ -119,7 +202,13 @@ def test_check_pod_restarts_ignores_duplicate_scrape_and_counts_window_deltas():
                             "container": "orders",
                             "job": "kube-state-metrics",
                         },
-                        "values": [[1.0, "10"], [2.0, "12"], [3.0, "15"]],
+                        "values": [
+                            [query_start, "10"],
+                            [window_start, "10"],
+                            [window_start + 15, "12"],
+                            [window_end, "15"],
+                            [query_end, "15"],
+                        ],
                     },
                 ]
             }
@@ -133,11 +222,93 @@ def test_check_pod_restarts_ignores_duplicate_scrape_and_counts_window_deltas():
     )
 
     assert 'job="kube-state-metrics"' in prom.calls[0]["query"]
+    assert prom.calls[0]["start"] == "2025-12-31T23:59:00Z"
+    assert prom.calls[0]["end"] == "2026-01-01T00:06:00Z"
     assert out["found"] is True
     assert out["count"] == 1
     rows = {row["service"]: row["restarts_in_window"] for row in out["top"]}
     assert rows["rabbitmq"] == 0
     assert rows["orders"] == 5
+
+
+def test_check_pod_restarts_detects_short_fault_with_padded_scrapes():
+    start = "2026-10-18T17:00:50.243332Z"
+    end = "2026-10-18T17:00:53.092854Z"
+    start_seconds = inv._iso_timestamp_seconds(start, "start")
+    prom = _FakePrometheus(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {
+                            "pod": "user-7889587f4c-qcfwf",
+                            "container": "user",
+                            "job": "kube-state-metrics",
+                        },
+                        "values": [
+                            [start_seconds - 15, "26"],
+                            [start_seconds, "26"],
+                            [start_seconds + 15, "27"],
+                            [start_seconds + 30, "27"],
+                        ],
+                    }
+                ]
+            }
+        }
+    )
+
+    result = inv.check_pod_restarts(prom, start=start, end=end)
+    pod = result["top"][0]["pods"][0]
+
+    assert result["status"] == "ok"
+    assert result["found"] is True
+    assert result["count"] == 1
+    assert result["window"] == {"start": start, "end": end}
+    assert result["query_window"] == {
+        "start": "2026-10-18T16:59:50.243332Z",
+        "end": "2026-10-18T17:01:53.092854Z",
+    }
+    assert result["coverage"] == {
+        "series_count": 1,
+        "sample_count": 4,
+        "window_bracketed_series_count": 1,
+        "window_unbracketed_series_count": 0,
+        "window_sample_count": 1,
+    }
+    assert pod["restart_observations"][0]["observed_from"] == start
+    assert pod["restart_observations"][0]["observed_to"] == (
+        "2026-10-18T17:01:05.243332Z"
+    )
+
+
+def test_check_pod_restarts_marks_single_sample_as_partial_not_zero():
+    start = "2026-10-18T17:00:50.243332Z"
+    end = "2026-10-18T17:00:53.092854Z"
+    start_seconds = inv._iso_timestamp_seconds(start, "start")
+    prom = _FakePrometheus(
+        {
+            "data": {
+                "result": [
+                    {
+                        "metric": {
+                            "pod": "user-7889587f4c-qcfwf",
+                            "container": "user",
+                            "job": "kube-state-metrics",
+                        },
+                        "values": [[start_seconds, "26"]],
+                    }
+                ]
+            }
+        }
+    )
+
+    result = inv.check_pod_restarts(prom, start=start, end=end)
+
+    assert result["status"] == "partial"
+    assert result["found"] is False
+    assert result["coverage"]["sample_count"] == 1
+    assert result["coverage"]["window_bracketed_series_count"] == 0
+    assert result["coverage"]["window_unbracketed_series_count"] == 1
 
 
 def test_check_pod_restarts_reports_container_increment_interval_not_exact_time():
@@ -170,7 +341,8 @@ def test_check_pod_restarts_reports_container_increment_interval_not_exact_time(
             "observed_to": "2025-10-09T08:53:35Z",
             "restart_count_delta": 1.0,
             "counter_reset": False,
-            "timestamp_precision": "between_scrapes",
+            "timestamp_precision": "between_evaluations",
+            "window_attribution": "within_window",
         }
     ]
 
@@ -255,6 +427,9 @@ def test_check_service_readiness_reports_only_observed_transitions():
 
 
 def test_check_pod_restarts_keeps_zero_count_service_after_top_five():
+    query_start = 1767225585
+    window_start = 1767225600
+    query_end = 1767225930
     services = ["carts", "catalogue", "front-end", "orders", "payment"]
     results = [
         {
@@ -263,7 +438,11 @@ def test_check_pod_restarts_keeps_zero_count_service_after_top_five():
                 "container": service,
                 "job": "kube-state-metrics",
             },
-            "values": [[1.0, "0"], [2.0, "0"]],
+            "values": [
+                [query_start, "0"],
+                [window_start, "0"],
+                [query_end, "0"],
+            ],
         }
         for service in services
     ]
@@ -274,7 +453,7 @@ def test_check_pod_restarts_keeps_zero_count_service_after_top_five():
                 "container": "rabbitmq",
                 "job": "kube-state-metrics",
             },
-            "values": [[1.0, "60"], [2.0, "60"]],
+            "values": [[query_start, "60"], [window_start, "60"], [query_end, "60"]],
         }
     )
     prom = _FakePrometheus({"data": {"result": results}})
@@ -305,7 +484,8 @@ def test_oom_and_restart_tools_report_coverage_state(payload, expected_status):
         )
 
         assert result["status"] == expected_status
-        assert result["coverage"] == {"series_count": 0, "sample_count": 0}
+        assert result["coverage"]["series_count"] == 0
+        assert result["coverage"]["sample_count"] == 0
 
 
 def test_aggregate_gauge_uses_max():
@@ -389,6 +569,72 @@ def test_memory_saturation_uses_canonical_cadvisor_job_and_averages_replicas():
     assert carts["service"] == "carts"
     assert carts["saturation_mean_pct"] == 65.0
     assert carts["saturation_max_pct"] == 80.0
+
+
+@pytest.mark.parametrize(
+    "investigator",
+    [inv.get_cpu_saturation_top, inv.get_memory_saturation_top],
+)
+def test_saturation_query_can_be_limited_to_one_service(investigator):
+    prom = _FakePrometheus({
+        "data": {
+            "result": [{
+                "metric": {"pod": "orders-db-aaaaa-bbbbb", "job": "kubernetes-cadvisor"},
+                "values": [[1.0, "25"], [2.0, "40"]],
+            }],
+        },
+    })
+
+    result = investigator(
+        prom,
+        start="2026-01-01T00:00:00Z",
+        end="2026-01-01T00:05:00Z",
+        service="orders-db",
+    )
+
+    assert result["top"][0]["service"] == "orders-db"
+    assert prom.calls
+    assert all('pod=~"^orders' in call["query"] for call in prom.calls)
+    assert 'pod=~"^orders-db(-[a-z0-9]{5,}-[a-z0-9]+|-[0-9]+)?$"' in prom.calls[0]["query"]
+    assert "\\-" not in prom.calls[0]["query"]
+
+
+def test_memory_saturation_aggregates_both_sides_by_pod():
+    prom = _FakePrometheus({"data": {"result": []}})
+    inv.get_memory_saturation_top(
+        prom,
+        start="2026-01-01T00:00:00Z",
+        end="2026-01-01T00:05:00Z",
+        service="front-end",
+    )
+    query = prom.calls[0]["query"]
+    assert query.count("sum by (pod)") == 2
+    assert 'pod=~"^front-end(-[a-z0-9]{5,}-[a-z0-9]+|-[0-9]+)?$"' in query
+    assert "\\-" not in query
+
+
+def test_saturation_selector_does_not_match_service_database():
+    import re
+
+    prom = _FakePrometheus({"data": {"result": []}})
+    inv.get_memory_saturation_top(
+        prom, start="2026-01-01T00:00:00Z", end="2026-01-01T00:05:00Z", service="user"
+    )
+    pattern = re.search(r'pod=~"([^"]+)"', prom.calls[0]["query"]).group(1)
+    assert re.fullmatch(pattern, "user-7bb7965fbc-s44hd")
+    assert re.fullmatch(pattern, "user-0")
+    assert not re.fullmatch(pattern, "user-db-7bb7965fbc-s44hd")
+    assert not re.fullmatch(pattern, "user-db-0")
+
+
+def test_saturation_query_rejects_invalid_service_scope():
+    with pytest.raises(ValueError, match="invalid service name"):
+        inv.get_cpu_saturation_top(
+            _FakePrometheus({}),
+            start="2026-01-01T00:00:00Z",
+            end="2026-01-01T00:05:00Z",
+            service="../orders",
+        )
 
 
 def test_aggregate_unknown_mode_raises():

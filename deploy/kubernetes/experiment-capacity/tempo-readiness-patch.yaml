@@ -1,0 +1,12 @@
+spec:
+  template:
+    spec:
+      containers:
+      - name: tempo
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3200
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3

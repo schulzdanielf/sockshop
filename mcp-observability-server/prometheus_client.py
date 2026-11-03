@@ -1,5 +1,6 @@
 """Prometheus client for querying metrics."""
 from datetime import datetime, timedelta
+import math
 from typing import Any, Dict, Optional
 
 import httpx
@@ -80,6 +81,40 @@ class PrometheusClient:
             return response.json()
         except httpx.HTTPError as e:
             return {"status": "error", "error": str(e)}
+
+    def get_scrape_targets(self) -> Dict[str, Any]:
+        try:
+            response = self.client.get(
+                f"{self.base_url}/api/v1/targets", params={"state": "active"}
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def query_raw_range(self, selector: str, start: str, end: str) -> Dict[str, Any]:
+        """Fetch actual samples in ``(start, end]``, without evaluation lookback.
+
+        Unlike query_range, an instant range-vector selector preserves scrape
+        timestamps. This internal API accepts a metric selector, not arbitrary
+        PromQL expressions, and evaluates it at the requested historical end.
+        """
+        start_time = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        end_time = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        if start_time.utcoffset() is None or end_time.utcoffset() is None:
+            raise ValueError("raw range timestamps must include a timezone")
+        duration_ms = math.ceil((end_time - start_time).total_seconds() * 1000)
+        if duration_ms <= 0:
+            raise ValueError("raw range end must be after start")
+        try:
+            response = self.client.get(
+                f"{self.base_url}/api/v1/query",
+                params={"query": f"{selector}[{duration_ms}ms]", "time": end},
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as exc:
+            return {"status": "error", "error": str(exc)}
 
     def get_metrics(self) -> Dict[str, Any]:
         """Get list of available metrics.

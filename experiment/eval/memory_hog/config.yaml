@@ -17,6 +17,14 @@ platform:
   poll_interval_seconds: 15
   run_timeout_seconds: 1800     # 30 min hard cap per run
 
+# Online evaluation reads only the historical MCP; dual_write is not a migration.
+historical_observability:
+  mcp_sse_url: "http://127.0.0.1:18082/sse"
+  required: true
+  mode: "dual_write"
+  timeout_seconds: 180
+  visibility_timeout_seconds: 600
+
 cluster:
   app_namespace: "sock-shop"
   litmus_namespace: "litmus"
@@ -76,7 +84,7 @@ chaos_types:
   # 6.6.x). Runnability status:
   #   network-latency   ✅ runs — requires host `sudo modprobe sch_netem`
   #   network-loss      ✅ runs — requires host `sudo modprobe sch_netem`
-  #   http-status-code  ✅ runs (port-80 services; NOT front-end:8079)
+  #   http-status-code  ✅ runs via Istio VirtualService; front-end is not in this matrix
   #   container-kill    ✅ runs
   #   io-stress         ❌ does NOT run here — stress-ng --hdd uses O_DIRECT,
   #                        unsupported by the WSL2 overlayfs (exit status 1).

@@ -1240,6 +1240,7 @@ def rca_reference_phases(
     phases: Dict[str, Dict[str, str]],
     *,
     reference_seconds: int = _RCA_REFERENCE_SECONDS,
+    baseline_source: Optional[str] = None,
 ) -> Tuple[Dict[str, Dict[str, str]], str]:
     """Replace the run baseline by the steady window right before the fault.
 
@@ -1249,6 +1250,8 @@ def rca_reference_phases(
     the injected fault). The last ``reference_seconds`` before ``fault.start``
     keep the same load level as the fault window and isolate the fault effect.
     """
+    if baseline_source == "after_load_stabilization":
+        return phases, baseline_source
     fault = phases.get("fault") or {}
     baseline = phases.get("baseline") or {}
     try:
@@ -1759,6 +1762,48 @@ def _rca_trace_candidates(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             candidates.append(candidate)
         if len(candidates) == _RCA_MAX_TRACE_DETAILS:
             break
+    for latency_candidate in (fault or {}).get("latency_candidates") or []:
+        if len(candidates) == _RCA_MAX_TRACE_DETAILS:
+            break
+        if not isinstance(latency_candidate, dict):
+            continue
+        trace_id = latency_candidate.get("trace_id")
+        if (
+            not isinstance(trace_id, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{16,64}", trace_id)
+            or any(item["trace_id"] == trace_id for item in candidates)
+        ):
+            continue
+        operations = latency_candidate.get("operations")
+        if not isinstance(operations, list):
+            operations = []
+        candidates.append(
+            {
+                "trace_id": trace_id,
+                "phase": "fault",
+                "signature": "LATENCY_REGRESSION",
+                "affected_service": _rca_redact_text(
+                    latency_candidate.get("affected_service", ""), 160
+                ),
+                "endpoint": _rca_redact_text(
+                    latency_candidate.get("endpoint", ""), 240
+                ),
+                "operations": [
+                    _rca_redact_text(operation, 240)
+                    for operation in operations[:3]
+                    if isinstance(operation, str)
+                ],
+                "start_time": _rca_unix_ns_to_iso(
+                    latency_candidate.get("start_time_unix_nano")
+                ),
+                "fault_duration_ms": latency_candidate.get("fault_duration_ms"),
+                "baseline_p95_ms": latency_candidate.get("baseline_p95_ms"),
+                "latency_delta_ms": latency_candidate.get("latency_delta_ms"),
+                "baseline_sample_count": latency_candidate.get(
+                    "baseline_sample_count"
+                ),
+            }
+        )
     return candidates
 
 
@@ -1841,7 +1886,10 @@ def _rca_normalize_trace_result(
 
     error_spans = safe_rows(
         "error_spans",
-        ("service", "name", "duration_ms", "exclusive_duration_ms"),
+        (
+            "service", "name", "duration_ms", "exclusive_duration_ms",
+            "http_status_code", "remote_endpoint", "remote_service",
+        ),
     )
     for row, source in zip(error_spans, result.get("error_spans") or []):
         if isinstance(source, dict) and source.get("message") is not None:
@@ -1898,7 +1946,47 @@ def _rca_tool_digest(tool_name: str, result: Any) -> Any:
     if not isinstance(result, dict):
         return result
     status = result.get("status")
+    if tool_name == "history_archive_traces":
+        return {
+            key: result.get(key)
+            for key in (
+                "status",
+                "evidence_source",
+                "archive_key",
+                "bundle_sha256",
+                "source_search_complete",
+                "source_fetch_error_count",
+                "manifest_trace_status",
+                "manifest_overall_status",
+                "search_index_status",
+                "invalid_span_count",
+                "unidentified_span_count",
+                "window_coverage",
+                "trace_count",
+                "span_count",
+                "archive_span_count",
+                "source_trace_count_expected",
+                "source_span_count_expected",
+                "trace_count_parity",
+                "span_count_parity",
+                "phases",
+                "trace_details",
+                "error",
+            )
+            if key in result
+        }
+    if (
+        tool_name == "prometheus_range_query"
+        and result.get("purpose") in {
+            "edge_latency_triage", "historical_container_termination",
+            "cpu_throttling", "gc_collection_time", "http_status_rates",
+            "network_edge_latency",
+        }
+    ):
+        return result
     if status in {"no_data", "partial", "tool_error", "invalid_tool_call", "blocked_repeat"} and tool_name not in {
+        "check_pod_restarts",
+        "check_oom_kills",
         "check_network_packet_drops",
         "check_service_readiness",
         "check_service_logs",
@@ -1913,8 +2001,22 @@ def _rca_tool_digest(tool_name: str, result: Any) -> Any:
         for metric_name, metric in (result.get("metrics") or {}).items():
             if not isinstance(metric, dict):
                 continue
-            if metric.get("status") != "ok":
-                digest["metrics"][metric_name] = {"status": metric.get("status")}
+            metric_status = metric.get("status")
+            phases = {
+                phase: {
+                    key: phase_result.get(key)
+                    for key in ("status", "series_count", "sample_count")
+                    if key in phase_result
+                }
+                for phase, phase_result in (metric.get("phases") or {}).items()
+                if isinstance(phase_result, dict)
+            }
+            if metric_status not in {"ok", "partial"}:
+                digest["metrics"][metric_name] = {
+                    "status": metric_status,
+                    "unit": metric.get("unit"),
+                    "phases": phases,
+                }
                 continue
             rows = [
                 row for row in metric.get("top") or []
@@ -1922,7 +2024,9 @@ def _rca_tool_digest(tool_name: str, result: Any) -> Any:
             ]
             rows.sort(key=lambda row: abs(row["delta_abs"]), reverse=True)
             digest["metrics"][metric_name] = {
+                "status": metric_status,
                 "unit": metric.get("unit"),
+                "phases": phases,
                 "top_delta": [
                     {
                         "service": row.get("service"),
@@ -1982,6 +2086,7 @@ def _rca_tool_digest(tool_name: str, result: Any) -> Any:
                     {
                         "pod": pod.get("pod"),
                         "container": pod.get("container"),
+                        "uid": pod.get("uid"),
                         "restart_observations": pod.get("restart_observations", [])[:6],
                         "omitted_restart_observation_count": pod.get(
                             "omitted_restart_observation_count", 0
@@ -1999,6 +2104,19 @@ def _rca_tool_digest(tool_name: str, result: Any) -> Any:
             "found": bool(result.get("found")),
             "count": result.get("count", 0),
             "affected": affected[:5],
+            "coverage": result.get("coverage") or {},
+            "query_window": result.get("query_window") or {},
+            "omitted_affected_service_count": max(0, len(affected) - 5),
+            **{
+                key: result[key]
+                for key in (
+                    "window", "raw_coverage", "observed_services",
+                    "sample_timestamp_kind", "history_pad", "history_pad_seconds",
+                    "collection_query", "collection_evaluation_time",
+                    "telemetry_family", "limitations", "error",
+                )
+                if key in result
+            },
         }
 
     if tool_name == "check_service_readiness":
@@ -2149,6 +2267,33 @@ def _rca_tool_digest(tool_name: str, result: Any) -> Any:
             ]
             phase_observations[phase]["omitted_failure_signature_count"] = details.get(
                 "omitted_failure_signature_count", 0
+            )
+            phase_observations[phase]["latency_candidates"] = [
+                {
+                    key: (
+                        _rca_redact_text(candidate[key], 240)
+                        if isinstance(candidate.get(key), str)
+                        else [
+                            _rca_redact_text(item, 240)
+                            for item in candidate.get(key, [])[:3]
+                            if isinstance(item, str)
+                        ]
+                        if isinstance(candidate.get(key), list)
+                        else candidate.get(key)
+                    )
+                    for key in (
+                        "trace_id", "signature", "affected_service", "endpoint",
+                        "operations", "start_time_unix_nano", "fault_duration_ms",
+                        "baseline_p95_ms", "latency_delta_ms",
+                        "baseline_sample_count",
+                    )
+                    if key in candidate
+                }
+                for candidate in (details.get("latency_candidates") or [])[:6]
+                if isinstance(candidate, dict)
+            ]
+            phase_observations[phase]["omitted_latency_candidate_count"] = max(
+                0, len(details.get("latency_candidates") or []) - 6
             )
         return {
             "collection": result.get("collection", {}),
@@ -2735,6 +2880,40 @@ def _rca_evidence_bundle(
                             **span,
                         }
                     )
+        elif tool_name == "history_archive_traces":
+            for trace in result.get("trace_details") or []:
+                if not isinstance(trace, dict):
+                    continue
+                timeline.append(
+                    {
+                        "kind": "archived_trace_candidate",
+                        "archive_key": result.get("archive_key"),
+                        **{
+                            key: trace.get(key)
+                            for key in (
+                                "trace_id",
+                                "phase",
+                                "service",
+                                "operation",
+                                "start_time",
+                                "duration_ms",
+                                "is_error",
+                                "dependency_edges",
+                            )
+                        },
+                    }
+                )
+                for span in trace.get("spans") or []:
+                    if isinstance(span, dict):
+                        timeline.append(
+                            {
+                                "kind": "archived_trace_span",
+                                "archive_key": result.get("archive_key"),
+                                "trace_id": trace.get("trace_id"),
+                                "phase": trace.get("phase"),
+                                **span,
+                            }
+                        )
 
     return {
         "schema_version": 1,

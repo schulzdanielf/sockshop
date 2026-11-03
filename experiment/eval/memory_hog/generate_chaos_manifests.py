@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Generate per-(service, chaos_type) Argo Workflow manifests.
+"""Generate per-(service, chaos_type) chaos manifests.
 
 The harness drives several chaos types via the platform's Litmus plugin —
 ``memory-hog``, ``cpu-hog``, ``pod-delete``, ``network-latency``,
 ``network-loss``, ``dns-error``, ``io-stress``, ``http-status-code`` and
-``container-kill`` (see ``RENDERERS``). The plugin runs each chaos by
+``container-kill`` (see ``RENDERERS``). The plugin runs most chaos types by
 *cloning* an existing Argo Workflow whose name matches
 ``<service>-<template_suffix>`` (e.g. ``carts-cpu-hog``), so each combination
 must exist in the ``litmus`` namespace before the harness starts.
+``http-status-code`` uses an Istio VirtualService instead of a Litmus workflow.
 
 Sources:
 
@@ -18,12 +19,17 @@ Sources:
 * ``pod-delete`` has no upstream baseline so we build it inline from the
   cpu-hog skeleton.
 
-Output: ``experiment/eval/memory_hog/out/manifests/<svc>-<chaos>.yaml`` —
-all files can be applied at once with::
+Output: ``experiment/eval/memory_hog/out/manifests/<svc>-<chaos>.yaml``.
+Litmus workflow templates can be applied with::
 
-    kubectl apply -f experiment/eval/memory_hog/out/manifests/
+    find experiment/eval/memory_hog/out/manifests -maxdepth 1 -type f \\
+      ! -name '*-http-status-code.yaml' -exec kubectl apply -f {} \\;
 
 Idempotent — re-running just overwrites the generated YAMLs.
+
+The ``http-status-code`` YAMLs are live Istio VirtualService interventions;
+the runner applies and removes them for each run. Do not apply them during
+Litmus template setup.
 """
 
 from __future__ import annotations
@@ -37,6 +43,16 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 CHAOS_MANIFEST_DIR = ROOT / "deploy" / "kubernetes" / "manifests-chaos"
+HTTP_PROBE_PATHS: Dict[str, tuple[str, ...]] = {
+    "carts": ("/health",),
+    "catalogue": ("/health",),
+    "front-end": ("/",),
+    "orders": ("/health",),
+    "payment": ("/health",),
+    "queue-master": ("/health",),
+    "shipping": ("/health",),
+    "user": ("/health",),
+}
 
 
 # ── Per-chaos-type rendering specs ─────────────────────────────────────────
@@ -397,16 +413,23 @@ def _render_http_status_code(service: str, env: Dict[str, Any]) -> str:
     proxy, logo o alvo não registra erro (ERRO 2 em erros-experimentos.md). A
     correção correta sob mesh é o **fault injection nativo do Istio**: um
     VirtualService que aborta 100% das requisições ao serviço com o status_code
-    configurado. O próprio Envoy injeta o erro → o tráfego real é afetado e o
-    Istio registra os 5xx.
+    configurado, exceto os caminhos usados pelas probes HTTP do serviço. A regra
+    sem fault precisa vir antes da regra catch-all com fault.
 
     Gera um VirtualService (não um Argo Workflow). Aplicado via manifest_path.
     """
+    probe_paths = HTTP_PROBE_PATHS.get(service)
+    if probe_paths is None:
+        raise ValueError(f"HTTP probe paths are not configured for service {service!r}")
+
     status_code = int(env.get("status_code", 500))
+    probe_matches = "\n".join(
+        f'        - uri:\n            exact: "{path}"' for path in probe_paths
+    )
     return f"""# VirtualService — Istio fault injection (HTTP {status_code}) em {service}.
 # Gerado por generate_chaos_manifests._render_http_status_code.
 # Sob Istio, o pod-http-status-code do Litmus é contornado pelo Envoy; este
-# VirtualService injeta o erro no próprio mesh, garantindo efeito observável.
+# VirtualService injeta o erro no próprio mesh sem afetar as probes HTTP.
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
@@ -416,6 +439,13 @@ spec:
   hosts:
     - {service}
   http:
+    - match:
+{probe_matches}
+      route:
+        - destination:
+            host: {service}
+            port:
+              number: 80
     - fault:
         abort:
           percentage:
@@ -427,6 +457,50 @@ spec:
             port:
               number: 80
 """
+
+
+def validate_http_probe_exclusions(service: str, manifest: Dict[str, Any]) -> None:
+    probe_paths = HTTP_PROBE_PATHS.get(service)
+    if probe_paths is None:
+        raise ValueError(f"HTTP probe paths are not configured for service {service!r}")
+    if not isinstance(manifest, dict):
+        raise ValueError("HTTP status-code manifest must be a mapping")
+
+    spec = manifest.get("spec")
+    if not isinstance(spec, dict) or not isinstance(spec.get("http"), list):
+        raise ValueError("HTTP status-code manifest must define spec.http rules")
+    if len(spec["http"]) != 2:
+        raise ValueError(
+            "HTTP status-code manifest must have a probe bypass rule "
+            "and a catch-all fault rule"
+        )
+    probe_rule, fault_rule = spec["http"]
+    if not isinstance(probe_rule, dict) or not isinstance(fault_rule, dict):
+        raise ValueError(
+            "HTTP status-code manifest must have a probe bypass rule "
+            "and a catch-all fault rule"
+        )
+
+    matches = probe_rule.get("match")
+    if not isinstance(matches, list):
+        raise ValueError("HTTP status-code manifest probe rule must match probe paths")
+    actual_probe_paths = {
+        uri["exact"]
+        for match in matches
+        if isinstance(match, dict)
+        for uri in [match.get("uri")]
+        if isinstance(uri, dict) and isinstance(uri.get("exact"), str)
+    }
+    if (
+        "fault" in probe_rule
+        or actual_probe_paths != set(probe_paths)
+        or not probe_rule.get("route")
+    ):
+        raise ValueError(
+            f"HTTP status-code manifest does not bypass probe paths for {service!r}"
+        )
+    if "fault" not in fault_rule or fault_rule.get("match") or not fault_rule.get("route"):
+        raise ValueError("HTTP status-code manifest must end with a catch-all fault rule")
 
 
 def _render_container_kill(service: str, env: Dict[str, Any]) -> str:
@@ -552,11 +626,16 @@ def main() -> int:
     for path in written:
         print(f"  {path.relative_to(ROOT)}")
     print()
-    print("Next: apply them ONCE so Litmus / Argo know the workflow templates:")
-    print(f"  kubectl apply -f {output_dir.relative_to(ROOT)}/")
+    print("Next: apply only the Litmus / Argo workflow templates:")
     print(
-        "(Each apply triggers one workflow run; the workflow NAME persists "
-        "afterwards and the harness clones it for every chaos invocation.)"
+        "  find "
+        f"{output_dir.relative_to(ROOT)} "
+        "-maxdepth 1 -type f ! -name '*-http-status-code.yaml' "
+        "-exec kubectl apply -f {} \\;"
+    )
+    print(
+        "(Each workflow apply triggers one run; HTTP VirtualServices are "
+        "applied and removed by the experiment runner.)"
     )
     return 0
 

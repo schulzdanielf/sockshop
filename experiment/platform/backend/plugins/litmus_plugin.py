@@ -73,6 +73,7 @@ class LitmusChaosPlugin:
             workflow_template,
             resource_chaos,
             config.get("fault_duration_seconds"),
+            template_snapshot=config.get("template_snapshot"),
         )
         return {
             "provider": "litmus",
@@ -164,6 +165,8 @@ class LitmusChaosPlugin:
         workflow_template: str,
         resource_chaos: Optional[Dict[str, Any]] = None,
         fault_duration_seconds: Optional[int] = None,
+        *,
+        template_snapshot: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Find the latest Argo Workflow for *workflow_template*, clone its spec
         and submit a new run. Returns the newly created workflow name."""
@@ -200,6 +203,10 @@ class LitmusChaosPlugin:
                 "Run the experiment at least once from the Litmus UI to create the template."
             )
 
+        if template_snapshot is not None:
+            if template_snapshot.get("metadata", {}).get("name") != workflow_template:
+                raise RuntimeError("Reviewed workflow snapshot does not match requested template")
+            latest_item = template_snapshot
         workflow_spec = copy.deepcopy(latest_item["spec"])
         if resource_chaos:
             self._apply_resource_chaos(workflow_spec, resource_chaos)
@@ -301,23 +308,19 @@ class LitmusChaosPlugin:
     ) -> Dict[str, Any]:
         deadline = time.monotonic() + self._STATUS_WAIT_TIMEOUT_SECONDS
         terminal_workflow_phases = {"Succeeded", "Failed", "Error"}
-        terminal_chaos_phases = {
-            "Completed",
-            "Completed_With_Probe_Failure",
-            "Error",
-            "Failed",
-        }
+        history = handle.setdefault("stop_status_history", [])
         while True:
             status = self.status(context, handle)
-            if (
-                status.get("state") in {"completed", "failed"}
-                or status.get("workflow_phase") in terminal_workflow_phases
-                or status.get("chaos_phase") in terminal_chaos_phases
-            ):
+            history.append({"observed_at": self._now(), **status})
+            if status.get("workflow_phase") in terminal_workflow_phases:
                 return status
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return status
+                return {
+                    **status,
+                    "terminal_wait_timed_out": True,
+                    "terminal_wait_timeout_seconds": self._STATUS_WAIT_TIMEOUT_SECONDS,
+                }
             time.sleep(min(self._STATUS_POLL_INTERVAL_SECONDS, remaining))
 
     def status(self, context: Dict[str, Any], handle: Dict[str, Any]) -> Dict[str, Any]:
@@ -339,6 +342,7 @@ class LitmusChaosPlugin:
                 return {"state": "pending", "reason": proc.stderr.strip()}
 
             wf_data = json.loads(proc.stdout)
+            handle["workflow_before_delete"] = wf_data
             phase = wf_data.get("status", {}).get("phase")
             wf_uid = wf_data.get("metadata", {}).get("uid", "")
             # Argo step that hosts the Litmus runner: its lifetime brackets the
@@ -468,6 +472,8 @@ class LitmusChaosPlugin:
                     "injected_at": handle.get("injected_at"),
                     "stopped_at": handle.get("stopped_at"),
                     "final_status": handle.get("final_status"),
+                    "stop_status_history": handle.get("stop_status_history"),
+                    "workflow_before_delete": handle.get("workflow_before_delete"),
                     "cleanup": handle.get("cleanup"),
                 }
             )

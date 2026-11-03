@@ -28,9 +28,64 @@ data:
             enabled: true
           lokiSearch:
             datasourceUid: loki
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: 1h
+            spanEndTimeShift: 1h
+            tags:
+              - key: service.name
+                value: service
+              - key: k8s.namespace.name
+                value: namespace
+              - key: k8s.pod.name
+                value: pod
+            filterByTraceID: false
+            filterBySpanID: false
+            customQuery: false
       - name: loki
         type: loki
         uid: loki
         access: proxy
         url: http://loki.monitoring.svc.cluster.local:3100
+        editable: true
+      - name: prometheus-history
+        type: prometheus
+        uid: prometheus-history
+        access: proxy
+        url: http://prometheus-history.monitoring-history.svc.cluster.local:9090
+        editable: true
+        jsonData:
+          timeInterval: 15s
+      - name: tempo-history
+        type: tempo
+        uid: tempo-history
+        access: proxy
+        url: http://tempo-history.monitoring-history.svc.cluster.local:3200
+        editable: true
+        jsonData:
+          serviceMap:
+            datasourceUid: prometheus-history
+          nodeGraph:
+            enabled: true
+          lokiSearch:
+            datasourceUid: loki-history
+          tracesToLogsV2:
+            datasourceUid: loki-history
+            spanStartTimeShift: 1h
+            spanEndTimeShift: 1h
+            tags:
+              - key: service.name
+                value: service
+              - key: k8s.namespace.name
+                value: namespace
+              - key: k8s.pod.name
+                value: pod
+            filterByTraceID: false
+            filterBySpanID: false
+            customQuery: false
+      - name: loki-history
+        type: loki
+        uid: loki-history
+        access: proxy
+        url: http://loki-history.monitoring-history.svc.cluster.local:3100
         editable: true

@@ -3,6 +3,11 @@
 > **Atualizado em:** 2026-09-25 · **Abordagem:** [003 — LLM multiagente para RCA](abordagens/003-llm-multiagente-rca.md)
 > Documento de recuperação: o que testar em seguida e como evoluir sem congelar prematuramente a arquitetura.
 
+**Prioridades revisadas em 17/10/2026:** consulte o relatório
+[Próximos passos — correções de maior retorno e menor esforço](./planos/2026-10-17-proximos-passos.md).
+Ele avalia as sete falhas e prioriza gates, identidade/lifecycle, CPU/memória,
+HTTP e rede. O restante desta página preserva o plano de exploração de 25/09.
+
 ## Direção atual
 
 O projeto passa a explorar uma estratégia **100% baseada em LLMs e multiagentes** para RCA. A arquitetura ainda não está definida: cada experimento deve responder uma pergunta pequena, produzir evidência comparável e orientar o próximo desenho.

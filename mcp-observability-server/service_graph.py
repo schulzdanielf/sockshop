@@ -8,6 +8,7 @@ ranked evidence needed to reason about where a fault propagated.
 
 from __future__ import annotations
 
+import math
 import statistics
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -365,6 +366,94 @@ def summarize_trace_graph(
         "cascade_order": cascade[:top_k],
         "suspected_propagation_path": suspected_path[:6],
     }
+
+
+def select_slow_trace_candidates(
+    baseline_traces: Iterable[Dict[str, Any]],
+    fault_traces: Iterable[Dict[str, Any]],
+    *,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Select error-free fault traces that exceed the same operation's baseline P95."""
+    def duration_ms(trace: Dict[str, Any]) -> Optional[float]:
+        features = trace.get("features") or {}
+        if not isinstance(features, dict):
+            return None
+        value = features.get("trace_duration_ms")
+        if not isinstance(value, (int, float)):
+            value = trace.get("duration_ms")
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
+    baseline_durations: Dict[Tuple[str, str], List[float]] = {}
+    for trace in baseline_traces or []:
+        if not isinstance(trace, dict):
+            continue
+        key = (trace.get("root_service"), trace.get("root_trace_name"))
+        if not all(isinstance(value, str) and value for value in key):
+            continue
+        duration = duration_ms(trace)
+        if duration is not None:
+            baseline_durations.setdefault(key, []).append(duration)
+
+    candidates = []
+    for trace in fault_traces or []:
+        if not isinstance(trace, dict):
+            continue
+        features = trace.get("features") or {}
+        if not isinstance(features, dict):
+            continue
+        if features.get("error_spans") or features.get("failure_signatures"):
+            continue
+        trace_id = trace.get("trace_id")
+        root_service = trace.get("root_service")
+        root_trace_name = trace.get("root_trace_name")
+        if not isinstance(trace_id, str) or not trace_id:
+            continue
+        key = (root_service, root_trace_name)
+        if key not in baseline_durations:
+            continue
+        duration = duration_ms(trace)
+        if duration is None:
+            continue
+        baseline_p95 = _percentile(baseline_durations[key], 0.95)
+        if baseline_p95 is None or duration <= baseline_p95:
+            continue
+
+        spans = features.get("hot_spans") or features.get("critical_path") or []
+        operations = [
+            f"{span['service']}.{span['name']}"
+            for span in spans
+            if isinstance(span, dict)
+            and isinstance(span.get("service"), str)
+            and isinstance(span.get("name"), str)
+        ][:3]
+        candidates.append(
+            {
+                "trace_id": trace_id,
+                "signature": "LATENCY_REGRESSION",
+                "affected_service": root_service,
+                "endpoint": root_trace_name,
+                "operations": operations,
+                "start_time_unix_nano": trace.get("start_time_unix_nano"),
+                "fault_duration_ms": round(duration, 3),
+                "baseline_p95_ms": round(baseline_p95, 3),
+                "latency_delta_ms": round(duration - baseline_p95, 3),
+                "baseline_sample_count": len(baseline_durations[key]),
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            -item["latency_delta_ms"],
+            -item["fault_duration_ms"],
+            item["trace_id"],
+        )
+    )
+    return candidates[:max(0, limit)]
 
 
 def _index_edges(summary: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str, Any]]:

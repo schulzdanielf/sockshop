@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 import httpx
@@ -16,38 +16,18 @@ from experiment.platform.backend.analysis.system_card import (
 )
 from experiment.platform.backend.plugins.mcp_client import MCPToolClient
 
-_REFERENCE_SECONDS = 45
-
-
 def _reference_windows(observation_window: Dict[str, Any]) -> tuple[Dict[str, Dict[str, str]], str]:
+    from experiment.platform.backend.agent_console import rca_reference_phases
+
     phases = observation_window.get("phases") or {}
     selected = {
         name: phase
         for name, phase in phases.items()
         if name in {"baseline", "fault", "post"} and isinstance(phase, dict)
     }
-    baseline = selected.get("baseline") or {}
-    fault = selected.get("fault") or {}
-    try:
-        fault_start = datetime.fromisoformat(str(fault["start"]).replace("Z", "+00:00"))
-        baseline_start = datetime.fromisoformat(
-            str(baseline["start"]).replace("Z", "+00:00")
-        )
-    except (KeyError, TypeError, ValueError):
-        return selected, "run_baseline"
-
-    reference_start = max(
-        baseline_start, fault_start - timedelta(seconds=_REFERENCE_SECONDS)
+    return rca_reference_phases(
+        selected, baseline_source=(observation_window.get("phase_sources") or {}).get("baseline"),
     )
-    if (fault_start - reference_start).total_seconds() < _REFERENCE_SECONDS / 2:
-        return selected, "run_baseline"
-
-    adjusted = dict(selected)
-    adjusted["baseline"] = {
-        "start": reference_start.isoformat().replace("+00:00", "Z"),
-        "end": fault_start.isoformat().replace("+00:00", "Z"),
-    }
-    return adjusted, "pre_fault_steady_window"
 
 
 class MCPRcaEvidenceSnapshotPlugin:

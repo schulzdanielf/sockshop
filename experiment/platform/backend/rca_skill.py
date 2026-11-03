@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -27,18 +28,27 @@ from .agent_console import (
     _rca_tool_digest,
     rca_reference_phases,
 )
+from .analysis.edge_latency import (
+    build_edge_latency_queries,
+    normalize_edge_latency_result,
+)
 from .analysis.llm_client import LLMClientError, call_llm_tool_messages
 from .analysis.system_card import load_system_card, render_system_card
+from .evidence_projection import compact_evidence_for_model, EVIDENCE_FORMAT_NOTICE
+from .analysis.telemetry_coverage import termination_query, termination_summary
+from .rca_options import validate_possible_fault_types
 
 SKILL_DIR = Path(__file__).resolve().parents[3] / ".github" / "skills" / "rca"
 MAX_LOG_SERVICES = 6
 MAX_LOG_LINES = 150
+_RAW_OVERRIDE = object()
 TOOL_ERRORS = (
     httpx.HTTPError,
     McpError,
     OSError,
     RuntimeError,
     TimeoutError,
+    asyncio.TimeoutError,
     ValueError,
     ExceptionGroup,
 )
@@ -76,6 +86,7 @@ class Diagnosis(StrictModel):
     status: Literal["confirmed", "inconclusive"]
     primary_service: str | None
     category: str = Field(max_length=80)
+    fault_type: str | None = None
     mechanism: str = Field(min_length=1, max_length=800)
     supporting_evidence: list[str] = Field(max_length=20)
     contradicting_evidence: list[str] = Field(max_length=20)
@@ -136,6 +147,11 @@ def _observation_count(
         )
     if name == "tempo_analyze_trace":
         return int(result.get("span_count") or 0)
+    if name == "history_archive_traces":
+        if phase_name:
+            phase = (result.get("phases") or {}).get(phase_name) or {}
+            return int(phase.get("span_count") or 0)
+        return int(result.get("span_count") or 0)
     if name == "loki_range_query":
         return sum(
             int((phase.get("coverage") or {}).get("lines_returned") or 0)
@@ -148,6 +164,18 @@ def _observation_count(
             if isinstance(metric, dict)
             for phase in selected(metric.get("phases") or {})
         )
+    if name == "prometheus_range_query":
+        return sum(
+            max(
+                int((phase.get("coverage") or {}).get("sample_count") or 0),
+                int((phase.get("coverage") or {}).get("event_count") or 0),
+            )
+            for phase in selected(result.get("phases") or {})
+        )
+    if name == "check_pod_restarts" and phase_name == "fault":
+        coverage = result.get("coverage") or {}
+        if "window_sample_count" in coverage:
+            return int(coverage["window_sample_count"])
     coverage = result.get("coverage") or {}
     if coverage:
         return int(coverage.get("sample_count") or 0)
@@ -177,13 +205,36 @@ def _families(ids: list[str], evidence: list[dict[str, Any]]) -> set[str]:
     }
 
 
+def _edge_latency_candidates(
+    results: list[dict[str, Any]], known_services: set[str]
+) -> list[str]:
+    candidates: list[str] = []
+    for result in results:
+        for metric in (result.get("metrics") or {}).values():
+            for edge in metric.get("top_delta") or []:
+                service = edge.get("service")
+                if (
+                    service in known_services
+                    and edge.get("delta", 0) > 0
+                    and service not in candidates
+                ):
+                    candidates.append(service)
+    return candidates
+
+
 def validate_diagnosis(
     diagnosis: Diagnosis,
     evidence: list[dict[str, Any]],
     known_services: set[str],
     categories: set[str],
     restarted_services: list[str],
+    possible_fault_types: list[str] | None = None,
+    require_best_guess: bool = False,
 ) -> Diagnosis:
+    if require_best_guess and diagnosis.primary_service not in known_services:
+        raise SkillRCAError(
+            "Diagnosis must select one known primary service as the best guess"
+        )
     if (
         diagnosis.primary_service is not None
         and diagnosis.primary_service not in known_services
@@ -199,6 +250,10 @@ def validate_diagnosis(
         )
         diagnosis.category = "unknown"
         diagnosis.status = "inconclusive"
+    if possible_fault_types and diagnosis.fault_type not in possible_fault_types:
+        raise SkillRCAError(
+            "Diagnosis did not select one of the supplied benchmark fault types"
+        )
     ids = {item["id"] for item in evidence}
 
     def retain_known_refs(refs: list[str], label: str) -> list[str]:
@@ -305,9 +360,20 @@ def answer_skill_rca(
     phases: dict[str, dict[str, str]],
     namespace: str,
     window_metadata: dict[str, Any] | None = None,
+    possible_fault_types: list[str] | None = None,
+    require_best_guess: bool = False,
+    archive_traces: dict[str, Any] | None = None,
+    evidence_source: Literal["live", "history"] = "live",
     llm: Callable[..., dict[str, Any]] = call_llm_tool_messages,
 ) -> dict[str, Any]:
     skill, references, skill_hash = load_skill()
+    possible_fault_types = validate_possible_fault_types(
+        possible_fault_types if possible_fault_types is not None else []
+    )
+    if require_best_guess and not possible_fault_types:
+        raise SkillRCAError(
+            "Best-guess classification requires benchmark fault-type options"
+        )
     if not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", namespace):
         raise SkillRCAError("Invalid namespace")
     card = load_system_card(namespace)
@@ -316,7 +382,9 @@ def answer_skill_rca(
         raise SkillRCAError(
             "Skill RCA requires a system card and baseline/fault windows"
         )
-    windows, reference_source = rca_reference_phases(phases)
+    windows, reference_source = rca_reference_phases(
+        phases, baseline_source=((window_metadata or {}).get("phase_sources") or {}).get("baseline"),
+    )
     for window in windows.values():
         start = datetime.fromisoformat(window["start"].replace("Z", "+00:00"))
         end = datetime.fromisoformat(window["end"].replace("Z", "+00:00"))
@@ -331,7 +399,10 @@ def answer_skill_rca(
     model_attempts: list[dict[str, Any]] = []
     restarted: list[str] = []
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": skill + "\n" + render_system_card(namespace)},
+        {
+            "role": "system",
+            "content": skill + "\n" + render_system_card(namespace) + "\n" + EVIDENCE_FORMAT_NOTICE,
+        },
         {
             "role": "user",
             "content": json.dumps(
@@ -340,8 +411,10 @@ def answer_skill_rca(
                     "phases": windows,
                     "reference_source": reference_source,
                     "window_metadata": window_metadata or {},
+                    "possible_fault_types": possible_fault_types,
                 },
                 ensure_ascii=False,
+                separators=(",", ":"),
             ),
         },
     ]
@@ -352,9 +425,15 @@ def answer_skill_rca(
         family: str,
         arguments: dict[str, Any],
         normalize: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        raw_override: Any = _RAW_OVERRIDE,
     ) -> dict[str, Any]:
         started = time.monotonic()
-        if name not in tools:
+        if raw_override is not _RAW_OVERRIDE:
+            if not isinstance(raw_override, dict):
+                result = {"status": "tool_error", "error": "Archive returned a non-object result"}
+            else:
+                result = normalize(raw_override) if normalize else raw_override
+        elif name not in tools:
             result = {"status": "tool_error", "error": f"MCP tool unavailable: {name}"}
         else:
             try:
@@ -389,7 +468,12 @@ def answer_skill_rca(
             "tool": name,
             "family": family,
             "status": status,
-            "source": result.get("evidence_source", "live"),
+            "source": (
+                evidence_source
+                if evidence_source == "history"
+                and result.get("evidence_source") in {None, "live"}
+                else result.get("evidence_source", evidence_source)
+            ),
             "observation_count": count,
             "fault_observation_count": fault_count,
             "arguments": arguments,
@@ -423,8 +507,32 @@ def answer_skill_rca(
         return result
 
     def model_json(
-        stage: str, schema: type[StrictModel], context: dict[str, Any]
+        stage: str,
+        schema: type[StrictModel],
+        context: dict[str, Any],
+        *,
+        allowed_fault_types: list[str] | None = None,
+        allowed_services: list[str] | None = None,
     ) -> dict[str, Any]:
+        output_schema = schema.model_json_schema()
+        if allowed_fault_types:
+            field = output_schema.get("properties", {}).get("fault_type")
+            if not isinstance(field, dict):
+                raise SkillRCAError(f"Schema for {stage} has no fault_type field")
+            field.clear()
+            field.update({"type": "string", "enum": allowed_fault_types})
+            required = output_schema.setdefault("required", [])
+            if "fault_type" not in required:
+                required.append("fault_type")
+        if allowed_services:
+            field = output_schema.get("properties", {}).get("primary_service")
+            if not isinstance(field, dict):
+                raise SkillRCAError(f"Schema for {stage} has no primary_service field")
+            field.clear()
+            field.update({"type": "string", "enum": allowed_services})
+            required = output_schema.setdefault("required", [])
+            if "primary_service" not in required:
+                required.append("primary_service")
         messages.append(
             {
                 "role": "user",
@@ -432,24 +540,62 @@ def answer_skill_rca(
                     {
                         "stage": stage,
                         "context": context,
-                        "evidence": evidence,
-                        "output_schema": schema.model_json_schema(),
+                        "evidence": compact_evidence_for_model(evidence),
+                        "output_schema": output_schema,
                     },
                     ensure_ascii=False,
+                    separators=(",", ":"),
                 ),
             }
         )
         for attempt in range(3):
+            # Each stage already carries its observations and current evidence.
+            current_stage = next(
+                index
+                for index in range(len(messages) - 1, 1, -1)
+                if messages[index]["role"] == "user"
+                and messages[index]["content"].startswith('{"stage":')
+            )
+            model_messages = [
+                message
+                for message in messages[:current_stage]
+                if message["role"] in {"user", "system"}
+                and not message["content"].startswith(('{"stage":', "Resposta invalida:"))
+            ] + messages[current_stage:]
             response = llm(
-                messages,
+                model_messages,
                 [],
                 tool_choice="none",
                 parallel_tool_calls=False,
                 max_new_tokens=4096,
+                chat_template_kwargs={"enable_thinking": False},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.__name__,
+                        "schema": output_schema,
+                    },
+                },
             )
             try:
                 value = _json_content(response)
                 schema.model_validate(value)
+                if (
+                    allowed_fault_types
+                    and value.get("fault_type") not in allowed_fault_types
+                ):
+                    raise ValueError(
+                        "fault_type must exactly match one of "
+                        + ", ".join(allowed_fault_types)
+                    )
+                if (
+                    allowed_services
+                    and value.get("primary_service") not in allowed_services
+                ):
+                    raise ValueError(
+                        "primary_service must select one of "
+                        + ", ".join(allowed_services)
+                    )
             except (ValueError, ValidationError) as exc:
                 model_attempts.append(
                     {
@@ -486,6 +632,7 @@ def answer_skill_rca(
     tools: dict[str, dict[str, Any]] = {}
     planning_was_invalid = False
     golden_result: dict[str, Any] = {}
+    edge_latency_results: list[dict[str, Any]] = []
     try:
         tools = {
             tool["name"]: tool
@@ -518,8 +665,61 @@ def answer_skill_rca(
                         and row.get("restarts_in_window", 0) > 0
                     }
                 )
+        if "prometheus_range_query" in tools and known:
+            arguments = {
+                "query": termination_query(namespace, sorted(known)),
+                "start": windows["baseline"]["start"],
+                "end": windows.get("post", windows["fault"])["end"],
+                "step": "15s",
+            }
+            query(
+                "prometheus_range_query",
+                2,
+                "metrics",
+                arguments,
+                lambda raw: termination_summary(raw, windows),
+            )
+        else:
+            limitations.append(
+                "Historico de terminacao indisponivel: prometheus_range_query ausente ou sem servicos conhecidos"
+            )
+        if "prometheus_range_query" in tools:
+            query_end = windows.get("post", windows["fault"])["end"]
+            for spec in build_edge_latency_queries(namespace, sorted(known)):
+                arguments = {
+                    "query": spec["query"],
+                    "start": windows["baseline"]["start"],
+                    "end": query_end,
+                    "step": "15s",
+                }
+                edge_latency_results.append(
+                    query(
+                        "prometheus_range_query",
+                        1,
+                        "metrics",
+                        arguments,
+                        lambda raw, query_spec=spec: normalize_edge_latency_result(
+                            raw,
+                            spec=query_spec,
+                            phases=windows,
+                            known_services=sorted(known),
+                        ),
+                    )
+                )
+        else:
+            limitations.append(
+                "Latencia por aresta indisponivel: prometheus_range_query ausente"
+            )
+        edge_candidates = _edge_latency_candidates(edge_latency_results, known)
         plan = InvestigationPlan.model_validate(
-            model_json("plan", InvestigationPlan, {"restarted_services": restarted})
+            model_json(
+                "plan",
+                InvestigationPlan,
+                {
+                    "restarted_services": restarted,
+                    "edge_latency_candidates": edge_candidates,
+                },
+            )
         )
         invalid_candidates = sorted(set(plan.candidates) - known)
         if invalid_candidates:
@@ -531,8 +731,13 @@ def answer_skill_rca(
             plan.candidates = [
                 candidate for candidate in plan.candidates if candidate in known
             ]
+        for candidate in edge_candidates:
+            if len(plan.candidates) >= 3:
+                break
+            if candidate not in plan.candidates:
+                plan.candidates.append(candidate)
         if not plan.candidates:
-            metric_candidates = []
+            metric_candidates = list(edge_candidates)
             for metric in (golden_result.get("metrics") or {}).values():
                 if not isinstance(metric, dict):
                     continue
@@ -589,6 +794,8 @@ def answer_skill_rca(
             phases=windows,
             namespace=namespace,
         )
+        if evidence_source == "history":
+            arguments["limit"] = min(int(arguments.get("limit", 20)), 10)
         query(name, 4, "traces", arguments)
         for _ in range(2):
             candidate = _rca_next_trace_candidate(calls)
@@ -600,6 +807,18 @@ def answer_skill_rca(
                 "traces",
                 {"trace_id": candidate["trace_id"]},
                 lambda raw: _rca_normalize_trace_result(raw, candidate),
+            )
+        if archive_traces is not None:
+            query(
+                "history_archive_traces",
+                4,
+                "traces",
+                {
+                    key: archive_traces[key]
+                    for key in ("campaign_id", "run_id", "archive_key", "bundle_sha256")
+                    if key in archive_traces
+                },
+                raw_override=archive_traces,
             )
         name = "check_network_packet_drops"
         if name in tools:
@@ -623,8 +842,19 @@ def answer_skill_rca(
                 {
                     "plan": plan.model_dump(),
                     "restarted_services": restarted,
+                    "edge_latency_candidates": edge_candidates,
                     "collection_limitations": limitations,
+                    "possible_fault_types": possible_fault_types,
+                    "known_services": sorted(known),
+                    "best_guess_requirement": (
+                        "Always choose the most likely primary_service and fault_type "
+                        "from the supplied options, even when evidence is insufficient "
+                        "for confirmation. Do not return null or unknown for these fields."
+                        if require_best_guess else None
+                    ),
                 },
+                allowed_fault_types=possible_fault_types or None,
+                allowed_services=sorted(known) if require_best_guess else None,
             )
         )
         diagnosis = validate_diagnosis(
@@ -633,6 +863,8 @@ def answer_skill_rca(
             known,
             set(card.get("allowed_fault_categories") or []),
             restarted,
+            possible_fault_types,
+            require_best_guess=require_best_guess,
         )
         if planning_was_invalid:
             diagnosis.status = "inconclusive"
@@ -656,8 +888,14 @@ def answer_skill_rca(
             f"Localizacao provavel: {diagnosis.primary_service or 'indeterminada'}\n"
             f"Causa provavel: {diagnosis.mechanism}\n"
             f"Estado: {diagnosis.status} · categoria: {diagnosis.category}\n"
-            f"Evidencias: {', '.join(diagnosis.supporting_evidence) or 'insuficientes'}\n"
-            "Limitacoes: " + "; ".join(diagnosis.limitations)
+            + (
+                f"Tipo de falha: {diagnosis.fault_type}\n"
+                if possible_fault_types
+                else ""
+            )
+            + f"Evidencias: {', '.join(diagnosis.supporting_evidence) or 'insuficientes'}\n"
+            + "Limitacoes: "
+            + "; ".join(diagnosis.limitations)
         )
     else:
         answer = "Skill RCA falhou sem produzir diagnostico: " + str(error)
@@ -668,6 +906,7 @@ def answer_skill_rca(
         "status": diagnosis.status if diagnosis else "error",
         "answer": answer,
         "diagnosis": diagnosis.model_dump() if diagnosis else None,
+        "possible_fault_types": possible_fault_types,
         "error": error,
         "skill": {"name": "rca", "sha256": skill_hash},
         "generated_at": datetime.now(timezone.utc).isoformat(),

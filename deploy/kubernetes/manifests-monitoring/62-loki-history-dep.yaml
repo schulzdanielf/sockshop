@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki-history
+  namespace: monitoring-history
+  labels:
+    app: loki-history
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: loki-history
+  template:
+    metadata:
+      labels:
+        app: loki-history
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:2.9.8
+          args:
+            - -config.file=/etc/loki/loki.yaml
+            - -config.expand-env=true
+          env:
+            - name: HISTORY_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: seaweedfs-history-credentials
+                  key: history-access-key
+            - name: HISTORY_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: seaweedfs-history-credentials
+                  key: history-secret-key
+          ports:
+            - name: http
+              containerPort: 3100
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: 3100
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3100
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki
+              readOnly: true
+            - name: data
+              mountPath: /loki
+      volumes:
+        - name: config
+          configMap:
+            name: loki-history-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: loki-history-pvc

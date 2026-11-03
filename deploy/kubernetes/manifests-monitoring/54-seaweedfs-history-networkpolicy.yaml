@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seaweedfs-history-ingress
+  namespace: monitoring-history
+spec:
+  podSelector:
+    matchLabels:
+      app: seaweedfs-history
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring-history
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8333
+    - from:
+        - podSelector:
+            matchLabels:
+              app: seaweedfs-history

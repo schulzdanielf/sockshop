@@ -51,7 +51,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+from experiment.eval.memory_hog import generate_chaos_manifests
 from experiment.eval.memory_hog.resource_intensity import resource_chaos_environment
+from experiment.platform.backend.history_config import (
+    DEFAULT_HISTORICAL_MCP_SSE_URL,
+)
 
 # ── Module-level constants ──────────────────────────────────────────────────
 HERE = Path(__file__).resolve().parent
@@ -329,6 +333,13 @@ def build_spec(
     short = ct.get("short", suffix.replace("-", ""))
     fault_category = ct.get("fault_category", "unknown")
     pretty = ct.get("name", chaos_type)
+    historical = cfg.get("historical_observability") or {}
+    historical_url = (
+        historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
+    )
+    history_timeout = historical.get("timeout_seconds", 90)
+    if type(history_timeout) is not int or history_timeout < 1:
+        raise ValueError("historical timeout_seconds must be a positive integer")
 
     # Keep the corpus boundary stable across TRAIN/TEST and repeated runs.
     # Database version and run_id still distinguish individual executions.
@@ -345,7 +356,17 @@ def build_spec(
     if not manifests_dir.is_absolute():
         manifests_dir = results_dir / manifests_dir
     vs_manifest = manifests_dir / f"{service}-{suffix}.yaml"
-    use_virtualservice = chaos_type == "http-status-code" and vs_manifest.exists()
+    use_virtualservice = chaos_type == "http-status-code"
+    if use_virtualservice:
+        if not vs_manifest.is_file():
+            raise FileNotFoundError(
+                "http-status-code requires a generated Istio VirtualService "
+                f"with probe exclusions: {vs_manifest}"
+            )
+        http_manifest = yaml.safe_load(vs_manifest.read_text(encoding="utf-8"))
+        generate_chaos_manifests.validate_http_probe_exclusions(
+            service, http_manifest
+        )
 
     resource_profile = None
     if chaos_type in {"cpu-hog", "memory-hog"}:
@@ -427,8 +448,8 @@ def build_spec(
         "observability": {
             "metrics": {
                 "provider": "mcp-prometheus",
-                "mcp_sse_url": "http://127.0.0.1:18080/sse",
-                "timeout_seconds": 10,
+                "mcp_sse_url": historical_url,
+                "timeout_seconds": max(10, history_timeout),
                 # ── Golden Signals (Google SRE) ───────────────────────────
                 # Four dimensions: traffic, errors, latency, saturation.
                 # Saturation is split into CPU and memory because the chaos
@@ -449,39 +470,53 @@ def build_spec(
                     {
                         "id": "error_rate",
                         "query": (
-                            '100 * ('
+                            "100 * ("
                             'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
                             'destination_workload!="unknown",response_code=~"5.."}[30s])) by (destination_workload)'
-                            ' or on(destination_workload) 0 * '
+                            " or on(destination_workload) 0 * "
                             'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
                             'destination_workload!="unknown"}[30s])) by (destination_workload)'
                             ') / clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
                             'destination_workload!="unknown"}[30s])) by (destination_workload), 0.0001)'
                         ),
                     },
+                    # Client-reported 5xx scoped to the directed service edge.
+                    # A proxy abort can fail before the destination application
+                    # logs anything, so this intentionally does not require a
+                    # matching server-side error log.
+                    {
+                        "id": "http_5xx_by_edge",
+                        "query": (
+                            "sum by (source_workload,destination_workload,response_code) "
+                            "(rate(istio_requests_total{"
+                            'destination_workload_namespace="sock-shop",'
+                            'destination_workload!="unknown",source_workload!="unknown",'
+                            'reporter="source",response_code=~"5.."}[30s]))'
+                        ),
+                    },
                     # ── Latency (RED) — three percentiles ──
                     {
                         "id": "latency_p50",
                         "query": (
-                            'histogram_quantile(0.50, sum(rate(istio_request_duration_milliseconds_bucket{'
+                            "histogram_quantile(0.50, sum(rate(istio_request_duration_milliseconds_bucket{"
                             'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            '[30s])) by (le,destination_workload))'
+                            "[30s])) by (le,destination_workload))"
                         ),
                     },
                     {
                         "id": "latency_p95",
                         "query": (
-                            'histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{'
+                            "histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{"
                             'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            '[30s])) by (le,destination_workload))'
+                            "[30s])) by (le,destination_workload))"
                         ),
                     },
                     {
                         "id": "latency_p99",
                         "query": (
-                            'histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{'
+                            "histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{"
                             'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            '[30s])) by (le,destination_workload))'
+                            "[30s])) by (le,destination_workload))"
                         ),
                     },
                     # ── Network signals ─────────────────────────────────
@@ -686,8 +721,8 @@ def build_spec(
             },
             "traces": {
                 "provider": "mcp-tempo",
-                "mcp_sse_url": "http://127.0.0.1:18080/sse",
-                "timeout_seconds": 20,
+                "mcp_sse_url": historical_url,
+                "timeout_seconds": max(20, history_timeout),
                 # Give Tempo a short ingestion grace period before phase-scoped
                 # service graph collection; immediate graph queries can race
                 # span indexing and miss the fault window.
@@ -710,6 +745,12 @@ def build_spec(
                 "use_llm": False,
                 "max_new_tokens": 256,
             },
+        },
+        "historical_observability": {
+            **historical,
+            "mcp_sse_url": historical_url,
+            "required": True,
+            "mode": historical.get("mode", "dual_write"),
         },
         "analysis": {
             "slo": dict(cfg["slo"]),
@@ -1147,7 +1188,7 @@ _EFFECT_METRICS: Dict[str, List[str]] = {
     "container-kill": ["pod_restarts", "pod_restarts_total", "error_rate"],
     "network-latency": ["latency_p95", "latency_p50", "latency_p99"],
     "network-loss": ["error_rate", "latency_p95", "network_transmit_dropped_rate"],
-    "http-status-code": ["error_rate"],
+    "http-status-code": ["error_rate", "http_5xx_by_edge"],
 }
 _EFFECT_MIN_RELATIVE_INCREASE = 0.20
 

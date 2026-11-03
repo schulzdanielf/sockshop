@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -16,6 +17,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+import yaml
+
+from experiment.platform.backend.analysis.edge_latency import EDGE_LATENCY_QUERY_SPECS
+from experiment.eval.memory_hog.rca_evaluation_common import campaign_fault_types
+
 DEFAULT_CAMPAIGN_DIR = (
     Path(__file__).resolve().parent
     / "out"
@@ -25,6 +31,38 @@ DEFAULT_CAMPAIGN_DIR = (
 DEFAULT_TIMEOUT_SECONDS = 900
 
 
+def _edge_latency_coverage(response: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    coverage = {
+        spec["metric_name"]: {
+            "status": "missing",
+            "fault_observation_count": 0,
+            "regressed_edges": 0,
+        }
+        for spec in EDGE_LATENCY_QUERY_SPECS
+    }
+    for item in response.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        digest = item.get("digest") or {}
+        metrics = digest.get("metrics") if isinstance(digest, dict) else None
+        if not isinstance(metrics, dict):
+            continue
+        for metric_name, metric in metrics.items():
+            if metric_name not in coverage or not isinstance(metric, dict):
+                continue
+            coverage[metric_name] = {
+                "status": metric.get("status", item.get("status", "unknown")),
+                "fault_observation_count": int(
+                    item.get("fault_observation_count") or 0
+                ),
+                "regressed_edges": sum(
+                    isinstance(edge, dict) and edge.get("direction") == "increase"
+                    for edge in metric.get("top_delta") or []
+                ),
+            }
+    return coverage
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -32,22 +70,45 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_cohort(campaign_dir: Path, baseline_path: Path) -> list[dict[str, Any]]:
-    """Use the completed run IDs from the prior evaluation as the paired cohort."""
-    baseline = _read_json(baseline_path)
-    baseline_results = baseline.get("results")
-    if not isinstance(baseline_results, list):
-        raise ValueError("baseline evaluation has no results list")
+def load_cohort(
+    campaign_dir: Path, baseline_path: Path | None = None
+) -> list[dict[str, Any]]:
+    """Load paired legacy runs or derive a comparable cohort from the campaign manifest."""
     runs_path = campaign_dir / "runs.csv"
     if not runs_path.is_file():
         raise FileNotFoundError(f"campaign run manifest is missing: {runs_path}")
-
-    import csv
-
     with runs_path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     rows_by_id = {row.get("run_id"): row for row in rows if row.get("run_id")}
 
+    if baseline_path is None:
+        cohort = []
+        for row in rows:
+            run_id = row.get("run_id")
+            if (
+                row.get("phase") != "test"
+                or row.get("status") != "completed"
+                or not run_id
+            ):
+                continue
+            cohort.append(
+                {
+                    "run_id": run_id,
+                    "run_status": "completed",
+                    "rca_status": None,
+                    "service": row.get("service"),
+                    "chaos_type": row.get("chaos_type"),
+                    "ground_truth_service": row.get("service"),
+                }
+            )
+        if not cohort:
+            raise ValueError("campaign manifest has no completed test runs")
+        return cohort
+
+    baseline = _read_json(baseline_path)
+    baseline_results = baseline.get("results")
+    if not isinstance(baseline_results, list):
+        raise ValueError("baseline evaluation has no results list")
     cohort: list[dict[str, Any]] = []
     seen: set[str] = set()
     for result in baseline_results:
@@ -71,8 +132,6 @@ def load_cohort(campaign_dir: Path, baseline_path: Path) -> list[dict[str, Any]]
             or row.get("chaos_type") != result.get("chaos_type")
         ):
             raise ValueError(f"baseline and campaign manifest disagree for {run_id}")
-        if not result.get("ground_truth_fault_category"):
-            raise ValueError(f"baseline has no fault category for {run_id}")
         seen.add(run_id)
         cohort.append(result)
     if not cohort:
@@ -80,10 +139,17 @@ def load_cohort(campaign_dir: Path, baseline_path: Path) -> list[dict[str, Any]]
     return cohort
 
 
-def _call_skill_rca(api_base: str, run_id: str, timeout_seconds: int) -> dict[str, Any]:
+def _call_skill_rca(
+    api_base: str,
+    run_id: str,
+    timeout_seconds: int,
+    possible_fault_types: list[str] | None = None,
+) -> dict[str, Any]:
     request = Request(
         f"{api_base.rstrip('/')}/api/runs/{quote(run_id, safe='')}/skill-rca",
-        data=b"{}",
+        data=json.dumps(
+            {"possible_fault_types": possible_fault_types or []}
+        ).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
@@ -95,7 +161,10 @@ def _call_skill_rca(api_base: str, run_id: str, timeout_seconds: int) -> dict[st
 
 
 def _attempt(
-    api_base: str, baseline: dict[str, Any], timeout_seconds: int
+    api_base: str,
+    baseline: dict[str, Any],
+    timeout_seconds: int,
+    possible_fault_types: list[str] | None = None,
 ) -> dict[str, Any]:
     run_id = baseline["run_id"]
     entry: dict[str, Any] = {
@@ -103,21 +172,23 @@ def _attempt(
         "service": baseline["service"],
         "chaos_type": baseline["chaos_type"],
         "ground_truth_service": baseline["ground_truth_service"],
-        "ground_truth_fault_category": baseline["ground_truth_fault_category"],
+        "localized_service": None,
+        "localization_correct": False,
+        "fault_type": None,
+        "category": None,
+        "fault_type_correct": False,
+        "fault_type_in_options": False,
         "legacy": {
             "status": baseline.get("rca_status"),
             "localized_service": baseline.get("localized_service"),
             "localization_correct": baseline.get("localization_correct"),
             "cause": baseline.get("cause"),
-            "fault_category_correct": baseline.get("fault_category_correct"),
-            "both_correct": (
-                baseline.get("localization_correct") is True
-                and baseline.get("fault_category_correct") is True
-            ),
         },
     }
     try:
-        response = _call_skill_rca(api_base, run_id, timeout_seconds)
+        response = _call_skill_rca(
+            api_base, run_id, timeout_seconds, possible_fault_types
+        )
     except HTTPError as exc:
         try:
             detail = json.loads(exc.read().decode("utf-8", errors="replace")).get(
@@ -144,16 +215,26 @@ def _attempt(
     if not isinstance(diagnosis, dict):
         diagnosis = {}
     localized = diagnosis.get("primary_service")
-    category = diagnosis.get("category")
-    localized_correct = (
-        localized.casefold() == entry["ground_truth_service"].casefold()
-        if isinstance(localized, str) and localized
-        else None
+    fault_type = diagnosis.get("fault_type")
+    status = response.get("status", "invalid_response")
+    valid_response = (
+        status in {"confirmed", "inconclusive"}
+        and response.get("observability_source") == "history"
     )
-    category_correct = (
-        category == entry["ground_truth_fault_category"]
-        if isinstance(category, str) and category
-        else None
+    if status in {"confirmed", "inconclusive"} and not valid_response:
+        status = "invalid_response"
+        entry["error"] = "Skill RCA response did not confirm historical observability"
+    if valid_response and possible_fault_types and fault_type not in possible_fault_types:
+        status = "invalid_response"
+        valid_response = False
+        entry["error"] = (
+            "fault_type must exactly match one of: " + ", ".join(possible_fault_types)
+        )
+    localized_correct = (
+        valid_response
+        and localized.casefold() == entry["ground_truth_service"].casefold()
+        if isinstance(localized, str) and localized
+        else False
     )
     fault_families = sorted(
         {
@@ -167,18 +248,22 @@ def _attempt(
     )
     entry.update(
         {
-            "status": response.get("status", "invalid_response"),
+            "status": status,
             "localized_service": localized,
             "localization_correct": localized_correct,
-            "category": category,
-            "fault_category_correct": category_correct,
-            "both_correct": (
-                localized_correct is True and category_correct is True
-                if isinstance(localized_correct, bool)
-                and isinstance(category_correct, bool)
-                else None
+            "fault_type": fault_type,
+            "category": diagnosis.get("category"),
+            "fault_type_correct": (
+                valid_response and fault_type == entry["chaos_type"]
             ),
-            "confirmed": response.get("status") == "confirmed",
+            "fault_type_in_options": (
+                valid_response and fault_type in possible_fault_types
+                if possible_fault_types
+                else False
+            ),
+            "valid_response": valid_response,
+            "confirmed": valid_response and status == "confirmed",
+            "observability_source": response.get("observability_source"),
             "attempt_id": response.get("attempt_id"),
             "artifact_path": response.get("artifact_path"),
             "skill_hash": (response.get("skill") or {}).get("sha256"),
@@ -187,6 +272,7 @@ def _attempt(
             "evidence_family_count": len(fault_families),
             "fault_evidence_families": fault_families,
             "evidence_count": len(response.get("evidence") or []),
+            "edge_latency_coverage": _edge_latency_coverage(response),
             "limitations": (
                 diagnosis.get("limitations", [])
                 if diagnosis
@@ -221,6 +307,12 @@ def _summarize(
     tool_counts: Counter[str] = Counter()
     status_counts: Counter[str] = Counter()
     family_counts: Counter[str] = Counter()
+    edge_latency_coverage = {
+        spec["metric_name"]: 0 for spec in EDGE_LATENCY_QUERY_SPECS
+    }
+    edge_latency_regression_runs = {
+        spec["metric_name"]: 0 for spec in EDGE_LATENCY_QUERY_SPECS
+    }
     for row in results:
         status_counts[str(row.get("status", "unknown"))] += 1
         tool_counts.update(
@@ -231,15 +323,21 @@ def _summarize(
             for family in row.get("fault_evidence_families", [])
             if isinstance(family, str)
         )
-    gains = {"localization": 0, "fault_category": 0, "both": 0}
-    regressions = {"localization": 0, "fault_category": 0, "both": 0}
+        for metric_name, metric in (row.get("edge_latency_coverage") or {}).items():
+            if metric_name not in edge_latency_coverage or not isinstance(metric, dict):
+                continue
+            if metric.get("fault_observation_count", 0) > 0:
+                edge_latency_coverage[metric_name] += 1
+            if metric.get("regressed_edges", 0) > 0:
+                edge_latency_regression_runs[metric_name] += 1
+    gains = {"localization": 0, "fault_type": 0}
+    regressions = {"localization": 0, "fault_type": 0}
     for row in paired:
         for key, skill_key, legacy_key in (
             ("localization", "localization_correct", "localization_correct"),
-            ("fault_category", "fault_category_correct", "fault_category_correct"),
-            ("both", "both_correct", "both_correct"),
+            ("fault_type", "fault_type_correct", "fault_type_correct"),
         ):
-            old = row["legacy"][legacy_key]
+            old = row["legacy"].get(legacy_key)
             new = row.get(skill_key)
             if isinstance(old, bool) and isinstance(new, bool):
                 if new and not old:
@@ -258,13 +356,17 @@ def _summarize(
         "failed": len(results) - len(completed),
         "status_counts": dict(sorted(status_counts.items())),
         "service_localization": _accuracy(results, "localization_correct"),
-        "fault_classification": _accuracy(results, "fault_category_correct"),
-        "both_correct": _accuracy(results, "both_correct"),
+        "fault_type_classification": _accuracy(results, "fault_type_correct"),
+        "fault_type_option_compliance": _accuracy(
+            results, "fault_type_in_options"
+        ),
         "paired_completed": len(paired),
         "paired_gains": gains,
         "paired_regressions": regressions,
         "fault_evidence_family_counts": dict(sorted(family_counts.items())),
         "tool_call_counts": dict(sorted(tool_counts.items())),
+        "edge_latency_fault_coverage_runs": edge_latency_coverage,
+        "edge_latency_regression_runs": edge_latency_regression_runs,
     }
 
 
@@ -287,16 +389,27 @@ def evaluate(
     campaign_id: str,
     output: Path,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    possible_fault_types: list[str] | None = None,
+    baseline_evaluation: str = "rca_evaluation_retry.json",
 ) -> dict[str, Any]:
     if output.exists():
         raise FileExistsError(f"refusing to overwrite an existing report: {output}")
+    if possible_fault_types is None:
+        possible_fault_types = sorted(
+            {
+                str(row["chaos_type"])
+                for row in cohort
+                if row.get("chaos_type")
+            }
+        )
     report: dict[str, Any] = {
         "schema_version": 1,
         "evaluation": "skill-rca",
         "campaign_id": campaign_id,
+        "possible_fault_types": possible_fault_types,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "api_base": api_base,
-        "baseline_evaluation": "rca_evaluation_retry.json",
+        "baseline_evaluation": baseline_evaluation,
         "cohort_run_ids": [row["run_id"] for row in cohort],
         "summary": {},
         "results": [],
@@ -309,7 +422,9 @@ def evaluate(
             flush=True,
         )
         started = time.monotonic()
-        result = _attempt(api_base, baseline, timeout_seconds)
+        result = _attempt(
+            api_base, baseline, timeout_seconds, possible_fault_types
+        )
         result["duration_seconds"] = round(time.monotonic() - started, 2)
         report["results"].append(result)
         report["summary"] = _summarize(report["results"], cohort)
@@ -317,8 +432,10 @@ def evaluate(
         _write_report(output, report)
         print(
             f"  status={result.get('status')} service={result.get('localized_service')} "
+            f"fault_type={result.get('fault_type')} "
             f"category={result.get('category')} "
-            f"artifact={result.get('artifact_path')}",
+            f"artifact={result.get('artifact_path')}"
+            + (f" error={result['error']}" if result.get("error") else ""),
             flush=True,
         )
     report["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -341,11 +458,20 @@ def main() -> int:
     if args.timeout < 1:
         parser.error("--timeout must be positive")
     campaign_dir = args.campaign_dir.resolve()
-    baseline_path = args.baseline or campaign_dir / "rca_evaluation_retry.json"
+    default_baseline = campaign_dir / "rca_evaluation_retry.json"
+    baseline_path = args.baseline or (
+        default_baseline if default_baseline.is_file() else None
+    )
     output = args.output or campaign_dir / "rca_skill_evaluation.json"
     try:
-        baseline_doc = _read_json(baseline_path)
+        baseline_doc = _read_json(baseline_path) if baseline_path else {}
         cohort = load_cohort(campaign_dir, baseline_path)
+        config_path = campaign_dir / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        runs_path = campaign_dir / "runs.csv"
+        with runs_path.open("r", encoding="utf-8", newline="") as handle:
+            run_rows = list(csv.DictReader(handle))
+        possible_fault_types = campaign_fault_types(config, run_rows)
         print(
             f"Campaign {baseline_doc.get('campaign_id')}: "
             f"{len(cohort)} paired completed runs; no fault injection.",
@@ -354,9 +480,17 @@ def main() -> int:
         report = evaluate(
             api_base=args.api_base,
             cohort=cohort,
-            campaign_id=str(baseline_doc.get("campaign_id") or campaign_dir.name),
+            campaign_id=str(
+                baseline_doc.get("campaign_id")
+                or config.get("experiment_campaign_id")
+                or campaign_dir.name
+            ),
             output=output,
             timeout_seconds=args.timeout,
+            possible_fault_types=possible_fault_types,
+            baseline_evaluation=(
+                baseline_path.name if baseline_path else "campaign runs.csv/config.yaml"
+            ),
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Skill RCA evaluation failed: {exc}", file=sys.stderr)

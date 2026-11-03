@@ -4,8 +4,34 @@ import json
 from unittest.mock import Mock, patch
 
 import yaml
+import pytest
 
 from experiment.platform.backend.plugins.litmus_plugin import LitmusChaosPlugin
+
+
+def test_submit_uses_reviewed_snapshot_not_another_latest_workflow():
+    reviewed = {
+        "metadata": {"name": "orders-cpu-hog"},
+        "spec": {"entrypoint": "reviewed", "templates": []},
+    }
+    other = {
+        "metadata": {"name": "orders-cpu-hog-1234567890123"},
+        "spec": {"entrypoint": "unreviewed", "templates": []},
+    }
+    with patch(
+        "experiment.platform.backend.plugins.litmus_plugin.subprocess.run",
+        side_effect=[
+            Mock(returncode=0, stdout=json.dumps({"items": [other]}), stderr=""),
+            Mock(returncode=0, stdout="workflow.argoproj.io/orders-cpu-hog-xyz created", stderr=""),
+        ],
+    ) as command:
+        LitmusChaosPlugin().inject({}, {
+            "provider": "litmus", "namespace": "sock-shop", "chaos_engine": "orders-cpu-hog",
+            "template_snapshot": reviewed,
+        })
+    submitted = json.loads(command.call_args.kwargs["input"])
+    assert submitted["spec"]["entrypoint"] == "reviewed"
+    assert reviewed["spec"]["templates"] == []
 
 
 def test_inject_overrides_stale_embedded_resource_tunables():
@@ -206,6 +232,49 @@ def test_stop_waits_for_terminal_litmus_verdict_before_deleting_workflow():
     assert kubectl.call_args.args[0][:3] == [
         "kubectl", "delete", "workflow.argoproj.io"
     ]
+
+
+def test_stop_does_not_delete_when_only_the_chaosresult_has_completed():
+    plugin = LitmusChaosPlugin()
+    handle = {"mode": "argo_workflow", "workflow_name": "catalogue-network-latency-test"}
+    statuses = [
+        {"state": "running", "workflow_phase": "Running",
+         "chaos_phase": "Completed", "chaos_verdict": "Pass"},
+        {"state": "completed", "workflow_phase": "Succeeded",
+         "chaos_phase": "Completed", "chaos_verdict": "Pass"},
+    ]
+    with patch.object(plugin, "status", side_effect=statuses) as status, patch(
+        "experiment.platform.backend.plugins.litmus_plugin.time.sleep"
+    ), patch(
+        "experiment.platform.backend.plugins.litmus_plugin.subprocess.run",
+        return_value=Mock(returncode=0, stdout="deleted", stderr=""),
+    ) as command:
+        command.side_effect = lambda *a, **kw: (
+            Mock(returncode=0, stdout="deleted", stderr="")
+            if status.call_count == 2 else pytest.fail("deleted a still-running workflow")
+        )
+        plugin.stop({}, handle)
+    assert handle["final_status"]["workflow_phase"] == "Succeeded"
+    assert [s["workflow_phase"] for s in handle["stop_status_history"]] == ["Running", "Succeeded"]
+    assert plugin.collect_artifacts({}, handle)["stop_status_history"] == handle["stop_status_history"]
+
+
+def test_stop_timeout_is_explicit_and_does_not_claim_completion():
+    plugin = LitmusChaosPlugin()
+    handle = {"mode": "argo_workflow", "workflow_name": "catalogue-network-latency-test"}
+    status = {"state": "running", "workflow_phase": "Running",
+              "chaos_phase": "Completed", "chaos_verdict": "Pass"}
+    with patch.object(plugin, "status", return_value=status), patch(
+        "experiment.platform.backend.plugins.litmus_plugin.time.monotonic",
+        side_effect=[0, 121],
+    ), patch(
+        "experiment.platform.backend.plugins.litmus_plugin.subprocess.run",
+        return_value=Mock(returncode=0, stdout="deleted", stderr=""),
+    ):
+        plugin.stop({}, handle)
+    assert handle["final_status"]["state"] == "running"
+    assert handle["final_status"]["terminal_wait_timed_out"] is True
+    assert handle["final_status"]["terminal_wait_timeout_seconds"] == 120
 
 
 def test_status_exposes_chaosresult_creation_timestamp():

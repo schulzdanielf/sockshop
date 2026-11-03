@@ -1559,38 +1559,76 @@ def test_rca_tool_digest_compacts_raw_results():
         "service": "front-end", "baseline": 10.0, "fault": 2.0,
         "delta": -8.0, "direction": "decrease",
     }
-    assert digest["metrics"]["error_rate"] == {"status": "no_data"}
+    assert digest["metrics"]["error_rate"] == {
+        "status": "no_data",
+        "unit": None,
+        "phases": {},
+    }
     assert "query" not in digest["metrics"]["cpu_saturation_pct"]
 
     restarts = agent_console._rca_tool_digest(
         "check_pod_restarts",
-        {"status": "ok", "found": True, "count": 1, "top": [
-            {
-                "service": "front-end",
-                "restarts_in_window": 1,
-                "pods": [
-                    {
-                        "pod": "front-end-abcde-12345",
-                        "container": "front-end",
-                        "restart_observations": [
-                            {
-                                "observed_from": "t0",
-                                "observed_to": "t1",
-                                "restart_count_delta": 1,
-                                "timestamp_precision": "between_scrapes",
-                            }
-                        ],
-                    }
-                ],
+        {
+            "status": "ok",
+            "found": True,
+            "count": 1,
+            "coverage": {
+                "series_count": 1,
+                "sample_count": 4,
+                "window_bracketed_series_count": 1,
+                "window_unbracketed_series_count": 0,
             },
-            {"service": "carts", "restarts_in_window": 0},
-        ]},
+            "query_window": {"start": "before", "end": "after"},
+            "top": [
+                {
+                    "service": "front-end",
+                    "restarts_in_window": 1,
+                    "pods": [
+                        {
+                            "pod": "front-end-abcde-12345",
+                            "container": "front-end",
+                            "restart_observations": [
+                                {
+                                    "observed_from": "t0",
+                                    "observed_to": "t1",
+                                    "restart_count_delta": 1,
+                                    "timestamp_precision": "between_scrapes",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {"service": "carts", "restarts_in_window": 0},
+            ],
+        },
     )
     assert restarts["affected"][0]["service"] == "front-end"
     assert restarts["affected"][0]["pod_observations"][0]["restart_observations"][0]["timestamp_precision"] == "between_scrapes"
+    assert restarts["coverage"]["window_bracketed_series_count"] == 1
+    assert restarts["query_window"] == {"start": "before", "end": "after"}
     assert agent_console._rca_tool_digest("check_oom_kills", {"status": "tool_error", "error": "boom", "top": []}) == {
         "status": "tool_error", "error": "boom",
     }
+
+    partial_answer = agent_console._rca_fallback_answer(
+        [{
+            "tool": "check_pod_restarts",
+            "result": {
+                "status": "partial",
+                "found": False,
+                "count": 0,
+                "coverage": {
+                    "series_count": 1,
+                    "sample_count": 1,
+                    "window_bracketed_series_count": 0,
+                    "window_unbracketed_series_count": 1,
+                },
+                "top": [],
+            },
+        }]
+    )
+    assert "check_pod_restarts: cobertura partial" in partial_answer
+    assert "nenhum pod foi reiniciado" not in partial_answer
 
 
 def test_rca_readiness_digest_and_fallback_preserve_phase_chain():
@@ -1786,6 +1824,20 @@ def test_rca_trace_digest_preserves_phase_observations_without_heuristic_path():
                             "occurrence_count": 2,
                         }
                     ],
+                    "latency_candidates": [
+                        {
+                            "trace_id": "trace-2",
+                            "signature": "LATENCY_REGRESSION",
+                            "affected_service": "orders",
+                            "endpoint": "GET /orders",
+                            "operations": ["orders.GET /orders"],
+                            "start_time_unix_nano": "1700000000000000000",
+                            "fault_duration_ms": 900.0,
+                            "baseline_p95_ms": 100.0,
+                            "latency_delta_ms": 800.0,
+                            "baseline_sample_count": 4,
+                        }
+                    ],
                     "top_edges": [
                         {
                             "from": "orders",
@@ -1812,6 +1864,8 @@ def test_rca_trace_digest_preserves_phase_observations_without_heuristic_path():
     assert digest["phase_observations"]["fault"]["top_nodes"][0]["error_span_count"] == 2
     assert digest["phase_observations"]["fault"]["failure_signatures"][0]["trace_id"] == "trace-1"
     assert digest["phase_observations"]["fault"]["failure_signatures"][0]["signature"] == "NETWORK_TIMEOUT"
+    assert digest["phase_observations"]["fault"]["latency_candidates"][0]["trace_id"] == "trace-2"
+    assert digest["phase_observations"]["fault"]["latency_candidates"][0]["latency_delta_ms"] == 800.0
     assert digest["measured_deltas"]["top_edge_deltas"][0]["error_rate_delta"] == 0.2
     assert "suspected_propagation_path" not in json.dumps(digest)
 

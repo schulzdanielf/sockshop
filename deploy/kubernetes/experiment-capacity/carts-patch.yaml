@@ -1,0 +1,13 @@
+spec:
+  template:
+    spec:
+      containers:
+      - name: carts
+        resources:
+          requests:
+            cpu: 300m
+          limits:
+            cpu: "1"
+        env:
+        - name: JAVA_OPTS
+          value: -Xms64m -Xmx128m -XX:+UseG1GC -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1 -XX:CICompilerCount=2 -Djava.security.egd=file:/dev/urandom

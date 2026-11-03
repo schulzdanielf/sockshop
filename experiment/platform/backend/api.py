@@ -52,6 +52,7 @@ from .engine import (
     _build_observation_window,
     _build_partial_observation_window,
 )
+from .controlled_experiment import CONTROLLED_CAMPAIGN_PROTOCOL_VERSION
 from .domain import DomainEvent
 from .analysis.mcp_investigator import investigate_metric_window
 from .agent_console import (
@@ -84,16 +85,37 @@ from .plugins.litmus_plugin import LitmusChaosPlugin
 from .plugins.locust_plugin import LocustLoadPlugin
 from .plugins.mcp_evidence_snapshot_plugin import (
     MCPRcaEvidenceSnapshotPlugin,
-    SnapshotPreferredMCPClient,
 )
 from .plugins.mcp_metrics_plugin import MCPPrometheusMetricsPlugin
 from .plugins.mcp_traces_plugin import MCPTempoTracesPlugin
+from .history_job import HistoryMigrationDispatcher
+from .history_config import DEFAULT_HISTORICAL_MCP_SSE_URL
+from .history_archive import (
+    HistoryArchiveError,
+    HistoryArchiveNotFound,
+    HistoryArchiveReader,
+)
+from .history_stream import validate_history_stream
 from .security import require_roles
 from .rca_skill import SkillRCAError, answer_skill_rca
+from .rca_options import RCABenchmarkOptions
+from .rca_knowledge import (
+    VERSION as KNOWLEDGE_VERSION,
+    FreezeRequest,
+    KnowledgeOptions,
+    KnowledgeStore,
+    digest as knowledge_digest,
+    historical_evidence_sources_valid,
+    investigate as investigate_knowledge,
+    load_skill,
+)
+from .analysis.llm_client import call_llm_tool_messages
 from .multiagent_rca import (
     InvestigationBudget,
     InvestigationContext,
     InvestigationPlan,
+    PROMPT_VERSION as MULTIAGENT_PROMPT_VERSION,
+    STRATEGY_VERSION as MULTIAGENT_STRATEGY_VERSION,
     answer_multiagent_rca,
     build_investigation_plan,
 )
@@ -118,7 +140,10 @@ def _select_telemetry_windows(
 
 
 def _build_multiagent_context(
-    run_id: str, namespace: str, window: dict
+    run_id: str,
+    namespace: str,
+    window: dict,
+    possible_fault_types: list[str] | None = None,
 ) -> InvestigationContext:
     if not isinstance(namespace, str) or not re.fullmatch(
         r"[a-z0-9]+(?:[-.][a-z0-9]+)*", namespace
@@ -130,6 +155,7 @@ def _build_multiagent_context(
         namespace=namespace,
         known_services=sorted((card.get("services") or {}).keys()),
         allowed_categories=list(card.get("allowed_fault_categories") or []),
+        possible_fault_types=possible_fault_types or [],
         phases={
             name: phase
             for name, phase in (window.get("phases") or {}).items()
@@ -138,6 +164,25 @@ def _build_multiagent_context(
         phase_sources=window.get("phase_sources") or {},
         partial=window.get("partial", False),
     )
+
+
+def _mcp_client_timeout_seconds(
+    metrics: dict[str, Any],
+    traces: dict[str, Any],
+    historical: dict[str, Any],
+) -> int:
+    timeouts = [
+        int(metrics.get("timeout_seconds", 10)),
+        int(traces.get("timeout_seconds", 20)),
+    ]
+    timeout = historical.get("timeout_seconds", 30)
+    if type(timeout) is not int or timeout < 1:
+        raise HTTPException(
+            status_code=409,
+            detail="historical timeout_seconds must be a positive integer",
+        )
+    timeouts.append(timeout)
+    return max(timeouts)
 
 
 def create_app() -> FastAPI:
@@ -151,6 +196,7 @@ def create_app() -> FastAPI:
         db_path=data_dir / "platform.db",
         object_store_root=data_dir / "object_store",
     )
+    history_archive = HistoryArchiveReader.from_environment()
 
     engine = OrchestratorEngine(
         storage=storage,
@@ -161,6 +207,7 @@ def create_app() -> FastAPI:
         notifier=NoopNotificationAdapter(),
         kill_switch_path=kill_switch_path,
         evidence_snapshot=MCPRcaEvidenceSnapshotPlugin(),
+        history_migration=HistoryMigrationDispatcher.from_environment(),
     )
 
     app = FastAPI(title="Chaos Platform", version="1.0.0")
@@ -181,6 +228,10 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return {"status": "ok"}
 
+    @app.get("/api/controlled-campaign/capabilities")
+    def get_controlled_campaign_capabilities() -> dict:
+        return {"protocol_version": CONTROLLED_CAMPAIGN_PROTOCOL_VERSION}
+
     @app.post("/api/experiments")
     def create_experiment(
         req: CreateExperimentRequest,
@@ -200,6 +251,351 @@ def create_app() -> FastAPI:
     @app.get("/api/experiments")
     def list_experiments() -> list[dict]:
         return storage.list_experiments()
+
+    @app.get("/api/multiagent-rca/strategy")
+    def get_multiagent_rca_strategy() -> dict:
+        return {
+            "strategy_version": MULTIAGENT_STRATEGY_VERSION,
+            "prompt_version": MULTIAGENT_PROMPT_VERSION,
+        }
+
+    @app.get("/api/skill-rag/strategy")
+    def get_skill_rag_strategy() -> dict:
+        return {
+            "version": KNOWLEDGE_VERSION,
+            "modes": [
+                "annotate", "control", "rag", "exploratory_control",
+                "exploratory_rag",
+            ],
+        }
+
+    def knowledge_store(corpus_id: str) -> KnowledgeStore:
+        return KnowledgeStore(storage.object_store_root / ".rca_knowledge", corpus_id)
+
+    def read_knowledge_base(corpus_id: str) -> tuple[dict, str] | None:
+        try:
+            store = knowledge_store(corpus_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        base_paths = [
+            store.directory / "base.json",
+            store.directory / "exploratory_base.json",
+        ]
+        installed = [path for path in base_paths if path.is_file()]
+        if not installed:
+            return None
+        if len(installed) != 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Knowledge corpus {corpus_id} has conflicting frozen bases",
+            )
+
+        path = installed[0]
+        try:
+            base = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot read knowledge corpus {corpus_id}: {exc}",
+            ) from exc
+        if not isinstance(base, dict):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Knowledge corpus {corpus_id} is malformed",
+            )
+        payload = {key: value for key, value in base.items() if key != "sha256"}
+        pairs = base.get("pairs")
+        try:
+            checksum_matches = base.get("sha256") == knowledge_digest(payload)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Knowledge corpus {corpus_id} failed integrity validation",
+            ) from exc
+        if (
+            not checksum_matches
+            or not isinstance(pairs, list)
+            or not isinstance(base.get("training_run_ids"), list)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Knowledge corpus {corpus_id} failed integrity validation",
+            )
+        if any(
+            not isinstance(pair, dict)
+            or not isinstance(pair.get("a"), dict)
+            or not isinstance(pair.get("b"), dict)
+            or not isinstance(pair.get("pair_id"), str)
+            or not isinstance(pair.get("source_run_id"), str)
+            for pair in pairs
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Knowledge corpus {corpus_id} contains malformed A/B pairs",
+            )
+        mode = "exploratory" if path.name == "exploratory_base.json" else "validated"
+        return base, mode
+
+    @app.get("/api/skill-rag/corpora")
+    def list_skill_knowledge_corpora(
+        _: str = Depends(require_roles({"chaos_engineer", "admin"})),
+    ) -> list[dict]:
+        root = storage.object_store_root / ".rca_knowledge"
+        if not root.is_dir():
+            return []
+
+        corpora = []
+        for directory in sorted(root.iterdir(), key=lambda item: item.name):
+            if (
+                not directory.is_dir()
+                or directory.is_symlink()
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", directory.name)
+            ):
+                continue
+            stored = read_knowledge_base(directory.name)
+            if stored is None:
+                continue
+            base, mode = stored
+            pairs = base["pairs"]
+            corpora.append(
+                {
+                    "corpus_id": directory.name,
+                    "mode": mode,
+                    "version": base.get("version"),
+                    "sha256": base["sha256"],
+                    "source_model": base.get("model"),
+                    "pair_count": len(pairs),
+                    "effect_validated_count": sum(
+                        pair.get("effect_validated") is True for pair in pairs
+                    ),
+                    "training_run_count": len(base["training_run_ids"]),
+                }
+            )
+        return corpora
+
+    @app.get("/api/skill-rag/{corpus_id}/pairs")
+    def get_skill_knowledge_pairs(
+        corpus_id: str,
+        _: str = Depends(require_roles({"chaos_engineer", "admin"})),
+    ) -> dict:
+        stored = read_knowledge_base(corpus_id)
+        if stored is None:
+            raise HTTPException(
+                status_code=404, detail=f"No frozen knowledge base for {corpus_id}"
+            )
+        base, mode = stored
+        pair_fields = (
+            "pair_id",
+            "source_run_id",
+            "a",
+            "b",
+            "labels",
+            "guide_status",
+            "causal_status",
+            "effect_validated",
+            "review_status",
+            "sha256",
+        )
+        return {
+            "corpus_id": corpus_id,
+            "mode": mode,
+            "version": base.get("version"),
+            "sha256": base["sha256"],
+            "source_model": base.get("model"),
+            "source_skill_sha256": base.get("skill_sha256"),
+            "a_text_version": base.get("a_text_version"),
+            "pair_count": len(base["pairs"]),
+            "pairs": [
+                {key: pair[key] for key in pair_fields if key in pair}
+                for pair in base["pairs"]
+            ],
+        }
+
+    @app.post("/api/skill-rag/{corpus_id}/freeze")
+    def freeze_skill_knowledge(
+        corpus_id: str, request: FreezeRequest,
+        _: str = Depends(require_roles({"chaos_engineer", "admin"})),
+    ) -> dict:
+        try:
+            store = knowledge_store(corpus_id)
+            with store.locked():
+                for source_id in request.training_run_ids:
+                    source = storage.get_run(source_id)
+                    spec = storage.get_experiment(
+                        source.experiment_id, source.experiment_version
+                    ).spec
+                    if spec.get("knowledge_campaign") != {
+                        "corpus_id": corpus_id, "split": "train"
+                    }:
+                        raise ValueError("freeze accepts only this corpus's training runs")
+                base = store.freeze(request.training_run_ids)
+            return {
+                "version": base["version"], "sha256": base["sha256"],
+                "annotation_count": base["annotation_count"],
+                "eligible_count": len(base["pairs"]),
+                "excluded_count": base["excluded_count"],
+            }
+        except (ValueError, KeyError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/skill-rag/{corpus_id}/exploratory-base")
+    def get_exploratory_skill_base(
+        corpus_id: str,
+        expected_skill_sha256: str | None = None,
+        allow_legacy_skill_hash: bool = False,
+        expected_model: str | None = None,
+        allow_legacy_model_mismatch: bool = False,
+        _: str = Depends(require_roles({"chaos_engineer", "admin"})),
+    ) -> dict:
+        try:
+            if allow_legacy_skill_hash and not expected_skill_sha256:
+                raise ValueError(
+                    "legacy Skill compatibility requires an expected source hash"
+                )
+            if allow_legacy_model_mismatch and not expected_model:
+                raise ValueError(
+                    "legacy model compatibility requires a pinned source model"
+                )
+            base = knowledge_store(corpus_id).load_exploratory_base(
+                expected_skill_sha256=expected_skill_sha256,
+                expected_model=expected_model,
+                allow_legacy_model_mismatch=allow_legacy_model_mismatch,
+            )
+            _, _, current_skill_sha256 = load_skill()
+            if (
+                not allow_legacy_skill_hash
+                and base["skill_sha256"] != current_skill_sha256
+            ):
+                raise ValueError(
+                    "exploratory base source Skill hash mismatch"
+                )
+            return {
+                "version": base["version"],
+                "mode": base["mode"],
+                "sha256": base["sha256"],
+                "candidate_count": len(base["pairs"]),
+                "source_run_ids": base["training_run_ids"],
+                "source_skill_sha256": base["skill_sha256"],
+                "current_skill_sha256": current_skill_sha256,
+                "skill_hashes_match": (
+                    base["skill_sha256"] == current_skill_sha256
+                ),
+                "legacy_skill_hash_allowed": allow_legacy_skill_hash,
+                "source_model": base["model"],
+                "current_model": DEFAULT_LLM_MODEL,
+                "models_match": base["model"] == DEFAULT_LLM_MODEL,
+                "legacy_model_mismatch_allowed": allow_legacy_model_mismatch,
+            }
+        except (ValueError, KeyError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/skill-rag")
+    def run_skill_knowledge(
+        run_id: str, options: KnowledgeOptions,
+        _: str = Depends(require_roles({"chaos_engineer", "admin"})),
+    ) -> dict:
+        window = get_observation_window(run_id)
+        try:
+            run = storage.get_run(run_id)
+            spec = storage.get_experiment(run.experiment_id, run.experiment_version).spec
+            expected_split = "train" if options.mode == "annotate" else "test"
+            if spec.get("knowledge_campaign") != {
+                "corpus_id": options.corpus_id, "split": expected_split
+            }:
+                raise ValueError("knowledge mode does not match the run's pinned split/corpus")
+            store = knowledge_store(options.corpus_id)
+            experimental_suffix = (
+                "_include_unvalidated_experimental"
+                if options.include_unvalidated_experimental
+                else ""
+            )
+            key = (
+                f"skill_knowledge_{options.corpus_id}_{options.mode}"
+                f"{experimental_suffix}"
+            )
+            fingerprint = knowledge_digest(options.model_dump())
+            with store.locked():
+                previous = storage.get_artifact(run_id, key)
+                if previous and previous.get("status") != "error":
+                    if previous["options_sha256"] != fingerprint:
+                        raise ValueError("completed knowledge attempt used different options")
+                    history = spec.get("historical_observability") or {}
+                    history_cache_valid = (
+                        previous.get("observability_source") == "history"
+                        and historical_evidence_sources_valid(
+                            previous.get("evidence")
+                        )
+                    )
+                    if history_cache_valid:
+                        return {**previous, "cached": True}
+                if options.mode == "exploratory_rag":
+                    store.load_exploratory_base(
+                        expected_skill_sha256=(
+                            options.opensearch_source_skill_sha256
+                            if options.retrieval_backend == "opensearch"
+                            else None
+                        ),
+                        expected_model=(
+                            options.opensearch_source_model
+                            if options.retrieval_backend == "opensearch"
+                            else None
+                        ),
+                        allow_legacy_model_mismatch=(
+                            options.allow_legacy_model_mismatch
+                            if options.retrieval_backend == "opensearch"
+                            else False
+                        ),
+                    )
+                elif options.mode not in {"annotate", "exploratory_control"}:
+                    store.load_base()
+                controlled = spec.get("controlled_campaign") or {}
+                labels = (
+                    {"service": controlled["service"], "fault_type": controlled["fault"]}
+                    if options.mode == "annotate" else None
+                )
+                observability = spec.get("observability") or {}
+                metrics = observability.get("metrics") or {}
+                traces = observability.get("traces") or {}
+                historical = spec.get("historical_observability") or {}
+                historical_url = (
+                    historical.get("mcp_sse_url")
+                    or DEFAULT_HISTORICAL_MCP_SSE_URL
+                )
+                gates = run.summary.get("controlled_gates") or {}
+                effect = (
+                    gates.get("intervention_confirmed_on_target") is True
+                    and (gates.get("mechanism_observed") or {}).get("passed") is True
+                )
+                result = investigate_knowledge(
+                    client=MCPToolClient(
+                        str(historical_url),
+                        _mcp_client_timeout_seconds(metrics, traces, historical),
+                    ),
+                    phases=window["phases"],
+                    namespace=str(spec.get("scope", {}).get("namespace", "sock-shop")),
+                    window_metadata={
+                        name: window[name] for name in (
+                            "phase_sources", "partial", "sampling_interval_seconds"
+                        ) if name in window
+                    },
+                    options=options, run_id=run_id, store=store,
+                    llm=call_llm_tool_messages, labels=labels, effect_validated=effect,
+                    evidence_source="history",
+                )
+                result.update(
+                    run_id=run_id, attempt_id=uuid4().hex,
+                    options_sha256=fingerprint, model=DEFAULT_LLM_MODEL,
+                    observability_source="history",
+                )
+                path = storage.save_artifact(
+                    run_id, f"{key}_{result['attempt_id']}", result
+                )
+                result["artifact_path"] = path
+                storage.save_artifact(run_id, key, result)
+            return result
+        except (ValueError, KeyError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/experiments/{experiment_id}")
     def get_experiment(experiment_id: str, version: Optional[int] = None) -> dict:
@@ -337,6 +733,50 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         if run.status.value in {"stopped", "failed"} and run.ended_at:
+            controlled = run.timings.get("controlled_observation_window")
+            controlled_phases = (
+                controlled.get("phases") if isinstance(controlled, dict) else None
+            )
+            if (
+                isinstance(controlled_phases, dict)
+                and {"baseline", "fault"}.issubset(controlled_phases)
+            ):
+                timings = run.timings
+                window = controlled.get("window")
+                phase_sources = controlled.get("phase_sources")
+                post_marker = run.timings.get("post_observation_started")
+                post_start = post_marker.get("at") if isinstance(post_marker, dict) else None
+                post_end = window.get("end") if isinstance(window, dict) else None
+                if (
+                    "post" not in controlled_phases
+                    and isinstance(post_start, str)
+                    and isinstance(post_end, str)
+                    and isinstance(phase_sources, dict)
+                ):
+                    timings = {
+                        **run.timings,
+                        "controlled_observation_window": {
+                            **controlled,
+                            "phases": {
+                                **controlled_phases,
+                                "post": {"start": post_start, "end": post_end},
+                            },
+                            "phase_sources": {
+                                **phase_sources,
+                                "post": "recovery_observation",
+                            },
+                        },
+                    }
+                try:
+                    return _build_observation_window(
+                        run_id=run.run_id,
+                        experiment_id=run.experiment_id,
+                        status=run.status.value,
+                        timings=timings,
+                        sampling_interval_seconds=sampling_interval,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
             try:
                 return _build_partial_observation_window(
                     run_id=run.run_id,
@@ -601,24 +1041,14 @@ def create_app() -> FastAPI:
         traces_config = (
             experiment.spec.get("observability", {}).get("traces", {}) or {}
         )
-        mcp_url = metrics_config.get("mcp_sse_url") or traces_config.get("mcp_sse_url")
-        if not mcp_url:
-            raise HTTPException(
-                status_code=409,
-                detail="experiment has no MCP observability endpoint configured",
-            )
-
-        timeout_seconds = max(
-            int(metrics_config.get("timeout_seconds", 10)),
-            int(traces_config.get("timeout_seconds", 20)),
+        historical = experiment.spec.get("historical_observability") or {}
+        historical_url = (
+            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
         )
-        mcp_client = MCPToolClient(str(mcp_url), timeout_seconds)
-        try:
-            snapshot = storage.get_artifact(run_id, "rca_evidence_snapshot")
-        except (OSError, sqlite3.Error):
-            snapshot = None
-        if isinstance(snapshot, dict):
-            mcp_client = SnapshotPreferredMCPClient(mcp_client, snapshot)
+        mcp_client = MCPToolClient(
+            str(historical_url),
+            _mcp_client_timeout_seconds(metrics_config, traces_config, historical),
+        )
         namespace = str(
             experiment.spec.get("scope", {}).get("namespace", "sock-shop")
         )
@@ -632,7 +1062,9 @@ def create_app() -> FastAPI:
             span.set_attribute("rca.run_id", run_id)
             span.set_attribute("rca.experiment_id", run.experiment_id)
             span.set_attribute("rca.agent.max_tool_calls", 10)
-            rca_phases, reference_source = rca_reference_phases(phases)
+            rca_phases, reference_source = rca_reference_phases(
+                phases, baseline_source=(window.get("phase_sources") or {}).get("baseline"),
+            )
             span.set_attribute("rca.reference_source", reference_source)
             try:
                 result = answer_run_rca_mcp(
@@ -685,6 +1117,7 @@ def create_app() -> FastAPI:
             "artifact_path": artifact_path,
             "evidence_bundle": result.get("evidence_bundle", {}),
             "used_mcp": True,
+            "observability_source": "history",
         }
 
     @app.get("/api/runs/{run_id}/multiagent-rca/plan", response_model=InvestigationPlan)
@@ -706,7 +1139,10 @@ def create_app() -> FastAPI:
         return build_investigation_plan(context)
 
     @app.post("/api/runs/{run_id}/multiagent-rca")
-    def run_multiagent_rca(run_id: str) -> dict:
+    def run_multiagent_rca(
+        run_id: str, options: RCABenchmarkOptions | None = None
+    ) -> dict:
+        options = options or RCABenchmarkOptions()
         window = get_observation_window(run_id)
         try:
             run = storage.get_run(run_id)
@@ -715,7 +1151,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         namespace = experiment.spec.get("scope", {}).get("namespace", "sock-shop")
         try:
-            context = _build_multiagent_context(run_id, namespace, window)
+            context = _build_multiagent_context(
+                run_id,
+                namespace,
+                window,
+                possible_fault_types=options.possible_fault_types,
+            )
         except (ValueError, ValidationError, SystemCardError, OSError) as exc:
             raise HTTPException(
                 status_code=409,
@@ -725,12 +1166,12 @@ def create_app() -> FastAPI:
         observability = experiment.spec.get("observability") or {}
         metrics_config = observability.get("metrics") or {}
         traces_config = observability.get("traces") or {}
-        mcp_url = metrics_config.get("mcp_sse_url") or traces_config.get("mcp_sse_url")
-        if not mcp_url:
-            raise HTTPException(status_code=409, detail="No MCP endpoint for multiagent RCA")
-        timeout = max(
-            int(metrics_config.get("timeout_seconds", 10)),
-            int(traces_config.get("timeout_seconds", 20)),
+        historical = experiment.spec.get("historical_observability") or {}
+        historical_url = (
+            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
+        )
+        timeout = _mcp_client_timeout_seconds(
+            metrics_config, traces_config, historical
         )
         attempt_id = uuid4().hex
         with get_tracer().start_as_current_span("agent.multiagent_rca") as span:
@@ -738,7 +1179,7 @@ def create_app() -> FastAPI:
             span.set_attribute("rca.attempt_id", attempt_id)
             span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
             result = answer_multiagent_rca(
-                mcp_client=MCPToolClient(str(mcp_url), timeout),
+                mcp_client=MCPToolClient(str(historical_url), timeout),
                 context=context,
                 budget=InvestigationBudget(),
                 model=DEFAULT_LLM_MODEL,
@@ -749,6 +1190,7 @@ def create_app() -> FastAPI:
                     "attempt_id": attempt_id,
                     "window": window["window"],
                     "model": DEFAULT_LLM_MODEL,
+                    "observability_source": "history",
                 }
             )
             artifact_path = storage.save_artifact(
@@ -785,7 +1227,12 @@ def create_app() -> FastAPI:
         return result
 
     @app.post("/api/runs/{run_id}/skill-rca")
-    def run_skill_rca(run_id: str) -> dict:
+    def run_skill_rca(
+        run_id: str,
+        options: RCABenchmarkOptions | None = None,
+        history_campaign_id: str | None = None,
+    ) -> dict:
+        options = options or RCABenchmarkOptions()
         window = get_observation_window(run_id)
         phases = window.get("phases") or {}
         if not {"baseline", "fault"}.issubset(phases):
@@ -802,13 +1249,33 @@ def create_app() -> FastAPI:
         observability = experiment.spec.get("observability") or {}
         metrics_config = observability.get("metrics") or {}
         traces_config = observability.get("traces") or {}
-        mcp_url = metrics_config.get("mcp_sse_url") or traces_config.get("mcp_sse_url")
-        if not mcp_url:
-            raise HTTPException(status_code=409, detail="No MCP endpoint for Skill RCA")
-        timeout = max(
-            int(metrics_config.get("timeout_seconds", 10)),
-            int(traces_config.get("timeout_seconds", 20)),
+        historical = experiment.spec.get("historical_observability") or {}
+        historical_url = (
+            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
         )
+        timeout = _mcp_client_timeout_seconds(
+            metrics_config, traces_config, historical
+        )
+        archive_campaign_id = history_campaign_id or run.experiment_id
+        archive_traces = None
+        archive_status = "not_configured"
+        if history_archive is not None:
+            try:
+                archive_traces = history_archive.read_trace_evidence(
+                    campaign_id=archive_campaign_id,
+                    run_id=run_id,
+                    phases=phases,
+                )
+                archive_status = str(archive_traces.get("status", "unknown"))
+            except HistoryArchiveError as exc:
+                archive_status = "unavailable"
+                archive_traces = {
+                    "status": "tool_error",
+                    "evidence_source": "archive",
+                    "campaign_id": archive_campaign_id,
+                    "run_id": run_id,
+                    "error": str(exc),
+                }
         attempt_id = uuid4().hex
         with get_tracer().start_as_current_span("agent.skill_rca") as span:
             span.set_attribute("rca.run_id", run_id)
@@ -816,7 +1283,7 @@ def create_app() -> FastAPI:
             span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
             try:
                 result = answer_skill_rca(
-                    mcp_client=MCPToolClient(str(mcp_url), timeout),
+                    mcp_client=MCPToolClient(str(historical_url), timeout),
                     phases=phases,
                     namespace=str(experiment.spec.get("scope", {}).get("namespace", "sock-shop")),
                     window_metadata={
@@ -824,6 +1291,10 @@ def create_app() -> FastAPI:
                         for key in ("phase_sources", "partial", "sampling_interval_seconds")
                         if key in window
                     },
+                    possible_fault_types=options.possible_fault_types,
+                    require_best_guess=options.require_best_guess,
+                    archive_traces=archive_traces,
+                    evidence_source="history",
                 )
             except (SkillRCAError, OSError) as exc:
                 span.record_exception(exc)
@@ -835,6 +1306,19 @@ def create_app() -> FastAPI:
                     "attempt_id": attempt_id,
                     "window": window["window"],
                     "model": DEFAULT_LLM_MODEL,
+                    "history_archive": {
+                        "status": archive_status,
+                        "campaign_id": (
+                            archive_campaign_id if history_archive is not None else None
+                        ),
+                        "run_id": run_id,
+                        "archive_key": (
+                            archive_traces.get("archive_key")
+                            if isinstance(archive_traces, dict)
+                            else None
+                        ),
+                    },
+                    "observability_source": "history",
                 }
             )
             artifact_path = storage.save_artifact(
@@ -868,6 +1352,151 @@ def create_app() -> FastAPI:
         if summary is None:
             raise HTTPException(status_code=404, detail="summary not found")
         return summary
+
+    @app.get("/api/runs/{run_id}/history/validation")
+    def validate_run_history(run_id: str) -> dict:
+        try:
+            run = storage.get_run(run_id)
+            experiment = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="run not found") from exc
+        historical = experiment.spec.get("historical_observability") or {}
+        migration = run.summary.get("history_migration") or {}
+        if historical.get("mode") == "dual_write":
+            mcp_url = historical.get("mcp_sse_url")
+            service = (experiment.spec.get("controlled_campaign") or {}).get(
+                "service"
+            )
+            namespace = (experiment.spec.get("scope") or {}).get(
+                "namespace", "sock-shop"
+            )
+            if not isinstance(mcp_url, str) or not mcp_url:
+                return {
+                    "status": "failed",
+                    "campaign_id": run.experiment_id,
+                    "run_id": run_id,
+                    "migration": migration,
+                    "error": "dual-write validation requires the historical MCP URL",
+                }
+            if not isinstance(service, str) or not service:
+                return {
+                    "status": "failed",
+                    "campaign_id": run.experiment_id,
+                    "run_id": run_id,
+                    "migration": migration,
+                    "error": "dual-write validation requires a controlled target service",
+                }
+            if not isinstance(namespace, str) or not namespace:
+                raise HTTPException(
+                    status_code=409,
+                    detail="dual-write validation requires a namespace",
+                )
+            timeout = historical.get("timeout_seconds", 30)
+            if type(timeout) is not int or timeout < 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="historical timeout_seconds must be a positive integer",
+                )
+            try:
+                window = get_observation_window(run_id)
+                result = validate_history_stream(
+                    MCPToolClient(mcp_url, timeout),
+                    phases=window.get("phases") or {},
+                    namespace=namespace,
+                    service=service,
+                )
+            except ValueError as exc:
+                return {
+                    "status": "failed",
+                    "mode": "dual_write",
+                    "campaign_id": run.experiment_id,
+                    "run_id": run_id,
+                    "migration": migration,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+            except (OSError, RuntimeError, TimeoutError) as exc:
+                return {
+                    "status": "pending",
+                    "mode": "dual_write",
+                    "campaign_id": run.experiment_id,
+                    "run_id": run_id,
+                    "migration": migration,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+            return {
+                **result,
+                "campaign_id": run.experiment_id,
+                "run_id": run_id,
+                "migration": migration,
+            }
+        if history_archive is None:
+            raise HTTPException(
+                status_code=503, detail="Historical archive reader is not configured"
+            )
+        if migration.get("status") in {
+            "dispatch_failed",
+            "blocked_missing_window",
+            "disabled",
+        }:
+            return {
+                "status": "failed",
+                "run_id": run_id,
+                "migration": migration,
+            }
+        try:
+            manifest = history_archive.read_manifest(
+                campaign_id=run.experiment_id,
+                run_id=run_id,
+            )
+        except HistoryArchiveNotFound:
+            status = "pending" if migration.get("status") == "queued" else "failed"
+            return {
+                "status": status,
+                "run_id": run_id,
+                "migration": migration,
+            }
+        except HistoryArchiveError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Could not validate history archive: {exc}"
+            ) from exc
+
+        telemetry = manifest.get("telemetry")
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
+        source_counts = {
+            "metrics": (telemetry.get("metrics") or {}).get("source_samples"),
+            "logs": (telemetry.get("logs") or {}).get("source_entries"),
+            "traces": (telemetry.get("traces") or {}).get("source_traces"),
+            "spans": (telemetry.get("traces") or {}).get("source_spans"),
+        }
+        families_complete = all(
+            isinstance(telemetry.get(family), dict)
+            and telemetry[family].get("status") == "complete"
+            for family in ("metrics", "logs", "traces")
+        )
+        counts_present = all(
+            isinstance(count, int) and not isinstance(count, bool) and count > 0
+            for count in source_counts.values()
+        )
+        complete = (
+            manifest.get("overall_status") == "complete"
+            and families_complete
+            and counts_present
+        )
+        return {
+            "status": "complete" if complete else "partial",
+            "campaign_id": run.experiment_id,
+            "run_id": run_id,
+            "manifest_overall_status": manifest.get("overall_status"),
+            "telemetry": {
+                family: (telemetry.get(family) or {}).get("status")
+                for family in ("metrics", "logs", "traces")
+            },
+            "source_counts": source_counts,
+        }
 
     @app.get("/api/runs/{run_id}/similar")
     def get_similar_runs(

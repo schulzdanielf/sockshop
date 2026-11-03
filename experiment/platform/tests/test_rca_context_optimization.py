@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import datetime
 
 import pytest
 from experiment.platform.backend.agent_console import (
@@ -7,15 +8,23 @@ from experiment.platform.backend.agent_console import (
     _rca_tool_digest,
 )
 from experiment.platform.backend.analysis.system_card import application_context
-from experiment.platform.backend.analysis.telemetry_coverage import coverage_report, termination_summary
+from experiment.platform.backend.analysis.telemetry_coverage import (
+    coverage_report,
+    termination_query,
+    termination_summary,
+    phase_series_summary,
+)
+from experiment.platform.backend.rca_skill import _observation_count
 from experiment.platform.backend.multiagent_rca import (
     FollowupRequest, InvestigationBudget, MultiagentRCAError,
     CausalAssessment, EvidenceObservation, SpecialistReport,
+    PROMPT_VERSION,
     _EvidenceRegistry, _log_filter, _model_digest, _model_json,
     answer_multiagent_rca, validate_assessment,
 )
 from experiment.platform.tests.test_multiagent_rca import (
-    AdaptiveMCP, NoDataMCP, adaptive_llm, context, followup, response_for,
+    AdaptiveMCP, NoDataMCP, adaptive_llm, context, followup, hypothesis,
+    response_for,
 )
 
 
@@ -50,7 +59,7 @@ def test_explicit_log_filters_escape_literals_and_use_regex_only_when_requested(
     request = FollowupRequest(
         tool="loki_range_query", service="orders", phase="fault",
         question="Buscar erros", patterns=["timeout", "Connection refused"],
-        match_mode="literal",
+        match_mode="literal", hypothesis_ids=["H1"],
     )
     assert _log_filter(request) == '|~ "(?i)(Connection\\\\ refused|timeout)"'
     regex = request.model_copy(update={"patterns": ["error.*timeout"], "match_mode": "regex"})
@@ -128,7 +137,7 @@ def test_empty_domains_skip_llm_and_context_has_no_experiment_labels():
         return response_for(messages, *args, **kwargs)
 
     result = answer_multiagent_rca(mcp_client=NoDataMCP(), context=context(), llm=llm)
-    assert result["budget"]["model_calls_used"] == 3
+    assert result["budget"]["model_calls_used"] == 2
     assert all(report["status"] == "no_data" for report in result["specialists"])
     assert result["telemetry_coverage"]["missing_fault_families"] == ["metrics", "logs", "traces"]
     for messages, options in captured:
@@ -138,7 +147,7 @@ def test_empty_domains_skip_llm_and_context_has_no_experiment_labels():
         assert "ground_truth" not in request["application_context"]
         assert "schema" not in request
         assert options["response_format"]["type"] == "json_schema"
-    assert result["prompt_version"] == "compact-context-v2"
+    assert result["prompt_version"] == PROMPT_VERSION
 
 
 def test_followup_gets_incremental_evidence_and_coordinator_only_latest_reports():
@@ -173,7 +182,7 @@ def test_trace_probes_are_budgeted_and_never_causal_evidence():
 
         def call_tool_json(self, name, arguments, **kwargs):
             self.calls.append(arguments)
-            return {"traces": [{"traceID": "untrusted-id", "rootServiceName": "unrelated"}]}
+            return {"traces": [{"traceID": "a" * 32, "rootServiceName": "unrelated"}]}
 
     client = ProbeMCP()
     registry = _EvidenceRegistry(
@@ -182,34 +191,201 @@ def test_trace_probes_are_budgeted_and_never_causal_evidence():
         namespace="sock-shop", budget=InvestigationBudget(max_tool_calls=1),
         started=time.monotonic(),
     )
-    registry.probe_trace_coverage()
-    registry.probe_trace_coverage()
+    registry.set_service_scope(["orders"])
+    candidates = registry.probe_trace_coverage(["orders"])
+    assert registry.probe_trace_coverage(["orders"]) == []
     assert len(client.calls) == registry.tool_calls_used == 1
+    assert 'resource.service.name = "orders"' in client.calls[0]["query"]
+    assert candidates == [{
+        "trace_id": "a" * 32,
+        "phase": "fault",
+        "signature": "TRACE_SEARCH_PROBE",
+        "affected_service": "orders",
+    }]
     assert not registry.observations
-    assert registry.diagnostics[0]["status"] == "unscoped_traces_present"
+    assert registry.diagnostics[0]["status"] == "traces_present"
     assert "unrelated" not in json.dumps(registry.diagnostics)
     assert registry.diagnostics[0]["is_causal_evidence"] is False
 
 
 def test_termination_history_preserves_phase_and_does_not_invent_events():
-    raw = {"status": "success", "data": {"result": [{
-        "metric": {"__name__": "kube_pod_container_status_last_terminated_timestamp",
-                   "pod": "orders-abc", "container": "orders"},
-        "values": [[1792144801, "1792140000"], [1792144861, "1792140000"]],
-    }]}}
-    phases = {key: value.model_dump(mode="json") for key, value in context().phases.items()}
+    raw = {
+        "status": "success",
+        "data": {
+            "result": [
+                {
+                    "metric": {
+                        "__name__": "kube_pod_container_status_last_terminated_timestamp",
+                        "pod": "orders-abc",
+                        "container": "orders",
+                    },
+                    "values": [[1792144801, "1792140000"], [1792144861, "1792140000"]],
+                }
+            ]
+        },
+    }
+    phases = {
+        key: value.model_dump(mode="json") for key, value in context().phases.items()
+    }
     summary = termination_summary(raw, phases)
     assert summary["phases"]["baseline"]["coverage"]["sample_count"] == 1
     assert summary["phases"]["fault"]["coverage"]["sample_count"] == 1
-    assert summary["phases"]["fault"]["termination_states"][0]["last_value"] == 1792140000
-    assert any("preceder" in item for item in summary["limitations"])
-    assert termination_summary({"status": "error", "error": "down"}, phases)["status"] == "tool_error"
+    assert (
+        summary["phases"]["fault"]["termination_states"][0]["last_value"] == 1792140000
+    )
+    assert summary["phases"]["fault"]["termination_events"] == []
+    assert any("timestamp" in item for item in summary["limitations"])
+    assert (
+        termination_summary({"status": "error", "error": "down"}, phases)["status"]
+        == "tool_error"
+    )
+
+
+def test_termination_summary_correlates_timestamp_reason_and_exit_code_in_phase():
+    phases = {
+        "baseline": {"start": "2026-10-02T10:00:00Z", "end": "2026-10-02T10:01:00Z"},
+        "fault": {"start": "2026-10-02T10:02:00Z", "end": "2026-10-02T10:03:00Z"},
+        "post": {"start": "2026-10-02T10:03:00Z", "end": "2026-10-02T10:04:00Z"},
+    }
+    sampled_at = datetime.fromisoformat("2026-10-02T10:03:15+00:00").timestamp()
+    terminated_at = datetime.fromisoformat("2026-10-02T10:02:59+00:00").timestamp()
+    identity = {
+        "namespace": "sock-shop",
+        "pod": "orders-abc",
+        "container": "orders",
+        "uid": "pod-uid",
+    }
+    raw = {
+        "status": "success",
+        "data": {
+            "result": [
+                {
+                    "metric": {
+                        **identity,
+                        "__name__": "kube_pod_container_status_last_terminated_timestamp",
+                    },
+                    "values": [[sampled_at, str(terminated_at)]],
+                },
+                {
+                    "metric": {
+                        **identity,
+                        "__name__": "kube_pod_container_status_last_terminated_reason",
+                        "reason": "OOMKilled",
+                    },
+                    "values": [[sampled_at, "1"]],
+                },
+                {
+                    "metric": {
+                        **identity,
+                        "__name__": "kube_pod_container_status_last_terminated_exitcode",
+                    },
+                    "values": [[sampled_at, "137"]],
+                },
+            ]
+        },
+    }
+
+    summary = termination_summary(raw, phases)
+    event = summary["phases"]["fault"]["termination_events"][0]
+
+    assert _observation_count("prometheus_range_query", summary, "fault") == 1
+    assert event["pod"] == "orders-abc"
+    assert event["uid"] == "pod-uid"
+    assert event["terminated_at"] == terminated_at
+    fault_end = datetime.fromisoformat(
+        phases["fault"]["end"].replace("Z", "+00:00")
+    ).timestamp()
+    assert event["observed_at"] > fault_end
+    assert event["reason"] == ["OOMKilled"]
+    assert event["exit_code"] == 137
+
+
+def test_termination_query_is_namespaced_and_escapes_service_names():
+    query = termination_query("sock-shop", ["queue-master", "orders"])
+    assert 'namespace="sock-shop"' in query
+    assert (
+        "kube_pod_container_status_last_terminated_(reason|exitcode|timestamp)" in query
+    )
+    assert r"queue\\-master" in query
+
+
+def test_missing_termination_time_is_reported_and_not_a_negative_event():
+    phases = {"fault": {"start": "2026-10-02T10:02:00Z", "end": "2026-10-02T10:03:00Z"}}
+    sampled_at = datetime.fromisoformat("2026-10-02T10:02:10+00:00").timestamp()
+    raw = {
+        "status": "success", "data": {"result": [{
+            "metric": {"__name__": "kube_pod_container_status_last_terminated_reason",
+                       "container": "payment", "reason": "Error"},
+            "values": [[sampled_at, "1"]],
+        }]},
+    }
+    summary = termination_summary(raw, phases)
+    assert summary["event_time_coverage"] == "unavailable"
+    assert "kube_pod_container_status_last_terminated_timestamp" in summary["missing_metrics"]
+    assert summary["phases"]["fault"]["termination_events"] == []
+    assert _rca_tool_digest("prometheus_range_query", summary) == summary
+
+
+def test_phase_series_preserves_http_identity_units_and_coverage():
+    phases = {
+        "baseline": {"start": "2026-10-02T10:00:00Z", "end": "2026-10-02T10:01:00Z"},
+        "fault": {"start": "2026-10-02T10:02:00Z", "end": "2026-10-02T10:03:00Z"},
+    }
+    labels = {"source_workload": "orders", "destination_workload": "payment",
+              "response_code": "503", "reporter": "destination"}
+    raw = {
+        "status": "success", "data": {"result": [{
+            "metric": labels, "values": [
+                [datetime.fromisoformat("2026-10-02T10:00:20+00:00").timestamp(), "0"],
+                [datetime.fromisoformat("2026-10-02T10:02:20+00:00").timestamp(), "5"],
+            ],
+        }]},
+    }
+    summary = phase_series_summary(
+        raw, phases, purpose="http_status_rates", unit="req/s", service="payment"
+    )
+    assert summary["unit"] == "req/s"
+    assert summary["phases"]["fault"]["series"][0]["labels"] == labels
+    assert summary["phases"]["fault"]["series"][0]["mean"] == 5
+    assert summary["phases"]["baseline"]["series"][0]["mean"] == 0
+    assert _observation_count("prometheus_range_query", summary, "fault") == 1
+    assert _rca_tool_digest("prometheus_range_query", summary) == summary
+
+
+def test_restart_digest_preserves_partial_coverage_and_scrape_uncertainty():
+    result = {
+        "status": "partial", "found": True, "count": 1,
+        "coverage": {"sample_count": 4, "window_sample_count": 0},
+        "query_window": {"start": "2026-10-02T10:01:00Z", "end": "2026-10-02T10:04:00Z"},
+        "sample_timestamp_kind": "scrape", "observed_services": ["payment", "user"],
+        "limitations": ["Overlapping interval is not an exactly timed event"],
+        "top": [{"service": "payment", "restarts_in_window": 1, "pods": [{
+            "pod": "payment-abc-def", "container": "payment", "uid": "pod-uid",
+            "restart_observations": [{
+                "observed_from": "2026-10-02T10:02:00Z",
+                "observed_to": "2026-10-02T10:02:15Z",
+                "timestamp_precision": "between_scrapes",
+                "window_attribution": "overlap_only",
+            }],
+        }]}],
+    }
+    digest = _rca_tool_digest("check_pod_restarts", result)
+    assert digest["status"] == "partial"
+    assert digest["coverage"] == result["coverage"]
+    assert digest["observed_services"] == result["observed_services"]
+    assert digest["sample_timestamp_kind"] == "scrape"
+    assert digest["limitations"] == result["limitations"]
+    pod = digest["affected"][0]["pod_observations"][0]
+    assert pod["uid"] == "pod-uid"
+    assert pod["restart_observations"][0]["window_attribution"] == "overlap_only"
+    assert _observation_count("check_pod_restarts", result) == 4
+    assert _observation_count("check_pod_restarts", result, "fault") == 0
 
 
 def test_window_count_is_distinct_from_sample_and_reaches_digest():
     class CountMCP:
         def call_tool_json(self, name, arguments, **kwargs):
-            assert 'count_over_time(' in arguments["query"]
+            assert "count_over_time(" in arguments["query"]
             assert arguments["start"] == arguments["end"] == "2026-10-16T10:04:00Z"
             return {"status": "success", "data": {"resultType": "matrix", "result": [{
                 "metric": {"container": "orders", "error_pattern": "timeout"},
@@ -224,6 +400,7 @@ def test_window_count_is_distinct_from_sample_and_reaches_digest():
         phases={key: value.model_dump(mode="json") for key, value in context().phases.items()},
         namespace="sock-shop", budget=InvestigationBudget(), started=time.monotonic(),
     )
+    registry.set_service_scope(["orders"])
     registry.query_log_counts(["orders"])
     call = registry.calls[0]
     phase = call["digest"]["phases"]["fault"]
@@ -247,6 +424,7 @@ def test_hyphenated_service_regexes_are_quoted_for_promql_and_logql():
         phases={key: value.model_dump(mode="json") for key, value in context().phases.items()},
         namespace="sock-shop", budget=InvestigationBudget(), started=time.monotonic(),
     )
+    registry.set_service_scope(["queue-master"])
     registry.query_log_counts(["queue-master"])
     registry.query_termination(["queue-master"])
     assert all(call["status"] == "no_data" for call in registry.calls)
@@ -271,7 +449,8 @@ def test_unknown_restart_or_conflicting_references_prevents_confirmation(unknown
         category="pod-failure", impact=[], causal_chain=["crash", "restart"],
         supporting_evidence=["E001", "E002"],
         contradicting_evidence=["E002"] if overlap else [],
-        restart_analysis=[], alternatives=["oom", "probe"], limitations=[], next_checks=[],
+        restart_analysis=[], alternatives=[hypothesis("H1"), hypothesis("H2")],
+        limitations=[], next_checks=[],
     )
     observations = [
         EvidenceObservation(

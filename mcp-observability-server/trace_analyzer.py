@@ -157,7 +157,11 @@ def _extract_failure_signatures(error_spans: List[Dict]) -> List[Dict]:
     for span in error_spans:
         msg = span.get("message", "") or ""
         sig_type = _classify_failure(msg)
-        endpoint = _get_attr(span, "peer.service") or _get_attr(span, "net.peer.ip")
+        endpoint = (
+            span.get("remote_endpoint")
+            or _get_attr(span, "peer.service")
+            or _get_attr(span, "net.peer.ip")
+        )
         if not endpoint:
             endpoint = (
                 _endpoint_from_message(msg) or _extract_remote_endpoint(span) or ""
@@ -657,6 +661,11 @@ def extract_features(trace_data: Dict) -> Dict:
             "duration_ms": s["duration_ms"],
             "exclusive_duration_ms": s["exclusive_duration_ms"],
             "message": s["status_message"],
+            "http_status_code": (
+                _get_attr(s, "http.response.status_code") or _get_attr(s, "http.status_code")
+            ),
+            "remote_endpoint": _extract_remote_endpoint(s),
+            "remote_service": _service_label_from_endpoint(_extract_remote_endpoint(s)),
         }
         for s in spans
         if s["is_error"]

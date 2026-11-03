@@ -30,10 +30,10 @@ spec:
         resources:
           requests:
             cpu: 100m
-            memory: 512Mi
+            memory: 2Gi
           limits:
             cpu: 1000m
-            memory: 2Gi
+            memory: 4Gi
         volumeMounts:
         - name: tempo-config
           mountPath: /etc/tempo

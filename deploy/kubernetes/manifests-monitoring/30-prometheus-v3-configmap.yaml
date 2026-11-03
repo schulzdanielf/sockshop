@@ -8,6 +8,8 @@ data:
     global:
       scrape_interval: 15s
       evaluation_interval: 15s
+    rule_files:
+      - "/etc/prometheus-rules/alert.rules"
     scrape_configs:
     - job_name: 'kubernetes-apiservers'
       kubernetes_sd_configs:
@@ -59,6 +61,12 @@ data:
       - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
         action: keep
         regex: true
+      - source_labels: [__meta_kubernetes_service_name]
+        action: drop
+        regex: 'queue-master|rabbitmq'
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port, __meta_kubernetes_pod_container_port_name]
+        action: drop
+        regex: ';http-envoy-prom'
       - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
         action: replace
         target_label: __scheme__
@@ -80,6 +88,13 @@ data:
       - source_labels: [__meta_kubernetes_service_name]
         action: replace
         target_label: kubernetes_name
+    - job_name: 'rabbitmq-exporter'
+      static_configs:
+        - targets: ['rabbitmq.sock-shop.svc.cluster.local:9090']
+          labels:
+            kubernetes_namespace: sock-shop
+            kubernetes_name: rabbitmq
+            service: rabbitmq
     - job_name: 'kubernetes-pods'
       kubernetes_sd_configs:
       - role: pod
@@ -114,3 +129,23 @@ data:
       - source_labels: [__meta_kubernetes_endpoints_name]
         regex: 'node-exporter'
         action: keep
+    - job_name: 'loki'
+      static_configs:
+        - targets: ['loki.monitoring.svc.cluster.local:3100']
+    - job_name: 'opentelemetry-collector'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - monitoring
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: otel-collector
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: metrics
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node

@@ -19,12 +19,33 @@ def main() -> int:
     parser.add_argument(
         "--output", type=Path, help="Also save the JSON response locally"
     )
+    parser.add_argument(
+        "--history-campaign-id",
+        help="Override the run's experiment ID when locating its history archive",
+    )
+    parser.add_argument(
+        "--possible-fault-type",
+        action="append",
+        default=[],
+        help="Benchmark fault type the diagnosis must choose; repeat for each option.",
+    )
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("--timeout must be positive")
+    endpoint = (
+        f"{args.api_base.rstrip('/')}/api/runs/"
+        f"{quote(args.run_id, safe='')}/skill-rca"
+    )
+    if args.history_campaign_id:
+        endpoint += (
+            "?history_campaign_id="
+            + quote(args.history_campaign_id, safe="")
+        )
     request = Request(
-        f"{args.api_base.rstrip('/')}/api/runs/{quote(args.run_id, safe='')}/skill-rca",
-        data=b"{}",
+        endpoint,
+        data=json.dumps(
+            {"possible_fault_types": args.possible_fault_type}
+        ).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )

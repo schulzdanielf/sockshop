@@ -125,6 +125,47 @@
         <div id="historyList"><span style="color:var(--muted);font-size:0.85rem;">Carregando…</span></div>
       </section>
 
+      <section class="panel knowledge-browser">
+        <div class="knowledge-header">
+          <div>
+            <p class="eyebrow">BASE DE CONHECIMENTO / RAG</p>
+            <h2>Explorar pares A/B</h2>
+            <p class="knowledge-copy">Consulte os pares congelados usados pela RAG. A contém evidências e sintomas; B reúne o guia diagnóstico do caso histórico. B é contexto para investigação, não uma conclusão sobre outro run.</p>
+          </div>
+          <button type="button" id="refreshKnowledgeBtn" class="btn-sm">⟳ Atualizar corpora</button>
+        </div>
+        <div class="knowledge-toolbar">
+          <label>Corpus do experimento
+            <select id="knowledgeCorpusSelect">
+              <option value="">Carregando corpora…</option>
+            </select>
+          </label>
+          <label>Filtrar pares
+            <input id="knowledgePairFilter" type="search" autocomplete="off" placeholder="Run de origem, par ou serviço" disabled />
+          </label>
+          <label>Par A/B
+            <select id="knowledgePairSelect" disabled>
+              <option value="">Selecione um corpus</option>
+            </select>
+          </label>
+        </div>
+        <div id="knowledgeStatus" class="knowledge-status" role="status" aria-live="polite">Carregando bases RAG…</div>
+        <div id="knowledgeCorpusMeta" class="knowledge-corpus-meta"></div>
+        <div id="knowledgePairMeta" class="knowledge-pair-meta"></div>
+        <div class="knowledge-pair-grid">
+          <article class="knowledge-document">
+            <h3>A · Evidências e sintomas</h3>
+            <p>Retrato da investigação inicial, sem rótulos do experimento.</p>
+            <pre id="knowledgeA" class="knowledge-json">Selecione um par A/B.</pre>
+          </article>
+          <article class="knowledge-document">
+            <h3>B · Guia diagnóstico</h3>
+            <p>Verificações, hipóteses e limites associados ao caso histórico.</p>
+            <pre id="knowledgeB" class="knowledge-json">Selecione um par A/B.</pre>
+          </article>
+        </div>
+      </section>
+
       <section class="panel telemetry-chat">
         <div class="chat-header">
           <div>

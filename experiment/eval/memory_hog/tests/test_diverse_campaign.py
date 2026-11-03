@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import yaml
+
 from experiment.eval.memory_hog import run_diverse_campaign as campaign
 
 
@@ -72,3 +74,24 @@ def test_campaign_config_isolated_from_source_config():
         for entry in config["chaos_types"]
         if entry["name"] in campaign.FAULTS
     )
+
+
+def test_campaign_manifest_preparation_generates_probe_bypass(tmp_path):
+    config = {
+        "train_experiments": [{"service": "orders", "chaos_type": "http-status-code"}],
+        "test_experiments": [],
+        "chaos_types": [
+            {"name": "http-status-code", "env": {"status_code": 500}}
+        ],
+        "output": {"results_dir": str(tmp_path), "manifests_dir": "manifests"},
+    }
+
+    generated = campaign.generate_campaign_manifests(config)
+    manifest_path = tmp_path / "manifests" / "orders-http-status-code.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    rules = manifest["spec"]["http"]
+
+    assert manifest_path in generated
+    assert rules[0]["match"] == [{"uri": {"exact": "/health"}}]
+    assert "fault" not in rules[0]
+    assert rules[1]["fault"]["abort"]["httpStatus"] == 500

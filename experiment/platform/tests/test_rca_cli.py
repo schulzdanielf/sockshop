@@ -14,7 +14,14 @@ def test_cli_calls_same_route_and_saves_json(monkeypatch, tmp_path, capsys):
     requests = []
 
     def open_request(request, timeout):
-        requests.append((request.full_url, request.method, timeout))
+        requests.append(
+            (
+                request.full_url,
+                request.method,
+                timeout,
+                json.loads(request.data.decode("utf-8")),
+            )
+        )
         return io.BytesIO(
             json.dumps({"status": "inconclusive", "answer": "Lacuna"}).encode()
         )
@@ -22,7 +29,12 @@ def test_cli_calls_same_route_and_saves_json(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(rca_cli, "urlopen", open_request)
     assert rca_cli.main() == 0
     assert requests == [
-        ("http://127.0.0.1:8010/api/runs/run-test/skill-rca", "POST", 900)
+        (
+            "http://127.0.0.1:8010/api/runs/run-test/skill-rca",
+            "POST",
+            900,
+            {"possible_fault_types": []},
+        )
     ]
     assert json.loads(output.read_text())["status"] == "inconclusive"
     assert "inconclusive" in capsys.readouterr().out
@@ -43,6 +55,36 @@ def test_cli_http_error_reports_artifact(monkeypatch, capsys):
     monkeypatch.setattr(rca_cli, "urlopen", fail)
     assert rca_cli.main() == 1
     assert "saved.json" in capsys.readouterr().err
+
+
+def test_cli_sends_the_benchmark_fault_type_options(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rca",
+            "--run-id",
+            "run-test",
+            "--possible-fault-type",
+            "container-kill",
+            "--possible-fault-type",
+            "network-loss",
+        ],
+    )
+    requests = []
+
+    def open_request(request, timeout):
+        requests.append(json.loads(request.data.decode("utf-8")))
+        return io.BytesIO(
+            json.dumps({"status": "inconclusive", "answer": "Lacuna"}).encode()
+        )
+
+    monkeypatch.setattr(rca_cli, "urlopen", open_request)
+
+    assert rca_cli.main() == 0
+    assert requests == [
+        {"possible_fault_types": ["container-kill", "network-loss"]}
+    ]
 
 
 def test_cli_does_not_overwrite_output(monkeypatch, tmp_path):

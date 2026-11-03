@@ -52,6 +52,12 @@ spec:
         volumeMounts:
         - mountPath: /tmp
           name: tmp-volume
+        startupProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.shipping.containerPort }}
+          periodSeconds: 5
+          failureThreshold: 120
         livenessProbe:
           httpGet:
             path: /health
@@ -62,10 +68,8 @@ spec:
           httpGet:
             path: /health
             port: {{ .Values.shipping.containerPort }}
-          initialDelaySeconds: 360
           periodSeconds: 3
       volumes:
         - name: tmp-volume
           emptyDir:
             medium: Memory
-

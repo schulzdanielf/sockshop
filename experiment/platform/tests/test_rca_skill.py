@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 
@@ -49,13 +50,21 @@ def evidence(identifier, family, *, status="ok", count=2, fault_count=2):
     }
 
 
-def validate(value, items, restarted=None):
+def validate(
+    value,
+    items,
+    restarted=None,
+    possible_fault_types=None,
+    require_best_guess=False,
+):
     return rca_skill.validate_diagnosis(
         rca_skill.Diagnosis.model_validate(value),
         items,
         {"front-end", "orders"},
         {"network-latency", "pod-failure"},
         restarted or [],
+        possible_fault_types,
+        require_best_guess,
     )
 
 
@@ -155,6 +164,29 @@ def test_unobserved_model_restart_is_removed_and_downgraded():
     assert any("sem evento confirmado" in item for item in result.limitations)
 
 
+def test_best_guess_requires_a_known_service_even_when_inconclusive():
+    with pytest.raises(rca_skill.SkillRCAError, match="best guess"):
+        validate(
+            diagnosis(status="inconclusive", primary_service=None),
+            [],
+            possible_fault_types=["container-kill"],
+            require_best_guess=True,
+        )
+
+    result = validate(
+        diagnosis(
+            status="inconclusive",
+            primary_service="orders",
+            fault_type="container-kill",
+        ),
+        [],
+        possible_fault_types=["container-kill"],
+        require_best_guess=True,
+    )
+    assert result.primary_service == "orders"
+    assert result.fault_type == "container-kill"
+
+
 class FakeMCP:
     def __init__(self, *, empty_logs=False, restart=False):
         self.calls = []
@@ -167,6 +199,7 @@ class FakeMCP:
             "check_service_readiness",
             "check_oom_kills",
             "check_pod_restarts",
+            "prometheus_range_query",
             "loki_range_query",
             "tempo_service_graph_phases",
             "tempo_analyze_trace",
@@ -236,6 +269,8 @@ class FakeMCP:
                     )
                 }
             }
+        if name == "prometheus_range_query":
+            return {"status": "success", "data": {"result": []}}
         if name == "tempo_service_graph_phases":
             return {"phases": {phase: {"trace_count": 0} for phase in PHASES}}
         return {
@@ -245,7 +280,16 @@ class FakeMCP:
         }
 
 
-def run_executor(client, final=None, metadata=None, candidate="front-end"):
+def run_executor(
+    client,
+    final=None,
+    metadata=None,
+    candidate="front-end",
+    possible_fault_types=None,
+    require_best_guess=False,
+    archive_traces=None,
+    evidence_source="live",
+):
     contexts = []
 
     def model(messages, tools, **kwargs):
@@ -259,7 +303,30 @@ def run_executor(client, final=None, metadata=None, candidate="front-end"):
                 "reasoning": "Comparar sinais",
             }
         else:
-            value = final or diagnosis()
+            evidence_by_family = {
+                item["family"]: item["id"]
+                for item in context["evidence"]
+                if item["fault_observation_count"] > 0
+                and item["status"] == "ok"
+                and item["tool"]
+                in {
+                    "get_run_golden_signals",
+                    "prometheus_range_query",
+                    "loki_range_query",
+                }
+            }
+            value = final or diagnosis(
+                supporting_evidence=[
+                    evidence_by_family[family]
+                    for family in ("metrics", "logs")
+                    if family in evidence_by_family
+                ],
+                **(
+                    {"fault_type": possible_fault_types[0]}
+                    if possible_fault_types
+                    else {}
+                ),
+            )
         return {"content": json.dumps(value)}
 
     result = rca_skill.answer_skill_rca(
@@ -268,6 +335,10 @@ def run_executor(client, final=None, metadata=None, candidate="front-end"):
         namespace="sock-shop",
         llm=model,
         window_metadata=metadata,
+        possible_fault_types=possible_fault_types,
+        require_best_guess=require_best_guess,
+        archive_traces=archive_traces,
+        evidence_source=evidence_source,
     )
     return result, contexts
 
@@ -289,16 +360,243 @@ def test_progressive_execution_exact_log_identity_and_windows():
     assert 'container="front-end"' in logs[1]["query"]
     assert "\\-" not in logs[1]["query"]
     assert logs[1]["limit"] == 150
-    assert result["evidence"][5]["fault_observation_count"] == 1
-    assert result["evidence"][4]["fault_observation_count"] == 0
+    term_query = next(
+        arguments
+        for name, arguments in client.calls
+        if name == "prometheus_range_query"
+    )
+    assert "kube_pod_container_status_last_terminated_" in term_query["query"]
+    assert PHASES["baseline"]["start"] <= term_query["start"] < PHASES["fault"]["start"]
+    assert term_query["end"] > PHASES["fault"]["end"]
+    fault_log = next(
+        item
+        for item in result["evidence"]
+        if item["tool"] == "loki_range_query"
+        and item["arguments"]["start"] == PHASES["fault"]["start"]
+    )
+    assert fault_log["fault_observation_count"] == 1
+    assert "prometheus_range_query" in result["tools_used"]
     assert [context["stage"] for context in contexts] == ["plan", "diagnosis"]
+
+
+def test_historical_evidence_source_and_trace_query_budget_are_explicit():
+    class LiveLabeledMCP(FakeMCP):
+        def call_tool_json(self, name, arguments):
+            result = super().call_tool_json(name, arguments)
+            if isinstance(result, dict):
+                return {**result, "evidence_source": "live"}
+            return result
+
+    result, _ = run_executor(LiveLabeledMCP(), evidence_source="history")
+
+    assert result["evidence"]
+    assert {item["source"] for item in result["evidence"]} == {"history"}
+    trace_call = next(
+        call for call in result["calls"]
+        if call["tool"] == "tempo_service_graph_phases"
+    )
+    assert trace_call["arguments"]["limit"] == 10
+
+
+def test_archive_trace_evidence_is_read_only_and_reaches_diagnosis_context():
+    archive = {
+        "status": "ok",
+        "evidence_source": "archive",
+        "campaign_id": "campaign-2026",
+        "run_id": "run-test",
+        "archive_key": "campaign-2026/run-test/source-bundle.json.gz",
+        "bundle_sha256": "a" * 64,
+        "source_search_complete": True,
+        "source_fetch_error_count": 0,
+        "manifest_trace_status": "partial",
+        "search_index_status": "partial",
+        "trace_count": 1,
+        "span_count": 1,
+        "phases": {
+            "baseline": {
+                "trace_count": 0,
+                "span_count": 0,
+                "error_span_count": 0,
+                "service_span_counts": {},
+            },
+            "fault": {
+                "trace_count": 1,
+                "span_count": 1,
+                "error_span_count": 1,
+                "service_span_counts": {"orders": 1},
+            },
+        },
+        "trace_details": [
+            {
+                "trace_id": "1" * 32,
+                "phase": "fault",
+                "service": "orders",
+                "operation": "GET /orders",
+                "duration_ms": 200,
+                "http_status_code": 500,
+                "is_error": True,
+                "spans": [
+                    {
+                        "span_id": "2" * 16,
+                        "service": "orders",
+                        "operation": "GET /orders",
+                        "start_time": "2026-01-01T00:00:00Z",
+                        "duration_ms": 200,
+                        "is_error": True,
+                    }
+                ],
+            }
+        ],
+    }
+    client = FakeMCP()
+
+    result, contexts = run_executor(client, archive_traces=archive)
+
+    assert not any(name == "history_archive_traces" for name, _ in client.calls)
+    evidence = next(
+        item for item in result["evidence"] if item["tool"] == "history_archive_traces"
+    )
+    assert evidence["family"] == "traces"
+    assert evidence["source"] == "archive"
+    assert evidence["status"] == "ok"
+    assert evidence["fault_observation_count"] == 1
+    assert any(
+        item["tool"] == "history_archive_traces"
+        for item in contexts[-1]["evidence"]
+    )
+    assert result["evidence_bundle"]["coverage"]["history_archive_traces"]["source"] == "archive"
+    assert any(
+        item["kind"] == "archived_trace_span"
+        for item in result["evidence_bundle"]["timeline"]
+    )
+
+
+def test_benchmark_fault_type_is_required_and_selected_even_when_inconclusive():
+    result, contexts = run_executor(
+        FakeMCP(),
+        final=diagnosis(status="inconclusive", fault_type="container-kill"),
+        possible_fault_types=["container-kill", "network-loss"],
+        require_best_guess=True,
+    )
+
+    diagnosis_context = contexts[-1]
+    output_schema = diagnosis_context["output_schema"]
+    assert diagnosis_context["context"]["possible_fault_types"] == [
+        "container-kill",
+        "network-loss",
+    ]
+    assert output_schema["properties"]["fault_type"]["enum"] == [
+        "container-kill",
+        "network-loss",
+    ]
+    assert "fault_type" in output_schema["required"]
+    services = output_schema["properties"]["primary_service"]["enum"]
+    assert "front-end" in services
+    assert "primary_service" in output_schema["required"]
+    assert result["status"] == "inconclusive"
+    assert result["diagnosis"]["primary_service"] == "front-end"
+    assert result["diagnosis"]["fault_type"] == "container-kill"
     assert len(result["skill"]["sha256"]) == 64
     assert "chaos_profile" not in json.dumps(contexts)
+
+
+def test_edge_latency_profiles_are_collected_before_planning():
+    class EdgeMCP(FakeMCP):
+        def call_tool_json(self, name, arguments):
+            if name != "prometheus_range_query":
+                return super().call_tool_json(name, arguments)
+            self.calls.append((name, arguments))
+            query = arguments["query"]
+            if "last_terminated" in query:
+                return {"status": "success", "data": {"result": []}}
+            baseline_start = "2026-10-02T10:01:15Z"
+            baseline_timestamp = (
+                int(
+                    datetime.fromisoformat(
+                        baseline_start.replace("Z", "+00:00")
+                    ).timestamp()
+                )
+                + 10
+            )
+            fault_timestamp = (
+                int(
+                    datetime.fromisoformat(
+                        PHASES["fault"]["start"].replace("Z", "+00:00")
+                    ).timestamp()
+                )
+                + 10
+            )
+            labels = (
+                {"source_workload": "front-end", "destination_workload": "orders"}
+                if "istio_request_duration_milliseconds" in query
+                else {"client": "front-end", "server": "orders"}
+            )
+            return {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "metric": labels,
+                            "values": [
+                                [baseline_timestamp, "0.01"],
+                                [fault_timestamp, "0.15"],
+                            ],
+                        }
+                    ]
+                },
+            }
+
+    client = EdgeMCP()
+    result, contexts = run_executor(client)
+    edge_calls = [
+        arguments
+        for name, arguments in client.calls
+        if name == "prometheus_range_query"
+        and "last_terminated" not in arguments["query"]
+    ]
+    assert len(edge_calls) == 3
+    assert all(arguments["step"] == "15s" for arguments in edge_calls)
+    assert all(arguments["start"] == "2026-10-02T10:01:15Z" for arguments in edge_calls)
+    assert all(arguments["end"] == PHASES["post"]["end"] for arguments in edge_calls)
+    assert contexts[0]["context"]["edge_latency_candidates"] == ["orders"]
+    assert contexts[1]["context"]["edge_latency_candidates"] == ["orders"]
+    assert any(
+        'container="orders"' in arguments["query"]
+        for name, arguments in client.calls
+        if name == "loki_range_query"
+    )
+    assert result["status"] == "confirmed"
+    edge_evidence = [
+        item
+        for item in result["evidence"]
+        if item["digest"].get("purpose") == "edge_latency_triage"
+    ]
+    assert len(edge_evidence) == 3
+    assert all(item["fault_observation_count"] == 1 for item in edge_evidence)
 
 
 def test_no_logs_or_traces_cannot_confirm():
     result, _ = run_executor(FakeMCP(empty_logs=True))
     assert result["status"] == "inconclusive"
+
+
+def test_asyncio_timeout_from_trace_tool_is_recorded_without_aborting():
+    class TimedOutTraceMCP(FakeMCP):
+        def call_tool_json(self, name, arguments):
+            if name == "tempo_service_graph_phases":
+                self.calls.append((name, arguments))
+                raise asyncio.TimeoutError()
+            return super().call_tool_json(name, arguments)
+
+    result, _ = run_executor(TimedOutTraceMCP())
+
+    trace_evidence = next(
+        item
+        for item in result["evidence"]
+        if item["tool"] == "tempo_service_graph_phases"
+    )
+    assert trace_evidence["status"] == "tool_error"
+    assert result["status"] == "confirmed"
 
 
 def test_planned_fault_window_cannot_confirm():
@@ -328,15 +626,28 @@ def test_unknown_plan_candidate_is_filtered_and_downgraded():
 
 
 def test_malformed_model_response_is_retried_and_reported():
+    model_options = []
+
+    def malformed_model(*args, **kwargs):
+        model_options.append(kwargs)
+        return {"content": "not JSON"}
+
     result = rca_skill.answer_skill_rca(
         mcp_client=FakeMCP(),
         phases=PHASES,
         namespace="sock-shop",
-        llm=lambda *args, **kwargs: {"content": "not JSON"},
+        llm=malformed_model,
     )
     assert result["status"] == "error"
     assert len(result["model_attempts"]) == 3
     assert result["calls"]
+    assert len(model_options) == 3
+    assert all(
+        options["response_format"]["type"] == "json_schema"
+        and options["response_format"]["json_schema"]["name"] == "InvestigationPlan"
+        and options["chat_template_kwargs"] == {"enable_thinking": False}
+        for options in model_options
+    )
 
 
 def test_missing_tools_are_explicit_not_empty_success():

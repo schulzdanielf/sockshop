@@ -37,6 +37,52 @@ def test_renderer_produces_valid_yaml(chaos_type):
     assert any("carts" in line for line in text.splitlines())
 
 
+@pytest.mark.parametrize(
+    ("service", "probe_path"),
+    [
+        (service, probe_path)
+        for service, paths in gcm.HTTP_PROBE_PATHS.items()
+        for probe_path in paths
+    ],
+)
+def test_http_status_code_bypasses_probe_path(service, probe_path):
+    manifest = yaml.safe_load(
+        gcm._render_http_status_code(service, {"status_code": 500})
+    )
+    rules = manifest["spec"]["http"]
+
+    assert any(
+        "fault" not in rule
+        and any(
+            match.get("uri", {}).get("exact") == probe_path
+            for match in rule.get("match", [])
+        )
+        for rule in rules[:-1]
+    )
+    assert rules[-1]["fault"]["abort"]["httpStatus"] == 500
+    assert "match" not in rules[-1]
+    assert all(
+        rule["route"][0]["destination"]["port"]["number"] == 80
+        for rule in rules
+    )
+    gcm.validate_http_probe_exclusions(service, manifest)
+
+
+def test_http_status_code_rejects_unknown_probe_paths():
+    with pytest.raises(ValueError, match="probe paths are not configured"):
+        gcm._render_http_status_code("unknown-service", {"status_code": 500})
+
+
+def test_http_status_code_validator_rejects_manifest_without_probe_bypass():
+    manifest = yaml.safe_load(
+        gcm._render_http_status_code("orders", {"status_code": 500})
+    )
+    manifest["spec"]["http"] = manifest["spec"]["http"][1:]
+
+    with pytest.raises(ValueError, match="probe bypass rule"):
+        gcm.validate_http_probe_exclusions("orders", manifest)
+
+
 @pytest.mark.parametrize("chaos_type", _CHAOS_TYPES)
 def test_renderer_leaves_no_catalogue_token(chaos_type):
     render = gcm.RENDERERS[chaos_type]

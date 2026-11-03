@@ -217,7 +217,8 @@ class MCPPrometheusMetricsPlugin:
 
         For each metric in *raw*:
           1. Auto-detect the discriminating label key (``name`` for RED
-             metrics, ``pod`` for container/saturation metrics).
+             metrics, ``pod`` for container/saturation metrics, or a
+             source-to-destination edge for directed request metrics).
           2. Bucket points by (label_value, phase).
           3. Compute baseline_mean / fault_mean / fault_p95 per label.
           4. Rank labels by ``fault_mean - baseline_mean`` (descending);
@@ -228,9 +229,11 @@ class MCPPrometheusMetricsPlugin:
 
         Returns
         -------
-        ``{metric_id: {"label_kind": "service"|"pod"|"raw",
+        ``{metric_id: {"label_kind": "service"|"pod"|"edge"|"raw",
                        "top": [{label, baseline_mean, fault_mean,
-                                fault_p95, delta_abs}, ...]}}``
+                                fault_p95, delta_abs}, ...],
+                       "top_edges": [{source_workload, destination_workload,
+                                      response_code, ...}, ...]}}``
         """
         data = raw.get("data", {})
         phase_bounds: List[Tuple[str, float, float]] = [
@@ -253,24 +256,45 @@ class MCPPrometheusMetricsPlugin:
             # auto-detected per series from its label set.
             per_label_baseline: Dict[str, List[float]] = {}
             per_label_fault: Dict[str, List[float]] = {}
+            route_labels: Dict[str, Dict[str, str]] = {}
             label_kind = "raw"
 
             for ts, val, labels in self._iter_points(payload):
-                # Pick the discriminating label: prefer 'name' (RED metrics)
-                # or Istio workload labels, then 'pod' (container/saturation).
-                # If neither, skip — the metric is already a single global
-                # series with nothing to localise.
-                service_label = next((k for k in SERVICE_LABEL_KEYS if labels.get(k)), None)
-                if service_label:
-                    key = str(labels[service_label])
-                    if key == "unknown":
-                        continue
-                    label_kind = "service"
-                elif "pod" in labels and labels["pod"]:
-                    key = self._pod_to_service(str(labels["pod"]))
-                    label_kind = "pod"
+                source_workload = labels.get("source_workload")
+                destination_workload = labels.get("destination_workload")
+                if source_workload and destination_workload:
+                    route = {
+                        "source_workload": str(source_workload),
+                        "destination_workload": str(destination_workload),
+                    }
+                    if labels.get("response_code"):
+                        route["response_code"] = str(labels["response_code"])
+                    key = "|".join(
+                        (
+                            route["source_workload"],
+                            route["destination_workload"],
+                            route.get("response_code", ""),
+                        )
+                    )
+                    route_labels[key] = route
+                    label_kind = "edge"
                 else:
-                    continue
+                    # Pick the discriminating label: prefer 'name' (RED
+                    # metrics) or Istio workload labels, then 'pod'
+                    # (container/saturation).
+                    service_label = next(
+                        (k for k in SERVICE_LABEL_KEYS if labels.get(k)), None
+                    )
+                    if service_label:
+                        key = str(labels[service_label])
+                        if key == "unknown":
+                            continue
+                        label_kind = "service"
+                    elif "pod" in labels and labels["pod"]:
+                        key = self._pod_to_service(str(labels["pod"]))
+                        label_kind = "pod"
+                    else:
+                        continue
 
                 if baseline_window[0] <= ts <= baseline_window[1]:
                     per_label_baseline.setdefault(key, []).append(val)
@@ -286,21 +310,30 @@ class MCPPrometheusMetricsPlugin:
                 fault_mean = statistics.fmean(fault_vals)
                 base_mean = statistics.fmean(base_vals) if base_vals else 0.0
                 fault_p95 = sorted(fault_vals)[int(0.95 * (len(fault_vals) - 1))]
+                row_label = (
+                    route_labels[label]["destination_workload"]
+                    if label in route_labels
+                    else label
+                )
                 rows.append(
                     {
-                        "label": label,
+                        "label": row_label,
                         "baseline_mean": round(base_mean, 4),
                         "fault_mean": round(fault_mean, 4),
                         "fault_p95": round(fault_p95, 4),
                         "delta_abs": round(fault_mean - base_mean, 4),
+                        **route_labels.get(label, {}),
                     }
                 )
             # Rank by absolute fault-vs-baseline deviation (descending) and
             # truncate. Negative deltas (metric DROPPED during fault, e.g.
             # traffic collapse) are still meaningful — keep them by magnitude.
             rows.sort(key=lambda r: abs(r["delta_abs"]), reverse=True)
-            out[str(metric_id)] = {
+            entry = {
                 "label_kind": label_kind,
                 "top": rows[:top_k],
             }
+            if label_kind == "edge":
+                entry["top_edges"] = rows[:50]
+            out[str(metric_id)] = entry
         return out

@@ -9,13 +9,71 @@ metadata:
 data:
   alert.rules: |-
     groups:
-    - name: HighErrorRate
+    - name: sock-shop
       rules:
       - alert: HighErrorRate
-        expr: rate(request_duration_seconds_count{status_code="500"}[5m]) > 1
+        expr: sum by (job) (rate(http_server_duration_milliseconds_count{http_status_code=~"5.."}[5m])) > 1
         for: 5m
         labels:
-          severity: slack
+          severity: warning
         annotations:
-          summary: "High HTTP 500 error rates"
-          description: "Rate of HTTP 500 errors per 5 minutes: {{ $value }}"
+          summary: "High HTTP 5xx response rate"
+          description: "HTTP 5xx responses per second for {{ $labels.job }}: {{ $value }}"
+    - name: observability-health
+      rules:
+      - alert: PrometheusScrapeTargetDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus target is down"
+          description: "Target {{ $labels.job }} at {{ $labels.instance }} has been down for at least five minutes."
+      - alert: OpenTelemetryCollectorDown
+        expr: absent(up{job="opentelemetry-collector"}) or up{job="opentelemetry-collector"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenTelemetry Collector is not being scraped"
+          description: "No healthy OpenTelemetry Collector metrics target is available."
+      - alert: OpenTelemetryMetricExportFailures
+        expr: sum by (exporter) (increase(otelcol_exporter_send_failed_metric_points[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenTelemetry metrics export is failing"
+          description: "Collector exporter {{ $labels.exporter }} dropped metric points in the last five minutes."
+      - alert: OpenTelemetryLogExportFailures
+        expr: sum by (exporter) (increase(otelcol_exporter_send_failed_log_records[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenTelemetry log export is failing"
+          description: "Collector exporter {{ $labels.exporter }} dropped log records in the last five minutes."
+      - alert: LokiIngestionDrops
+        expr: sum by (reason) (increase(loki_discarded_samples_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki is discarding log records"
+          description: "Loki discarded log records for reason {{ $labels.reason }} in the last five minutes."
+      - alert: OpenTelemetryLokiQueueNearCapacity
+        expr: otelcol_exporter_queue_size{exporter="loki"} / otelcol_exporter_queue_capacity{exporter="loki"} > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenTelemetry Loki export queue is near capacity"
+          description: "The Collector Loki exporter queue is above 80% capacity."
+      - alert: OpenTelemetryTraceExportFailures
+        expr: sum by (exporter) (increase(otelcol_exporter_send_failed_spans[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenTelemetry trace export is failing"
+          description: "Collector exporter {{ $labels.exporter }} dropped spans in the last five minutes."

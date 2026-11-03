@@ -9,11 +9,10 @@ exact query used.
 Design goals
 ------------
 * **Window safety.** Every tool takes explicit ``start``/``end`` ISO
-  timestamps. Range queries are bounded by those — never use
-  ``increase(...[1h])`` or any open-ended lookback, because that would
-  smear counters from earlier experiments into the current window.
-    Counter-based signals (restart counts) are derived from per-container
-    counter increments on a range_query restricted to ``[start, end]``.
+  timestamps. Counter queries may pad the range to obtain scrapes on both
+  sides, but only count increments whose observed scrape interval overlaps
+  the requested window. This avoids unbounded lookbacks while preserving
+  the uncertainty between scrapes.
 * **Vocabulary parity.** Pod labels are normalised to the parent
   deployment / service name (``front-end-6489c74749-9jdrg`` →
   ``front-end``) so callers can reason at the service level. The raw
@@ -30,7 +29,8 @@ Design goals
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 # ── Pod-name → service-name normalisation ───────────────────────────────
@@ -71,7 +71,9 @@ def _iter_series(payload: Any):
         points: List[tuple] = []
         for p in series.get("values", []) or []:
             try:
-                points.append((float(p[0]), float(p[1])))
+                timestamp, value = float(p[0]), float(p[1])
+                if math.isfinite(timestamp) and math.isfinite(value):
+                    points.append((timestamp, value))
             except (ValueError, TypeError, IndexError):
                 continue
         yield labels, points
@@ -101,10 +103,11 @@ def _aggregate_by_service(
       * ``"max"`` — for 0/1 gauges where any transition to 1 inside
         the window counts; result is ``max(values)`` per series, then
         ``max`` per service. Use for the OOMKilled gauge.
+      * ``"rising"`` — count observed low-to-high gauge transitions.
             * ``"mean"`` — average across the window per pod, then average
                 pod percentages per service. Use for saturation percentages.
     """
-    per_pod: Dict[str, Dict[str, Any]] = {}
+    per_pod: Dict[Any, Dict[str, Any]] = {}
     for labels, points in _iter_series(payload):
         if not points:
             continue
@@ -118,12 +121,22 @@ def _aggregate_by_service(
             value = max(values)
         elif mode == "mean":
             value = sum(values) / len(values)
+        elif mode == "rising":
+            ordered = sorted(points)
+            value = sum(previous < 0.5 <= current for (_, previous), (_, current)
+                        in zip(ordered, ordered[1:]))
         else:
             raise ValueError(f"unknown aggregation mode: {mode!r}")
-        per_pod[pod] = {
+        identity = (
+            (pod, labels.get("container"), labels.get("uid"))
+            if mode in ("rising", "max") else pod
+        )
+        per_pod[identity] = {
             "pod": pod,
             "service": _pod_to_service(pod),
             "value": round(value, 4),
+            **({"container": labels["container"]} if labels.get("container") else {}),
+            **({"uid": labels["uid"]} if labels.get("uid") else {}),
         }
 
     per_service: Dict[str, Dict[str, Any]] = {}
@@ -134,7 +147,7 @@ def _aggregate_by_service(
             bucket["value"] = max(bucket["value"], entry["value"])
         else:
             bucket["value"] += entry["value"]
-        bucket["pods"].append({"pod": entry["pod"], "value": entry["value"]})
+        bucket["pods"].append({k: v for k, v in entry.items() if k != "service"})
     if mode == "mean":
         for bucket in per_service.values():
             bucket["value"] /= len(bucket["pods"])
@@ -159,13 +172,42 @@ def _sample_time_iso(timestamp: float) -> str:
     )
 
 
-def _restart_rollup(payload: Any) -> Dict[str, Dict[str, Any]]:
-    """Sum reset-aware counter increments by pod and service.
+_PROMETHEUS_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h|d|w|y)")
+_PROMETHEUS_DURATION_SECONDS = {
+    "ms": 0.001,
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+    "y": 31536000,
+}
 
-    kube-state-metrics can be scraped through more than one Prometheus job.
-    The query selects its canonical job; the check here also guards test or
-    nonstandard payloads from counting duplicate scrape sources.
-    """
+
+def _prometheus_duration_seconds(value: str) -> float:
+    parts = list(_PROMETHEUS_DURATION_PART.finditer(value))
+    if not parts or "".join(part.group(0) for part in parts) != value:
+        raise ValueError("step must be a positive Prometheus duration")
+    seconds = sum(
+        float(part.group(1)) * _PROMETHEUS_DURATION_SECONDS[part.group(2)]
+        for part in parts
+    )
+    if seconds <= 0:
+        raise ValueError("step must be a positive Prometheus duration")
+    return seconds
+
+
+def _iso_timestamp_seconds(value: str, name: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{name} must include a timezone")
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _restart_container_samples(payload: Any) -> Dict[tuple, Dict[float, float]]:
     container_samples: Dict[tuple, Dict[float, float]] = {}
     for labels, points in _iter_series(payload):
         if labels.get("job") not in (None, "kube-state-metrics"):
@@ -174,39 +216,92 @@ def _restart_rollup(payload: Any) -> Dict[str, Dict[str, Any]]:
         if not pod or pod == "unknown":
             continue
         container = str(labels.get("container") or "unknown")
-        samples = container_samples.setdefault((pod, container), {})
+        uid = str(labels.get("uid") or "")
+        samples = container_samples.setdefault((pod, container, uid), {})
         for timestamp, value in points:
-            samples[timestamp] = max(value, samples.get(timestamp, value))
+            if value >= 0:
+                samples[timestamp] = max(value, samples.get(timestamp, value))
+    return {
+        identity: samples
+        for identity, samples in container_samples.items()
+        if samples
+    }
 
+
+def _restart_coverage(
+    container_samples: Dict[tuple, Dict[float, float]],
+    window_start: float,
+    window_end: float,
+) -> Dict[str, int]:
+    bracketed = sum(
+        min(samples) <= window_start and max(samples) >= window_end
+        for samples in container_samples.values()
+    )
+    series_count = len(container_samples)
+    return {
+        "series_count": series_count,
+        "sample_count": sum(len(samples) for samples in container_samples.values()),
+        "window_bracketed_series_count": bracketed,
+        "window_unbracketed_series_count": series_count - bracketed,
+        "window_sample_count": sum(
+            window_start <= timestamp <= window_end
+            for samples in container_samples.values() for timestamp in samples
+        ),
+    }
+
+
+def _restart_rollup(
+    container_samples: Dict[tuple, Dict[float, float]],
+    window_start: float,
+    window_end: float,
+    timestamp_kind: str = "scrape",
+) -> Dict[str, Dict[str, Any]]:
+    """Sum reset-aware counter increments by pod and service.
+
+    kube-state-metrics can be scraped through more than one Prometheus job.
+    The query selects its canonical job; the check here also guards test or
+    nonstandard payloads from counting duplicate scrape sources.
+    """
     per_service: Dict[str, Dict[str, Any]] = {}
-    for (pod, container), samples in container_samples.items():
+    for (pod, container, uid), samples in container_samples.items():
         points = sorted(samples.items())
-        count = _counter_increments(points)
+        count = 0.0
         service = _pod_to_service(pod)
         row = per_service.setdefault(
             service, {"service": service, "value": 0.0, "pods": []}
         )
-        row["value"] += count
         observations = []
         for (previous_time, previous), (current_time, current) in zip(
             points, points[1:]
         ):
+            if current_time < window_start or previous_time >= window_end:
+                continue
             delta = current - previous if current >= previous else current
             if delta <= 0:
                 continue
+            count += delta
             observations.append(
                 {
                     "observed_from": _sample_time_iso(previous_time),
                     "observed_to": _sample_time_iso(current_time),
                     "restart_count_delta": round(delta, 4),
                     "counter_reset": current < previous,
-                    "timestamp_precision": "between_scrapes",
+                    "timestamp_precision": (
+                        "between_scrapes" if timestamp_kind == "scrape"
+                        else "between_evaluations"
+                    ),
+                    "window_attribution": (
+                        "within_window" if previous_time >= window_start
+                        and current_time <= window_end else "overlap_only"
+                    ),
                 }
             )
+        row["value"] += count
         row["pods"].append(
             {
                 "pod": pod,
                 "container": container,
+                "uid": uid or None,
                 "value": round(count, 4),
                 "restart_observations": observations[:20],
                 "omitted_restart_observation_count": max(0, len(observations) - 20),
@@ -286,19 +381,14 @@ def check_oom_kills(
 ) -> Dict[str, Any]:
     """Return per-service evidence of OOMKills *within* ``[start, end]``.
 
-    Uses ``kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}``,
-    a 0/1 gauge. The range query lets us see the 0→1 transition that
-    happens at the OOM kill — pods that were already OOMKilled before
-    ``start`` would still have value=1 throughout the window, so we
-    compare ``max - min`` to confirm the transition actually occurred
-    inside the window (and additionally report ``max`` so an agent can
-    distinguish "OOMed in this run" from "OOMed earlier and still in
-    that state").
+    Uses the last-termination reason gauge. Only observed rising transitions
+    are counted; a falling edge or initial high state is not a new OOM.
+    Without termination timestamps this remains sampled state, not proof
+    of the event time or of its cause.
     """
     query = (
-        "sum by (pod) ("
         "kube_pod_container_status_last_terminated_reason"
-        f'{{namespace="{namespace}",reason="OOMKilled"}})'
+        f'{{namespace="{namespace}",reason="OOMKilled",job="kube-state-metrics"}}'
     )
     raw = prometheus.query_range(query, start, end, step)
     if not isinstance(raw, dict) or raw.get("status") == "error":
@@ -313,7 +403,7 @@ def check_oom_kills(
             "coverage": {"series_count": 0, "sample_count": 0},
         }
     coverage = _coverage_summary(raw)
-    transitions = _aggregate_by_service(raw, mode="max_minus_min")
+    transitions = _aggregate_by_service(raw, mode="rising")
     still_high = _aggregate_by_service(raw, mode="max")
     rows: List[Dict[str, Any]] = []
     for svc, t in transitions.items():
@@ -337,6 +427,10 @@ def check_oom_kills(
         "query": query,
         "window": {"start": start, "end": end},
         "coverage": coverage,
+        "limitations": [
+            "Last-termination reason is sampled metrics state, not an exact event timestamp.",
+            "A missing or initially high OOM reason cannot exclude or date an OOM.",
+        ],
     }
 
 
@@ -347,20 +441,54 @@ def check_pod_restarts(
     end: str,
     namespace: str = "sock-shop",
     step: str = "15s",
+    history_pad: str = "1m",
 ) -> Dict[str, Any]:
-    """Return per-service restart counts *strictly* within ``[start, end]``.
+    """Return counter increments observed across ``[start, end]``.
 
-    We avoid ``increase(...[1h])`` because the 1h lookback would include
-    restarts from previous experiments. We range-query only the canonical
-    kube-state-metrics scrape, then sum reset-aware adjacent counter
-    increments per container inside the requested window. This avoids
-    treating duplicate scrape-source gaps as counter changes.
+    Raw scrape collection is padded by at least one minute on both sides,
+    independently of query evaluation step. An increment is
+    included when its between-scrape interval overlaps the requested window;
+    the exact event time remains uncertain at scrape resolution.
     """
+    window_start = _iso_timestamp_seconds(start, "start")
+    window_end = _iso_timestamp_seconds(end, "end")
+    if window_start > window_end:
+        raise ValueError("start must not be after end")
+    step_seconds = _prometheus_duration_seconds(step)
+    pad_seconds = max(step_seconds, _prometheus_duration_seconds(history_pad))
+    query_start = _sample_time_iso(window_start - pad_seconds)
+    query_end = _sample_time_iso(window_end + pad_seconds)
     query = (
         "kube_pod_container_status_restarts_total"
         f'{{namespace="{namespace}",job="kube-state-metrics"}}'
     )
-    raw = prometheus.query_range(query, start, end, step)
+    raw_query = getattr(prometheus, "query_raw_range", None)
+    timestamp_kind = "scrape" if callable(raw_query) else "evaluation"
+    raw = (
+        raw_query(query, query_start, query_end) if callable(raw_query)
+        else prometheus.query_range(query, query_start, query_end, step)
+    )
+    collection = {
+        "sample_timestamp_kind": timestamp_kind,
+        "history_pad": history_pad,
+        "history_pad_seconds": pad_seconds,
+        "collection_query": (
+            f"{query}[{math.ceil((window_end - window_start + 2 * pad_seconds) * 1000)}ms]"
+            if timestamp_kind == "scrape" else query
+        ),
+        "collection_evaluation_time": query_end if timestamp_kind == "scrape" else None,
+        "telemetry_family": "metrics",
+        "limitations": [
+            "Counter increments overlapping the window are candidates, not exactly timed events.",
+            "Padding samples are not fault-phase observations or independent telemetry.",
+            "Missing series or insufficient bracketing cannot exclude a restart.",
+            "Observed services are only those with retrieved counters, not a service inventory.",
+        ],
+    }
+    if timestamp_kind == "evaluation":
+        collection["limitations"].append(
+            "Legacy range-query timestamps are evaluations; lookback may repeat older scrapes."
+        )
     if not isinstance(raw, dict) or raw.get("status") == "error":
         return {
             "status": "tool_error",
@@ -370,16 +498,36 @@ def check_pod_restarts(
             "error": raw.get("error") if isinstance(raw, dict) else "no data",
             "query": query,
             "window": {"start": start, "end": end},
-            "coverage": {"series_count": 0, "sample_count": 0},
+            "query_window": {"start": query_start, "end": query_end},
+            **collection,
+            "observed_services": [],
+            "raw_coverage": {"series_count": 0, "sample_count": 0},
+            "coverage": {
+                "series_count": 0,
+                "sample_count": 0,
+                "window_bracketed_series_count": 0,
+                "window_unbracketed_series_count": 0,
+                "window_sample_count": 0,
+            },
         }
-    coverage = _coverage_summary(raw)
-    rollup = _restart_rollup(raw)
+    container_samples = _restart_container_samples(raw)
+    coverage = _restart_coverage(container_samples, window_start, window_end)
+    rollup = _restart_rollup(
+        container_samples, window_start, window_end, timestamp_kind
+    )
     # Return all observed services so a targeted question can distinguish a
     # zero count from a service omitted by a top-5 cutoff.
     top = _top_k(rollup, k=len(rollup))
     nonzero = [r for r in top if r["value"] > 0.5]
+    status = (
+        "no_data"
+        if coverage["series_count"] == 0
+        else "ok"
+        if coverage["window_unbracketed_series_count"] == 0
+        else "partial"
+    )
     return {
-        "status": "ok" if coverage["series_count"] else "no_data",
+        "status": status,
         "found": len(nonzero) > 0,
         "count": len(nonzero),
         "signal_detected": len(nonzero) > 0,
@@ -393,7 +541,11 @@ def check_pod_restarts(
         ],
         "query": query,
         "window": {"start": start, "end": end},
+        "query_window": {"start": query_start, "end": query_end},
         "coverage": coverage,
+        "raw_coverage": _coverage_summary(raw),
+        "observed_services": sorted(rollup),
+        **collection,
     }
 
 
@@ -511,6 +663,7 @@ def _saturation_top(
     namespace: str,
     step: str,
     k: int,
+    service: str | None = None,
 ) -> Dict[str, Any]:
     """Common implementation for the CPU / memory saturation top-K tools.
 
@@ -520,18 +673,23 @@ def _saturation_top(
     fraction of the container memory limit. Pods without a limit are
     excluded (no saturation signal exists for them).
     """
+    pod_filter = ""
+    if service is not None:
+        if not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", service):
+            raise ValueError("invalid service name")
+        pod_filter = f',pod=~"^{service}(-[a-z0-9]{{5,}}-[a-z0-9]+|-[0-9]+)?$"'
     if resource == "cpu":
         query = (
             "100 * sum by (pod) ("
             "rate(container_cpu_usage_seconds_total"
-            f'{{namespace="{namespace}",cpu="total"}}[1m])'
+            f'{{namespace="{namespace}",cpu="total",job="kubernetes-cadvisor"{pod_filter}}}[1m])'
             ")"
             " / on(pod) group_left() ("
             "sum by (pod) ("
-            "container_spec_cpu_quota"
-            f'{{namespace="{namespace}",job="kubernetes-cadvisor"}}'
+            "(container_spec_cpu_quota"
+            f'{{namespace="{namespace}",job="kubernetes-cadvisor"{pod_filter}}} > 0)'
             " / container_spec_cpu_period"
-            f'{{namespace="{namespace}",job="kubernetes-cadvisor"}}'
+            f'{{namespace="{namespace}",job="kubernetes-cadvisor"{pod_filter}}}'
             ")"
             ")"
         )
@@ -539,11 +697,11 @@ def _saturation_top(
         query = (
             "100 * sum by (pod) ("
             "container_memory_working_set_bytes"
-            f'{{namespace="{namespace}",job="kubernetes-cadvisor"}}'
+            f'{{namespace="{namespace}",job="kubernetes-cadvisor"{pod_filter}}}'
             ")"
             " / on(pod) group_left() ("
-            "container_spec_memory_limit_bytes"
-            f'{{namespace="{namespace}",job="kubernetes-cadvisor"}} > 0'
+            "sum by (pod) (container_spec_memory_limit_bytes"
+            f'{{namespace="{namespace}",job="kubernetes-cadvisor"{pod_filter}}}) > 0'
             ")"
         )
     else:
@@ -596,6 +754,7 @@ def get_cpu_saturation_top(
     namespace: str = "sock-shop",
     step: str = "15s",
     k: int = 3,
+    service: str | None = None,
 ) -> Dict[str, Any]:
     """Top-K services by CPU saturation (% of limit) in ``[start, end]``."""
     return _saturation_top(
@@ -606,6 +765,7 @@ def get_cpu_saturation_top(
         namespace=namespace,
         step=step,
         k=k,
+        service=service,
     )
 
 
@@ -617,6 +777,7 @@ def get_memory_saturation_top(
     namespace: str = "sock-shop",
     step: str = "15s",
     k: int = 3,
+    service: str | None = None,
 ) -> Dict[str, Any]:
     """Top-K services by memory saturation (% of limit) in ``[start, end]``."""
     return _saturation_top(
@@ -627,6 +788,7 @@ def get_memory_saturation_top(
         namespace=namespace,
         step=step,
         k=k,
+        service=service,
     )
 
 
@@ -734,9 +896,9 @@ def _golden_metric_query(metric: str, namespace: str) -> str:
     if metric == "cpu_saturation_pct":
         return (
             "100 * sum by (pod) (rate(container_cpu_usage_seconds_total"
-            f'{{namespace="{escaped_namespace}",cpu="total"}}[1m]))'
-            " / on(pod) group_left() (sum by (pod) (container_spec_cpu_quota"
-            f'{{namespace="{escaped_namespace}",job="kubernetes-cadvisor"}}'
+            f'{{namespace="{escaped_namespace}",cpu="total",job="kubernetes-cadvisor"}}[1m]))'
+            " / on(pod) group_left() (sum by (pod) ((container_spec_cpu_quota"
+            f'{{namespace="{escaped_namespace}",job="kubernetes-cadvisor"}} > 0)'
             " / container_spec_cpu_period"
             f'{{namespace="{escaped_namespace}",job="kubernetes-cadvisor"}}))'
         )

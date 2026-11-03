@@ -6,14 +6,17 @@ From the repository root:
 
 The script runs two replicas of each of seven supported chaos types on distinct
 services, writes results under out/all_chaos_training, and requires a passing
-Litmus ChaosResult plus target-specific metric evidence for every run. The
-WSL2-incompatible dns-error and io-stress types are intentionally excluded.
+Litmus ChaosResult plus target-specific metric evidence for every run. Reports
+separate the observed signal, mechanism confidence, and service impact; a
+passing signal gate is not causal proof. The WSL2-incompatible dns-error and
+io-stress types are intentionally excluded.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +45,19 @@ EXCLUDED_CHAOS = {
 REPLICAS = 2
 
 
+def json_safe(value: Any) -> Any:
+    """Replace non-finite floats with JSON null, recursively."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    return value
+
+
 def build_training_config(base_config: Dict[str, Any]) -> Dict[str, Any]:
     """Return a private train-only config; leave the default campaign untouched."""
     config = json.loads(json.dumps(base_config))
@@ -67,19 +83,68 @@ def _float(row: Dict[str, Any], field: str) -> Optional[float]:
         return None
 
 
-def _target_row(features: Dict[str, Any], metric_id: str, service: str) -> Optional[Dict[str, Any]]:
+def _target_row(
+    features: Dict[str, Any], metric_id: str, service: str
+) -> Optional[Dict[str, Any]]:
     hotspots = features.get("metric_hotspots") or {}
     entry = hotspots.get(metric_id) or {}
-    for row in entry.get("top") or []:
-        if isinstance(row, dict) and row.get("label") == service:
+    rows = entry.get("top_edges") or entry.get("top") or []
+    for row in rows:
+        if isinstance(row, dict) and (
+            row.get("label") == service or row.get("destination_workload") == service
+        ):
             return row
     return None
+
+
+def _service_impact(features: Dict[str, Any], service: str) -> Dict[str, Any]:
+    error_rate = _target_row(features, "error_rate", service)
+    latency = _target_row(features, "latency_p95", service)
+    traffic = _target_row(features, "traffic", service)
+    error_delta = _float(error_rate or {}, "delta_abs")
+    error_peak = _float(error_rate or {}, "fault_p95")
+    latency_delta = _float(latency or {}, "delta_abs")
+    latency_peak = _float(latency or {}, "fault_p95")
+    traffic_baseline = _float(traffic or {}, "baseline_mean")
+    traffic_fault = _float(traffic or {}, "fault_mean")
+    error_increase = (
+        error_delta is not None
+        and error_peak is not None
+        and error_delta >= 5.0
+        and error_peak >= 5.0
+    )
+    latency_increase = (
+        latency_delta is not None
+        and latency_peak is not None
+        and latency_delta >= 50.0
+        and latency_peak >= 100.0
+    )
+    traffic_drop = (
+        traffic_baseline is not None
+        and traffic_fault is not None
+        and traffic_baseline > 0
+        and traffic_fault <= traffic_baseline * 0.8
+    )
+    return {
+        "observed": error_increase or latency_increase or traffic_drop,
+        "signals": {
+            "error_increase": error_increase,
+            "latency_increase": latency_increase,
+            "traffic_drop": traffic_drop,
+        },
+        "metrics": {
+            "error_rate": error_rate,
+            "latency_p95": latency,
+            "traffic": traffic,
+        },
+    }
 
 
 def validate_metric_effect(
     chaos_type: str, service: str, features: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Require the expected target-labeled signal in the fault window."""
+    """Report target signals, service impact, and whether the mechanism is specific."""
+    impact = _service_impact(features, service)
     if chaos_type == "cpu-hog":
         saturation = _target_row(features, "cpu_saturation_pct", service)
         throttling = _target_row(features, "cpu_throttled", service)
@@ -87,19 +152,29 @@ def validate_metric_effect(
         sat_peak = _float(saturation or {}, "fault_p95")
         throttle_delta = _float(throttling or {}, "delta_abs")
         saturation_observed = (
-            sat_delta is not None and sat_peak is not None
-            and sat_delta >= 10.0 and sat_peak >= 50.0
+            sat_delta is not None
+            and sat_peak is not None
+            and sat_delta >= 10.0
+            and sat_peak >= 50.0
         )
         throttling_observed = throttle_delta is not None and throttle_delta >= 0.01
+        signal_observed = saturation_observed or throttling_observed
         return {
-            "passed": saturation_observed or throttling_observed,
+            "passed": signal_observed,
+            "signal_observed": signal_observed,
+            "mechanism_signal_observed": signal_observed,
+            "mechanism_status": (
+                "cpu_contention_observed" if signal_observed else "not_observed"
+            ),
+            "impact_observed": impact["observed"],
             "metrics": {
                 "cpu_saturation_pct": saturation,
                 "cpu_throttled": throttling,
+                **impact["metrics"],
             },
             "reason": (
-                "target CPU saturation/throttling increased"
-                if saturation_observed or throttling_observed
+                "target CPU saturation/throttling increased; useful application work is not proven"
+                if signal_observed
                 else "no target CPU saturation or throttling increase met threshold"
             ),
         }
@@ -111,57 +186,75 @@ def validate_metric_effect(
         mem_delta = _float(saturation or {}, "delta_abs")
         mem_peak = _float(saturation or {}, "fault_p95")
         oom_delta = _float(oom or {}, "delta_abs")
-        restart_delta = _float(restarts or {}, "delta_abs")
         saturation_observed = (
-            mem_delta is not None and mem_peak is not None
-            and mem_delta >= 10.0 and mem_peak >= 60.0
+            mem_delta is not None
+            and mem_peak is not None
+            and mem_delta >= 10.0
+            and mem_peak >= 60.0
         )
-        termination_observed = (
-            (oom_delta is not None and oom_delta >= 0.4)
-            or (restart_delta is not None and restart_delta >= 1.0)
-        )
+        oom_observed = oom_delta is not None and oom_delta >= 0.4
+        signal_observed = saturation_observed or oom_observed
         return {
-            "passed": saturation_observed or termination_observed,
+            "passed": signal_observed,
+            "signal_observed": signal_observed,
+            "mechanism_signal_observed": signal_observed,
+            "mechanism_status": (
+                "oom_killed_observed"
+                if oom_observed
+                else (
+                    "memory_pressure_observed"
+                    if saturation_observed
+                    else "not_observed"
+                )
+            ),
+            "impact_observed": impact["observed"],
             "metrics": {
                 "memory_saturation_pct": saturation,
                 "oom_killed": oom,
                 "pod_restarts_total": restarts,
+                **impact["metrics"],
             },
             "reason": (
-                "target memory saturation/OOM/restart observed"
-                if saturation_observed or termination_observed
-                else "no target memory saturation, OOM, or restart signal met threshold"
+                "target memory pressure/OOM observed; restart alone is not evidence of exhaustion"
+                if signal_observed
+                else "no target memory pressure or OOM signal met threshold; restart alone is insufficient"
             ),
         }
 
     if chaos_type in {"pod-delete", "container-kill"}:
         restarts = _target_row(features, "pod_restarts_total", service)
         ready = _target_row(features, "pod_ready", service)
-        error_rate = _target_row(features, "error_rate", service)
         restart_delta = _float(restarts or {}, "delta_abs")
         ready_delta = _float(ready or {}, "delta_abs")
         ready_fault_mean = _float(ready or {}, "fault_mean")
-        error_delta = _float(error_rate or {}, "delta_abs")
-        error_peak = _float(error_rate or {}, "fault_p95")
         restart_observed = restart_delta is not None and restart_delta >= 0.2
         readiness_observed = (
-            ready_delta is not None and ready_fault_mean is not None
-            and ready_delta <= -0.25 and ready_fault_mean <= 0.75
+            ready_delta is not None
+            and ready_fault_mean is not None
+            and ready_delta <= -0.25
+            and ready_fault_mean <= 0.75
         )
-        service_impact_observed = (
-            error_delta is not None and error_peak is not None
-            and error_delta >= 5.0 and error_peak >= 5.0
-        )
-        passed = restart_observed or readiness_observed or service_impact_observed
+        signal_observed = restart_observed or readiness_observed or impact["observed"]
         return {
-            "passed": passed,
+            "passed": signal_observed,
+            "signal_observed": signal_observed,
+            "mechanism_signal_observed": False,
+            "mechanism_status": (
+                "lifecycle_or_impact_symptom_only"
+                if signal_observed
+                else "not_observed"
+            ),
+            "impact_observed": impact["observed"],
             "metrics": {
                 "pod_restarts_total": restarts,
                 "pod_ready": ready,
-                "error_rate": error_rate,
+                **impact["metrics"],
             },
-            "reason": "target pod restart/readiness or service error signal observed"
-            if passed else "no target pod or service-impact signal met threshold",
+            "reason": (
+                "target lifecycle/impact signal observed; pod identity or termination reason is needed to distinguish the mechanism"
+                if signal_observed
+                else "no target lifecycle or service-impact signal met threshold"
+            ),
         }
 
     if chaos_type == "network-latency":
@@ -169,60 +262,91 @@ def validate_metric_effect(
         latency_delta = _float(latency or {}, "delta_abs")
         latency_peak = _float(latency or {}, "fault_p95")
         passed = (
-            latency_delta is not None and latency_peak is not None
-            and latency_delta >= 50.0 and latency_peak >= 100.0
+            latency_delta is not None
+            and latency_peak is not None
+            and latency_delta >= 50.0
+            and latency_peak >= 100.0
         )
         return {
             "passed": passed,
-            "metrics": {"latency_p95": latency},
+            "signal_observed": passed,
+            "mechanism_signal_observed": False,
+            "mechanism_status": "service_latency_only" if passed else "not_observed",
+            "impact_observed": passed or impact["observed"],
+            "metrics": {"latency_p95": latency, **impact["metrics"]},
             "reason": "target p95 latency increased"
-            if passed else "target p95 latency increase did not meet threshold",
+            + (
+                "; affected path is not identified"
+                if passed
+                else " did not meet threshold"
+            ),
         }
 
     if chaos_type == "network-loss":
         receive_drops = _target_row(features, "network_receive_dropped_rate", service)
         transmit_drops = _target_row(features, "network_transmit_dropped_rate", service)
-        error_rate = _target_row(features, "error_rate", service)
         drop_deltas = [
             _float(receive_drops or {}, "delta_abs"),
             _float(transmit_drops or {}, "delta_abs"),
         ]
-        error_delta = _float(error_rate or {}, "delta_abs")
-        error_peak = _float(error_rate or {}, "fault_p95")
-        drops_observed = any(delta is not None and delta >= 0.1 for delta in drop_deltas)
-        errors_observed = (
-            error_delta is not None and error_peak is not None
-            and error_delta >= 5.0 and error_peak >= 5.0
+        drops_observed = any(
+            delta is not None and delta >= 0.1 for delta in drop_deltas
         )
         return {
-            "passed": drops_observed or errors_observed,
+            "passed": drops_observed,
+            "signal_observed": drops_observed,
+            "mechanism_signal_observed": False,
+            "mechanism_status": (
+                "interface_drop_signal_ambiguous" if drops_observed else "not_observed"
+            ),
+            "impact_observed": impact["observed"],
             "metrics": {
                 "network_receive_dropped_rate": receive_drops,
                 "network_transmit_dropped_rate": transmit_drops,
-                "error_rate": error_rate,
+                **impact["metrics"],
             },
-            "reason": "target packet drops or service errors increased"
-            if drops_observed or errors_observed
-            else "no target packet-drop or service-error signal met threshold",
+            "reason": (
+                "interface drop counter increased; netem rule, direction and path remain unverified"
+                if drops_observed
+                else "no target interface drop signal met threshold; 5xx alone does not prove packet loss"
+            ),
         }
 
     if chaos_type == "http-status-code":
-        error_rate = _target_row(features, "error_rate", service)
-        error_delta = _float(error_rate or {}, "delta_abs")
-        error_peak = _float(error_rate or {}, "fault_p95")
+        edge = _target_row(features, "http_5xx_by_edge", service)
+        error_delta = _float(edge or {}, "delta_abs")
+        error_peak = _float(edge or {}, "fault_p95")
         passed = (
-            error_delta is not None and error_peak is not None
-            and error_delta >= 15.0 and error_peak >= 20.0
+            error_delta is not None
+            and error_peak is not None
+            and error_delta >= 0.01
+            and error_peak >= 0.01
+            and edge.get("source_workload") not in (None, "", "unknown")
         )
         return {
             "passed": passed,
-            "metrics": {"error_rate": error_rate},
-            "reason": "target HTTP error rate increased"
-            if passed else "target HTTP error rate increase did not meet threshold",
+            "signal_observed": passed,
+            "mechanism_signal_observed": passed,
+            "mechanism_status": (
+                "client_reported_5xx_on_target_edge"
+                if passed
+                else "target_http_edge_not_observed"
+            ),
+            "impact_observed": passed or impact["observed"],
+            "metrics": {"http_5xx_by_edge": edge, **impact["metrics"]},
+            "reason": (
+                "5xx observed by the caller on an identified edge to the target"
+                if passed
+                else "no caller-reported target-edge 5xx met threshold; destination aggregate alone is insufficient"
+            ),
         }
 
     return {
         "passed": False,
+        "signal_observed": False,
+        "mechanism_signal_observed": False,
+        "mechanism_status": "unsupported_chaos_type",
+        "impact_observed": False,
         "metrics": {},
         "reason": f"unsupported chaos type: {chaos_type}",
     }
@@ -236,7 +360,7 @@ def validate_runs(
     replicas: int = REPLICAS,
     phase: str = "train",
 ) -> List[Dict[str, Any]]:
-    """Validate count, Litmus verdict, and target metric evidence for each row."""
+    """Validate run count and report injection, target signal, and causal limits."""
     cells = TARGET_CELLS if cells is None else cells
     if not runs_csv.exists():
         return [{"passed": False, "reason": f"runs file not found: {runs_csv}"}]
@@ -322,7 +446,21 @@ def validate_runs(
             }
         metric_check = validate_metric_effect(chaos_type, service, features)
         report["checks"]["metrics"] = metric_check
-        report["passed"] = bool(report["checks"]["injection"]["passed"] and metric_check["passed"])
+        if not report["checks"]["injection"]["passed"]:
+            report["result_status"] = "injection_failed"
+        elif not metric_check["signal_observed"]:
+            report["result_status"] = (
+                "impact_observed_without_target_signal"
+                if metric_check["impact_observed"]
+                else "target_signal_not_observed"
+            )
+        elif not metric_check["mechanism_signal_observed"]:
+            report["result_status"] = "target_signal_without_mechanism_signal"
+        else:
+            report["result_status"] = "target_signal_with_mechanism_signal"
+        report["passed"] = bool(
+            report["checks"]["injection"]["passed"] and metric_check["passed"]
+        )
         reports.append(report)
     return reports
 

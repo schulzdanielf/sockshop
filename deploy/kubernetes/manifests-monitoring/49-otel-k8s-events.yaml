@@ -1,0 +1,119 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-k8s-events
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: otel-k8s-events-reader
+  namespace: sock-shop
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: otel-k8s-events-reader
+  namespace: sock-shop
+subjects:
+  - kind: ServiceAccount
+    name: otel-k8s-events
+    namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: otel-k8s-events-reader
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-k8s-events-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    receivers:
+      k8s_events:
+        auth_type: serviceAccount
+        namespaces: [sock-shop]
+    processors:
+      attributes/event_metadata:
+        actions:
+          - action: insert
+            key: log_source
+            value: otel_k8s_events
+          - action: insert
+            key: namespace
+            value: sock-shop
+          - action: insert
+            key: service
+            value: kubernetes
+      batch: {}
+    exporters:
+      otlp:
+        endpoint: otel-collector.monitoring.svc.cluster.local:4317
+        tls:
+          insecure: true
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    service:
+      extensions: [health_check]
+      pipelines:
+        logs:
+          receivers: [k8s_events]
+          processors: [attributes/event_metadata, batch]
+          exporters: [otlp]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-k8s-events
+  namespace: monitoring
+  labels:
+    app: otel-k8s-events
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-k8s-events
+  template:
+    metadata:
+      labels:
+        app: otel-k8s-events
+    spec:
+      serviceAccountName: otel-k8s-events
+      containers:
+        - name: otel-k8s-events
+          image: otel/opentelemetry-collector-contrib:0.104.0
+          args:
+            - --config=/etc/otel-k8s-events/config.yaml
+          ports:
+            - name: health
+              containerPort: 13133
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel-k8s-events
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: otel-k8s-events-config

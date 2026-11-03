@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-history
+  namespace: monitoring-history
+  labels:
+    app: prometheus-history
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus-history
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090

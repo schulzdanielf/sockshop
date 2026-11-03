@@ -54,6 +54,75 @@ def test_observation_window_rejects_missing_global_bounds():
         raise AssertionError("missing window end must be rejected")
 
 
+def test_observation_window_preserves_controlled_campaign_phases_and_sources():
+    controlled = {
+        "timezone": "UTC",
+        "sampling_interval_seconds": 5,
+        "window": {
+            "start": "2026-10-18T12:31:05+00:00",
+            "end": "2026-10-18T12:39:18+00:00",
+        },
+        "phases": {
+            "warmup": {"start": "2026-10-18T12:31:05+00:00", "end": "2026-10-18T12:32:54+00:00"},
+            "baseline": {"start": "2026-10-18T12:32:54+00:00", "end": "2026-10-18T12:34:38+00:00"},
+            "fault": {"start": "2026-10-18T12:34:41+00:00", "end": "2026-10-18T12:36:58+00:00"},
+            "post": {"start": "2026-10-18T12:36:58+00:00", "end": "2026-10-18T12:39:18+00:00"},
+        },
+        "phase_sources": {
+            "baseline": "after_load_stabilization",
+            "fault": "virtualservice_api_bracket_estimated",
+        },
+    }
+    result = _build_observation_window(
+        run_id="run-controlled",
+        experiment_id="controlled-experiment",
+        status="completed",
+        timings={"controlled_observation_window": controlled},
+        sampling_interval_seconds=5,
+    )
+
+    assert result["window"] == controlled["window"]
+    assert result["phases"] == controlled["phases"]
+    assert result["phase_sources"] == controlled["phase_sources"]
+    assert result["sampling_interval_seconds"] == 5
+
+
+def test_observation_window_reconstructs_legacy_controlled_run_timings():
+    timings = {
+        "warmup_started": {"at": "2026-10-18T12:31:05+00:00"},
+        "warmup_completed": {"at": "2026-10-18T12:32:54+00:00"},
+        "baseline_started": {"at": "2026-10-18T12:32:54+00:00"},
+        "baseline_completed": {"at": "2026-10-18T12:34:38+00:00"},
+        "intervention_removed": {"at": "2026-10-18T12:36:58+00:00"},
+        "recovery_observed": {"at": "2026-10-18T12:39:18+00:00"},
+        "intervention_estimate": {
+            "start": "2026-10-18T12:34:41+00:00",
+            "end": "2026-10-18T12:36:58+00:00",
+            "source": "virtualservice_api_bracket",
+            "duration_verified": False,
+        },
+    }
+
+    result = _build_observation_window(
+        run_id="run-old-controlled",
+        experiment_id="controlled-experiment",
+        status="completed",
+        timings=timings,
+        sampling_interval_seconds=0,
+    )
+
+    assert result["window"] == {
+        "start": timings["warmup_started"]["at"],
+        "end": timings["recovery_observed"]["at"],
+    }
+    assert result["phases"]["fault"] == {
+        "start": timings["intervention_estimate"]["start"],
+        "end": timings["intervention_estimate"]["end"],
+    }
+    assert result["phase_sources"]["fault"] == "virtualservice_api_bracket"
+    assert result["sampling_interval_seconds"] == 5
+
+
 def test_fault_window_uses_litmus_injection_start_and_configured_duration():
     result = _resolve_fault_window(
         "2026-09-25T10:02:00+00:00",

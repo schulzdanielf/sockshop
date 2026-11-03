@@ -112,6 +112,20 @@ class RcaEvidenceSnapshotPort(Protocol):
         ...
 
 
+class HistoryMigrationPort(Protocol):
+    def dispatch(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        status: str,
+        namespace: str,
+        observation_window: Dict[str, Any],
+        log_snapshot: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        ...
+
+
 class StoragePort(Protocol):
     def create_experiment(
         self, created_by: str, spec: Dict[str, Any]

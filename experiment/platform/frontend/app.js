@@ -809,6 +809,152 @@ async function reRun(experimentId) {
   }
 }
 
+let knowledgeCorpora = [];
+let knowledgePairs = [];
+
+function renderKnowledgePair() {
+  const pairId = document.getElementById('knowledgePairSelect').value;
+  const pair = knowledgePairs.find((item) => item.pair_id === pairId);
+  const meta = document.getElementById('knowledgePairMeta');
+  if (!pair) {
+    meta.textContent = '';
+    document.getElementById('knowledgeA').textContent = 'Selecione um par A/B.';
+    document.getElementById('knowledgeB').textContent = 'Selecione um par A/B.';
+    return;
+  }
+
+  const labels = pair.labels ? JSON.stringify(pair.labels) : 'não disponíveis';
+  meta.textContent = [
+    `Par: ${pair.pair_id}`,
+    `Run de origem: ${pair.source_run_id}`,
+    `Guia: ${pair.guide_status || 'não informado'}`,
+    `Causalidade: ${pair.causal_status || 'não informada'}`,
+    `Efeito experimental validado: ${pair.effect_validated === true ? 'sim' : pair.effect_validated === false ? 'não' : 'não informado'}`,
+    `Rótulos da avaliação: ${labels}`
+  ].join(' · ');
+  document.getElementById('knowledgeA').textContent = JSON.stringify(pair.a, null, 2);
+  document.getElementById('knowledgeB').textContent = JSON.stringify(pair.b, null, 2);
+}
+
+function renderKnowledgePairs(preferredPairId = '') {
+  const select = document.getElementById('knowledgePairSelect');
+  const filter = document.getElementById('knowledgePairFilter').value.trim().toLowerCase();
+  const visiblePairs = knowledgePairs.filter((pair) => {
+    const searchable = [
+      pair.pair_id,
+      pair.source_run_id,
+      pair.labels?.service,
+      pair.labels?.fault_type
+    ].filter(Boolean).join(' ').toLowerCase();
+    return searchable.includes(filter);
+  });
+
+  select.replaceChildren();
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = visiblePairs.length
+    ? 'Selecione um par A/B'
+    : 'Nenhum par corresponde ao filtro';
+  select.appendChild(placeholder);
+  visiblePairs.forEach((pair) => {
+    const option = document.createElement('option');
+    option.value = pair.pair_id;
+    option.textContent = `${pair.source_run_id} · ${pair.effect_validated === true ? 'efeito validado' : 'efeito não validado'}`;
+    select.appendChild(option);
+  });
+
+  const nextPairId = visiblePairs.some((pair) => pair.pair_id === preferredPairId)
+    ? preferredPairId
+    : visiblePairs[0]?.pair_id || '';
+  select.value = nextPairId;
+  select.disabled = visiblePairs.length === 0;
+  renderKnowledgePair();
+}
+
+async function loadKnowledgePairs(corpusId) {
+  knowledgePairs = [];
+  renderKnowledgePairs();
+  if (!corpusId) return;
+
+  const result = await api(`/api/skill-rag/${encodeURIComponent(corpusId)}/pairs`);
+  knowledgePairs = result.pairs || [];
+  const effectValidatedCount = knowledgePairs.filter(
+    (pair) => pair.effect_validated === true
+  ).length;
+  document.getElementById('knowledgeCorpusMeta').textContent = [
+    `Corpus ${result.corpus_id}`,
+    `modo ${result.mode}`,
+    `${result.pair_count} pares`,
+    `${effectValidatedCount} com efeito validado`,
+    `SHA-256 ${result.sha256}`
+  ].join(' · ');
+  document.getElementById('knowledgePairFilter').disabled = false;
+  renderKnowledgePairs();
+  document.getElementById('knowledgeStatus').textContent = knowledgePairs.length
+    ? `${knowledgePairs.length} pares A/B carregados.`
+    : 'Este corpus não contém pares.';
+}
+
+async function loadKnowledgeCorpora() {
+  const status = document.getElementById('knowledgeStatus');
+  const corpusSelect = document.getElementById('knowledgeCorpusSelect');
+  const previousCorpusId = corpusSelect.value;
+  status.textContent = 'Carregando corpora congelados…';
+  try {
+    knowledgeCorpora = await api('/api/skill-rag/corpora');
+    corpusSelect.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = knowledgeCorpora.length
+      ? 'Selecione um corpus'
+      : 'Nenhum corpus congelado encontrado';
+    corpusSelect.appendChild(placeholder);
+    knowledgeCorpora.forEach((corpus) => {
+      const option = document.createElement('option');
+      option.value = corpus.corpus_id;
+      option.textContent = `${corpus.corpus_id} · ${corpus.pair_count} pares · ${corpus.mode}`;
+      corpusSelect.appendChild(option);
+    });
+
+    const selectedCorpusId = knowledgeCorpora.some(
+      (item) => item.corpus_id === previousCorpusId
+    )
+      ? previousCorpusId
+      : '';
+    corpusSelect.value = selectedCorpusId;
+    document.getElementById('knowledgePairFilter').value = '';
+    document.getElementById('knowledgePairFilter').disabled = !selectedCorpusId;
+    document.getElementById('knowledgeCorpusMeta').textContent = '';
+    if (!selectedCorpusId) {
+      knowledgePairs = [];
+      renderKnowledgePairs();
+      status.textContent = knowledgeCorpora.length
+        ? 'Selecione o corpus do experimento para consultar os pares.'
+        : 'Nenhuma base congelada está disponível neste armazenamento.';
+      return;
+    }
+    await loadKnowledgePairs(selectedCorpusId);
+  } catch (err) {
+    status.textContent = `Erro ao consultar a base RAG: ${err.message}`;
+  }
+}
+
+document.getElementById('refreshKnowledgeBtn').addEventListener('click', loadKnowledgeCorpora);
+document.getElementById('knowledgeCorpusSelect').addEventListener('change', async (event) => {
+  document.getElementById('knowledgePairFilter').value = '';
+  document.getElementById('knowledgePairFilter').disabled = !event.target.value;
+  document.getElementById('knowledgeCorpusMeta').textContent = '';
+  try {
+    await loadKnowledgePairs(event.target.value);
+  } catch (err) {
+    document.getElementById('knowledgeStatus').textContent = `Erro ao consultar os pares: ${err.message}`;
+  }
+});
+document.getElementById('knowledgePairFilter').addEventListener('input', () => {
+  renderKnowledgePairs(document.getElementById('knowledgePairSelect').value);
+});
+document.getElementById('knowledgePairSelect').addEventListener('change', renderKnowledgePair);
+
 function openRun(runId) {
   currentRunId = runId;
   document.getElementById('runIdInput').value = runId;
@@ -817,4 +963,5 @@ function openRun(runId) {
 }
 
 loadHistory();
+loadKnowledgeCorpora();
 showStep(1);

@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY experiment/platform/tools/requirements-history.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY experiment/platform/tools/migrate_observability_history.py /app/migrate_observability_history.py
+COPY experiment/platform/tools/bootstrap_history_store.py /app/bootstrap_history_store.py
+USER 10001:10001
+ENTRYPOINT ["python", "/app/migrate_observability_history.py"]

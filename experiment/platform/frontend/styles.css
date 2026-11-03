@@ -52,6 +52,10 @@ body {
   grid-column: 1 / -1;
 }
 
+.panel.knowledge-browser {
+  grid-column: 1 / -1;
+}
+
 .panel.telemetry-chat {
   grid-column: 1 / -1;
   background: #172b2a;
@@ -236,6 +240,84 @@ button:hover {
   max-width: 620px;
 }
 
+.knowledge-header,
+.knowledge-toolbar {
+  display: flex;
+  align-items: end;
+  gap: 0.8rem;
+}
+
+.knowledge-header {
+  justify-content: space-between;
+  align-items: start;
+  margin-bottom: 0.9rem;
+}
+
+.knowledge-header h2 {
+  margin: 0.15rem 0 0.35rem;
+}
+
+.knowledge-copy,
+.knowledge-document p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.knowledge-copy {
+  max-width: 760px;
+}
+
+.knowledge-toolbar {
+  align-items: start;
+}
+
+.knowledge-toolbar label {
+  flex: 1;
+  min-width: 0;
+}
+
+.knowledge-header .btn-sm {
+  width: auto;
+  flex-shrink: 0;
+}
+
+.knowledge-status,
+.knowledge-corpus-meta,
+.knowledge-pair-meta {
+  margin: 0.7rem 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-pair-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.knowledge-document {
+  min-width: 0;
+  padding: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fffdf8;
+}
+
+.knowledge-document h3 {
+  margin: 0 0 0.25rem;
+}
+
+.knowledge-json {
+  margin: 0.7rem 0 0;
+  max-height: 480px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.76rem;
+}
+
 .window-badge {
   border: 1px solid #4a8178;
   color: #b8e8dc;
@@ -410,6 +492,16 @@ button:hover {
 
   .window-badge {
     white-space: normal;
+  }
+
+  .knowledge-header,
+  .knowledge-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .knowledge-pair-grid {
+    grid-template-columns: 1fr;
   }
 }
 

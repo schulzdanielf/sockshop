@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run medium controlled RCA campaign",
+			"type": "shell",
+			"command": "make",
+			"args": [
+				"experiment-multiagent-rca-evaluation",
+				"EXPERIMENT_LEVEL=medium",
+				"RUN_ARGS=--run --calibration experiment/eval/memory_hog/cpu-calibration.yaml"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

@@ -27,6 +27,7 @@ from .analysis import (
 from .domain import DomainEvent, ExperimentVersion, RunRecord, RunStatus, utc_now_iso
 from .ports import (
     ChaosProviderPort,
+    HistoryMigrationPort,
     LoadProviderPort,
     MetricsProviderPort,
     NotificationPort,
@@ -104,6 +105,64 @@ def _build_observation_window(
     sampling_interval_seconds: int,
 ) -> Dict[str, Any]:
     """Build the compact, authoritative time contract for a completed run."""
+    controlled = timings.get("controlled_observation_window")
+    if controlled is None:
+        def timestamp(name: str) -> str | None:
+            marker = timings.get(name)
+            return marker.get("at") if isinstance(marker, dict) else None
+
+        window_start = timestamp("warmup_started")
+        window_end = timestamp("recovery_observed")
+        estimate = timings.get("intervention_estimate")
+        if window_start and window_end and isinstance(estimate, dict):
+            phase_bounds = {
+                "warmup": (window_start, timestamp("warmup_completed")),
+                "baseline": (timestamp("baseline_started"), timestamp("baseline_completed")),
+                "fault": (estimate.get("start"), estimate.get("end")),
+                "post": (timestamp("intervention_removed"), window_end),
+            }
+            controlled = {
+                "timezone": "UTC",
+                "sampling_interval_seconds": sampling_interval_seconds or 5,
+                "window": {"start": window_start, "end": window_end},
+                "phases": {
+                    name: {"start": start, "end": end}
+                    for name, (start, end) in phase_bounds.items()
+                    if isinstance(start, str) and isinstance(end, str)
+                },
+                "phase_sources": {
+                    "baseline": "after_load_stabilization",
+                    "fault": estimate.get("source", "unknown"),
+                },
+            }
+    if controlled is not None:
+        if not isinstance(controlled, dict):
+            raise ValueError("controlled observation window must be an object")
+        window = controlled.get("window")
+        phases = controlled.get("phases")
+        phase_sources = controlled.get("phase_sources")
+        if (
+            not isinstance(window, dict)
+            or not all(isinstance(window.get(key), str) and window[key] for key in ("start", "end"))
+            or not isinstance(phases, dict)
+            or not isinstance(phase_sources, dict)
+        ):
+            raise ValueError("controlled observation window requires valid bounds, phases, and sources")
+        return {
+            "schema_version": "1",
+            "run_id": run_id,
+            "experiment_id": experiment_id,
+            "status": status,
+            "timezone": controlled.get("timezone", "UTC"),
+            "window": window,
+            "phases": phases,
+            "phase_sources": phase_sources,
+            "sampling_interval_seconds": (
+                sampling_interval_seconds
+                or int(controlled.get("sampling_interval_seconds", 0) or 0)
+            ),
+        }
+
     phase_keys = {
         "baseline": ("t_start", "t_warmup_start"),
         "warmup": ("t_warmup_start", "t_warmup_end"),
@@ -187,6 +246,7 @@ class OrchestratorEngine:
         notifier: NotificationPort,
         kill_switch_path: Optional[Path] = None,
         evidence_snapshot: Optional[RcaEvidenceSnapshotPort] = None,
+        history_migration: Optional[HistoryMigrationPort] = None,
     ):
         self.storage = storage
         self.chaos = chaos
@@ -196,6 +256,7 @@ class OrchestratorEngine:
         self.notifier = notifier
         self.kill_switch_path = kill_switch_path
         self.evidence_snapshot = evidence_snapshot
+        self.history_migration = history_migration
 
         self._stop_flags: Dict[str, threading.Event] = {}
         self._runtime_handles: Dict[str, Dict[str, Any]] = {}
@@ -227,7 +288,10 @@ class OrchestratorEngine:
         # Stash on summary so it survives across the run lifecycle without
         # adding a new column to the runs table.
         run.summary["is_training"] = bool(is_training)
+        requested_run_id = run.run_id
         run = self.storage.create_run(run, idempotency_key=idempotency_key)
+        if run.run_id != requested_run_id:
+            return run
 
         self._event(
             run.run_id,
@@ -386,6 +450,11 @@ class OrchestratorEngine:
         stop_flag = self._stop_flags[run_id]
 
         try:
+            if exp.spec.get("controlled_campaign", {}).get("enabled") is True:
+                from .controlled_experiment import ControlledRun
+
+                ControlledRun(self, run_id, exp.spec).run()
+                return
             load_cfg = dict(exp.spec.get("load_profile", {}))
             chaos_cfg = dict(exp.spec.get("chaos_profile", {}))
             obs = exp.spec.get("observability", {})
@@ -819,14 +888,20 @@ class OrchestratorEngine:
             run.ended_at = utc_now_iso()
             run.summary["error"] = str(exc)
             try:
-                window = _build_partial_observation_window(
-                    run_id=run_id,
-                    experiment_id=exp.experiment_id,
-                    status=run.status.value,
-                    events=self.storage.list_events(run_id),
-                    ended_at=run.ended_at,
-                    sampling_interval_seconds=step,
-                )
+                if (
+                    exp.spec.get("controlled_campaign", {}).get("enabled") is True
+                    and run.summary.get("artifact_paths", {}).get("observation_window")
+                ):
+                    window = self.storage.get_artifact(run_id, "observation_window")
+                else:
+                    window = _build_partial_observation_window(
+                        run_id=run_id,
+                        experiment_id=exp.experiment_id,
+                        status=run.status.value,
+                        events=self.storage.list_events(run_id),
+                        ended_at=run.ended_at,
+                        sampling_interval_seconds=step,
+                    )
                 run.summary.setdefault("artifact_paths", {})[
                     "observation_window"
                 ] = self.storage.save_artifact(
@@ -846,8 +921,96 @@ class OrchestratorEngine:
             )
             self.notifier.notify("run_failed", {"run_id": run_id, "error": str(exc)})
         finally:
-            self._runtime_handles.pop(run_id, None)
-            self._stop_flags.pop(run_id, None)
+            try:
+                self._dispatch_history_migration(run_id, exp)
+            finally:
+                self._runtime_handles.pop(run_id, None)
+                self._stop_flags.pop(run_id, None)
+
+    def _dispatch_history_migration(
+        self, run_id: str, experiment: ExperimentVersion
+    ) -> None:
+        historical = experiment.spec.get("historical_observability") or {}
+        dual_write = historical.get("mode") == "dual_write"
+        if self.history_migration is None and not dual_write:
+            return
+        try:
+            run = self.storage.get_run(run_id)
+            observation_window = self.storage.get_artifact(
+                run_id, "observation_window"
+            )
+            if not isinstance(observation_window, dict):
+                observation_window = {}
+            log_snapshot = self.storage.get_artifact(
+                run_id, "rca_evidence_snapshot"
+            )
+            if not isinstance(log_snapshot, dict):
+                log_snapshot = None
+        except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+            self._event(
+                run_id,
+                "history_migration_input_failed",
+                {"error_type": type(exc).__name__, "error": str(exc)[:500]},
+            )
+            return
+        namespace = str(
+            (experiment.spec.get("scope") or {}).get("namespace", "sock-shop")
+        )
+        if dual_write:
+            result = {
+                "status": "dual_write",
+                "campaign_id": historical.get("campaign_id", experiment.experiment_id),
+                "mode": "collector_fanout",
+            }
+        else:
+            try:
+                if self.history_migration is None:
+                    return
+                result = self.history_migration.dispatch(
+                    run_id=run_id,
+                    experiment_id=experiment.experiment_id,
+                    status=run.status.value,
+                    namespace=namespace,
+                    observation_window=observation_window,
+                    log_snapshot=log_snapshot,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                result = {
+                    "status": "dispatch_failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+        if result.get("status") == "disabled":
+            return
+        try:
+            artifact_path = self.storage.save_artifact(
+                run_id, "history_migration", result
+            )
+            run = self.storage.get_run(run_id)
+            run.summary.setdefault("artifact_paths", {})[
+                "history_migration"
+            ] = artifact_path
+            run.summary["history_migration"] = result
+            self.storage.update_run(run)
+            self._event(
+                run_id,
+                (
+                    "history_dual_write_recorded"
+                    if dual_write
+                    else "history_migration_dispatched"
+                ),
+                {
+                    "status": result.get("status"),
+                    "job_name": result.get("job_name"),
+                    "error_type": result.get("error_type"),
+                },
+            )
+        except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+            self._event(
+                run_id,
+                "history_migration_result_persist_failed",
+                {"error_type": type(exc).__name__, "error": str(exc)[:500]},
+            )
 
     def _sleep_interruptible(self, stop_flag: threading.Event, seconds: int) -> None:
         end = time.time() + seconds

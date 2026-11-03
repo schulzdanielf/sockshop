@@ -53,6 +53,16 @@ def _observation_window():
     }
 
 
+def test_post_stabilization_baseline_is_preserved_in_rca_and_snapshot():
+    window = _observation_window()
+    window["phase_sources"] = {"baseline": "after_load_stabilization"}
+    expected = window["phases"]["baseline"]
+    phases, source = rca_reference_phases(window["phases"], baseline_source="after_load_stabilization")
+    selected, snapshot_source = snapshot_module._reference_windows(window)
+    assert phases["baseline"] == selected["baseline"] == expected
+    assert source == snapshot_source == "after_load_stabilization"
+
+
 def test_snapshot_plugin_uses_card_services_and_rca_reference_windows(monkeypatch):
     monkeypatch.setattr(
         snapshot_module,

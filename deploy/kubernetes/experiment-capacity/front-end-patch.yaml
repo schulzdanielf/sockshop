@@ -1,0 +1,10 @@
+spec:
+  template:
+    spec:
+      containers:
+      - name: front-end
+        resources:
+          requests:
+            cpu: 500m
+          limits:
+            cpu: "1"

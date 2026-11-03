@@ -9,6 +9,11 @@
 | 5xx | Erro local, abort Envoy, dependencia, regra de negocio | Log do chamador e destino, span CLIENT/SERVER, resposta/flags do proxy |
 | Latencia/perda | Rede, DNS, recurso, dependencia | RTT/timeouts/retransmissao, UnknownHostException, spans e logs correlacionados |
 
+Traces sem spans de erro ainda podem indicar regressao: compare duracao fault
+com o P95 baseline da mesma operacao. Use-os para aprofundamento quando nao
+houver trace de erro, mas nao atribua causa apenas por duracao ou por delta
+agregado do grafo.
+
 Para cada restart observado:
 
 1. Identifique o servico e, quando disponivel, pod/container e intervalo entre

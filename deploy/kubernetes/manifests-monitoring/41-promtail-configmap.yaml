@@ -33,3 +33,6 @@ data:
               pod:
               namespace:
               container:
+          - match:
+              selector: '{namespace="sock-shop"}'
+              action: drop

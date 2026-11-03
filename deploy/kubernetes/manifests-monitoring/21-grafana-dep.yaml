@@ -48,6 +48,13 @@ spec:
           mountPath: /var/lib/grafana
         - name: grafana-datasources
           mountPath: /etc/grafana/provisioning/datasources
+        - name: otel-pipeline-dashboard
+          mountPath: /etc/grafana/provisioning/dashboards/otel-pipeline.yaml
+          subPath: provider.yaml
+          readOnly: true
+        - name: otel-pipeline-dashboard
+          mountPath: /var/lib/grafana/dashboards/otel
+          readOnly: true
       volumes:
       - name: grafana-persistent-storage
         persistentVolumeClaim:
@@ -55,5 +62,8 @@ spec:
       - name: grafana-datasources
         configMap:
           name: grafana-datasources
+      - name: otel-pipeline-dashboard
+        configMap:
+          name: otel-pipeline-dashboard
       nodeSelector:
         beta.kubernetes.io/os: linux

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: history-observability-mcp
+  namespace: monitoring-history
+  labels:
+    app: history-observability-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: history-observability-mcp
+  template:
+    metadata:
+      labels:
+        app: history-observability-mcp
+    spec:
+      containers:
+        - name: observability-mcp
+          image: microservices-demo/mcp-observability-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: history-observability-mcp-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+      nodeSelector:
+        kubernetes.io/os: linux

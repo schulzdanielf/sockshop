@@ -55,8 +55,8 @@ data:
       # Limites mais conservadores para reduzir picos de uso de memoria.
       ingestion_rate_mb: 4
       ingestion_burst_size_mb: 8
-      per_stream_rate_limit: 2MB
-      per_stream_rate_limit_burst: 4MB
+      per_stream_rate_limit: 4MB
+      per_stream_rate_limit_burst: 8MB
       max_query_parallelism: 2
       max_entries_limit_per_query: 2000
 

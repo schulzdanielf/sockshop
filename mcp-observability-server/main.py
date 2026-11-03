@@ -1,7 +1,7 @@
 """MCP Server for observability - Prometheus, Loki, Metrics and KPIs."""
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from config import settings
 from fastmcp import FastMCP
@@ -18,7 +18,11 @@ from log_investigator import capture_run_log_snapshot as _inv_capture_run_log_sn
 from log_investigator import check_service_logs as _inv_check_service_logs
 from loki_client import LokiClient
 from prometheus_client import PrometheusClient
-from service_graph import diff_graph_summaries, summarize_trace_graph
+from service_graph import (
+    diff_graph_summaries,
+    select_slow_trace_candidates,
+    summarize_trace_graph,
+)
 from tempo_client import TempoClient
 from trace_analyzer import extract_features
 from trace_summarizer import summarize_trace
@@ -132,6 +136,14 @@ def prometheus_range_query(
         init_clients()
     result = prometheus.query_range(query, start, end, step)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def prometheus_scrape_targets() -> str:
+    """Read active scrape targets from the same backend used by metric queries."""
+    if not prometheus:
+        init_clients()
+    return json.dumps(prometheus.get_scrape_targets(), indent=2)
 
 
 @mcp.tool()
@@ -677,6 +689,10 @@ def tempo_service_graph_phases(
     fault["failure_signatures"], fault["omitted_failure_signature_count"] = (
         _trace_failure_evidence(fault_raw.get("traces") or [])
     )
+    fault["latency_candidates"] = select_slow_trace_candidates(
+        baseline_raw.get("traces") or [],
+        fault_raw.get("traces") or [],
+    )
     post = None
     if post_start and post_end:
         post_raw = _tempo_analyzed_traces(
@@ -936,7 +952,7 @@ def check_oom_kills(
     namespace: str = "sock-shop",
     step: str = "15s",
 ) -> str:
-    """Return services with OOMKilled containers within ``[start, end]``.
+    """Return observed OOM reason state and rising transitions in the window.
 
     Args:
         start: ISO timestamp (inclusive) of the investigation window start.
@@ -948,9 +964,9 @@ def check_oom_kills(
         JSON object with keys ``found`` (bool), ``count`` (int),
         ``top`` (list of {service, transitioned_in_window, delta,
         max_in_window, pods}), ``query``, ``window``.
-        ``transitioned_in_window=True`` means the OOMKilled gauge went
-        from 0 to 1 inside the window (i.e. the OOM happened *during*
-        this run, not before).
+        ``transitioned_in_window=True`` means sampled OOM reason state
+        rose from 0 to 1. It does not establish an exact termination time.
+        Initially high state and missing data cannot date or exclude an OOM.
     """
     if not prometheus:
         init_clients()
@@ -970,23 +986,27 @@ def check_pod_restarts(
     end: str,
     namespace: str = "sock-shop",
     step: str = "15s",
+    history_pad: str = "1m",
 ) -> str:
-    """Return services that experienced pod restarts within ``[start, end]``.
+    """Return restart counter increments observed across ``[start, end]``.
 
-    Computed as ``max(counter) - min(counter)`` on a range-query
-    bounded by the window — so an experiment of 6 minutes returns
-    restarts in those 6 minutes regardless of any earlier OOMs.
+    Raw historical samples are padded around the requested window to capture
+    surrounding scrapes, without query_range evaluation lookback. An increment is attributed when its interval
+    between scrapes overlaps the window; exact event time is uncertain at
+    scrape resolution. Insufficient bracketing coverage is reported as
+    ``partial``, not as no restarts.
 
     Args:
         start: ISO timestamp (inclusive) of the investigation window start.
         end: ISO timestamp (inclusive) of the investigation window end.
         namespace: Kubernetes namespace to inspect.
-        step: Range-query resolution (default 15s).
+        step: Legacy query resolution and minimum padding (default 15s).
+        history_pad: Bounded history on each side (default 1m); increase when
+            the historical scrape interval is longer. Not event-time precision.
 
     Returns:
-        JSON object with keys ``found`` (bool), ``count`` (int),
-        ``top`` (list of {service, restarts_in_window, pods}),
-        ``query``, ``window``.
+        JSON object with keys ``status``, ``found``, ``count``, ``top``,
+        ``query``, ``window``, ``query_window`` and ``coverage``.
     """
     if not prometheus:
         init_clients()
@@ -996,6 +1016,7 @@ def check_pod_restarts(
         end=end,
         namespace=namespace,
         step=step,
+        history_pad=history_pad,
     )
     return json.dumps(result, indent=2)
 
@@ -1035,6 +1056,7 @@ def get_cpu_saturation_top(
     namespace: str = "sock-shop",
     step: str = "15s",
     k: int = 3,
+    service: Optional[str] = None,
 ) -> str:
     """Top-K services by CPU saturation (% of limit) within the window.
 
@@ -1050,6 +1072,7 @@ def get_cpu_saturation_top(
         namespace: Kubernetes namespace to inspect.
         step: Range-query resolution (default 15s).
         k: Number of top services to return (default 3).
+        service: Optional service name to restrict the Prometheus query.
     """
     if not prometheus:
         init_clients()
@@ -1060,6 +1083,7 @@ def get_cpu_saturation_top(
         namespace=namespace,
         step=step,
         k=k,
+        service=service,
     )
     return json.dumps(result, indent=2)
 
@@ -1071,6 +1095,7 @@ def get_memory_saturation_top(
     namespace: str = "sock-shop",
     step: str = "15s",
     k: int = 3,
+    service: Optional[str] = None,
 ) -> str:
     """Top-K services by memory saturation (% of limit) within the window.
 
@@ -1084,6 +1109,7 @@ def get_memory_saturation_top(
         namespace: Kubernetes namespace to inspect.
         step: Range-query resolution (default 15s).
         k: Number of top services to return (default 3).
+        service: Optional service name to restrict the Prometheus query.
     """
     if not prometheus:
         init_clients()
@@ -1094,6 +1120,7 @@ def get_memory_saturation_top(
         namespace=namespace,
         step=step,
         k=k,
+        service=service,
     )
     return json.dumps(result, indent=2)
 

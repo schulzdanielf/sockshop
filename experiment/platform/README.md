@@ -10,6 +10,39 @@ This module implements a product-oriented chaos engineering platform with:
 
 ## Architecture
 
+### Skill RCA knowledge extension
+
+The original `POST /api/runs/{id}/skill-rca` is unchanged. The new
+`POST /api/runs/{id}/skill-rag` accepts `KnowledgeOptions` with `corpus_id`,
+`mode` (`annotate`, `control`, `rag`), `possible_fault_types` and bounded
+retrieval/investigation settings. It requires the existing `chaos_engineer`
+or `admin` role. It rejects caller-supplied ground-truth labels.
+
+Annotation is authorized only for a run pinned to
+`knowledge_campaign: {corpus_id: ..., split: train}` in its experiment version;
+the host obtains the service/fault labels from that training spec only after
+the blind initial investigation. Test modes require a pinned `test` split and
+a frozen base. Model tools never expose experiment specs or evaluator files.
+The platform's header-based role gate is an operator boundary, not a substitute
+for authentication or OS isolation when deploying to an untrusted environment.
+
+`POST /api/skill-rag/{corpus_id}/freeze` accepts `training_run_ids`, verifies
+their pinned training membership, and publishes only supported A/B pairs.
+Records and the base use immutable, atomically published JSON and a corpus
+lock. Changed configuration, embedding provider, model or Skill version is
+rejected instead of silently reusing incompatible results. Every attempt,
+including an explicit model/query error, is persisted as an artifact.
+
+The web UI's **Explorar pares A/B** panel lists installed frozen corpora and
+shows each source pair's A (initial evidence and symptoms) beside B (diagnostic
+guide), along with its validation metadata. The read-only
+`GET /api/skill-rag/corpora` and `GET /api/skill-rag/{corpus_id}/pairs`
+endpoints require the `chaos_engineer` or `admin` role and validate the stored
+base checksum before returning its pairs.
+
+For commands, outputs and evaluation, see the
+[70-run campaign guide](../eval/memory_hog/README.md#online-skill-rca-rag-ab-70-runs-35-train--35-test).
+
 - Domain core: experiment definitions, run records, timeline events
 - Ports: chaos/load/metrics/traces/storage/notification
 - Adapters:
@@ -41,12 +74,25 @@ python -m pip install -r experiment/platform/backend/requirements.txt
 2. Start API + GUI:
 
 ```bash
+HISTORY_MIGRATION_ENABLED=true \
 uvicorn experiment.platform.backend.main:app --host 0.0.0.0 --port 8010 --reload
 ```
 
 3. Open:
 
 - http://localhost:8010/
+
+The Makefile targets `experiment-platform-up` and `experiment-platform-up-bg`
+enable per-run telemetry-history migration by default. Set
+`HISTORY_MIGRATION_ENABLED=false` to opt out. When starting Uvicorn directly,
+set `HISTORY_MIGRATION_ENABLED=true` as shown above.
+For the test-only Skill/RAG campaign, use temporary dual-write instead: start
+the API with `HISTORY_MIGRATION_ENABLED=false` and
+`HISTORY_ARCHIVE_ENABLED=false`, then use
+`experiment.platform.tools.history_dual_write` to enable and disable the
+campaign-scoped historical sinks. The campaign validates online read-back
+through the history MCP before running either diagnostic; see the memory-hog
+README for the full canary/resume sequence.
 
 The default listener binds to all WSL interfaces so the notebook can reach it.
 Use `--host 127.0.0.1` instead if the platform should be WSL-local only.
@@ -91,31 +137,38 @@ without adding them to the MCP config file.
 kubectl port-forward --address 127.0.0.1 -n mcp-server svc/mcp-observability 18080:8000
 ```
 
-3. Start the Qwen3.5 OpenAI-compatible telemetry proxy:
+3. Forward the OTLP receiver used for model-call metrics:
+
+```bash
+kubectl port-forward --address 127.0.0.1 -n monitoring svc/otel-collector 4318:4318
+```
+
+4. Start the Qwen3.5 OpenAI-compatible telemetry proxy:
 
 ```bash
 OTEL_SERVICE_NAME=llm-qwen35 \
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:30318 \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
 LLM_MODEL=qwen3.5-9b-grafana \
 LLM_IO_AUDIT_PATH="$HOME/.local/share/qwen35-grafana/qwen35-audit.jsonl" \
 python -m uvicorn model.qwen35_otel_proxy:app --host 127.0.0.1 --port 8011
 ```
 
-4. Ensure the official read-only Grafana MCP container is running:
+5. Ensure the official read-only Grafana MCP container is running:
 
 ```bash
 make ensure-grafana-mcp
 ```
 
-5. Start the platform using both MCP servers while keeping client-side telemetry:
+6. Start the platform using both MCP servers while keeping client-side telemetry:
 
 ```bash
 LLM_URL=http://127.0.0.1:8011/v1/chat/completions \
 LLM_MODEL=qwen3.5-9b-grafana \
 GRAFANA_MCP_SSE_URL=http://127.0.0.1:18081/sse \
 GRAFANA_MCP_TIMEOUT_SECONDS=30 \
+HISTORY_MIGRATION_ENABLED=true \
 OTEL_SERVICE_NAME=rca-platform \
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:30318 \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
 LLM_IO_AUDIT_PATH="$HOME/.local/share/qwen35-grafana/platform-audit.jsonl" \
 python -m uvicorn experiment.platform.backend.main:app --host 0.0.0.0 --port 8010
 ```
@@ -192,9 +245,44 @@ evidências e caminho do artefato. Falhas retornam código de saída 1 e mensage
 no stderr. `inconclusive` é uma investigação concluída sem causa corroborada,
 não uma confirmação nem um erro de transporte.
 
+### Leitura de traces arquivados
+
+Para RCA de runs migrados, habilite a leitura somente leitura do bundle S3. O
+API local usa o endpoint configurado e busca a credencial de serviço no Secret
+Kubernetes sem imprimir ou persistir a chave. O port-forward é manual e não é
+iniciado nem restaurado pelo executor:
+
+```bash
+kubectl -n monitoring-history port-forward svc/seaweedfs-history 8333:8333
+
+HISTORY_ARCHIVE_ENABLED=true \
+HISTORY_ARCHIVE_ENDPOINT=127.0.0.1:8333 \
+uvicorn experiment.platform.backend.main:app --host 0.0.0.0 --port 8010 --reload
+```
+
+O leitor localiza `history-runs/<campaign>/<run_id>/source-bundle.json.gz`,
+valida o SHA-256 e a paridade das contagens de traces/spans com o manifesto e
+resume os spans que intersectam cada janela antes de enviá-los ao modelo. Os
+IDs e timestamps de origem não são alterados; status da busca no índice Tempo e
+cobertura dos spans arquivados são reportados separadamente. Se o experimento
+não corresponder ao nome da campanha, informe-o explicitamente:
+
+```bash
+./.venv/bin/python -m experiment.platform.rca_cli \
+  --run-id run-835437377b07 \
+  --history-campaign-id exploratory-rag-20261028T191703038725Z
+```
+
+Sem `HISTORY_ARCHIVE_ENABLED=true`, a RCA mantém o caminho MCP atual. Se o
+bundle não existir ou falhar na verificação, a limitação é registrada e a
+leitura ao vivo continua disponível.
+
 ### Investigação e garantias
 
-1. Compara RED/CPU/memória com a referência imediatamente anterior à falha.
+1. Compara RED/CPU/memória e latência por aresta Istio/service graph com a
+   referência imediatamente anterior à falha. Mantém caller/destino e perfis
+   client/server separados; as três consultas Prometheus permanecem uma única
+   família `metrics`.
 2. Consulta readiness, OOM e restarts; Qwen propõe até três candidatos e
    pelo menos duas hipóteses.
 3. Busca logs de referência/fault/post dos candidatos e serviços com restart,
@@ -208,6 +296,11 @@ não uma confirmação nem um erro de transporte.
    Vários checks Prometheus continuam contando como uma única família.
 6. Janela de falha apenas planejada, ausência de corroboração ou motivo de
    restart desconhecido rebaixam a conclusão a `inconclusive`.
+
+As respostas CLI/API e os artefatos preservam cobertura e regressões por
+métrica de latência. O avaliador de campanhas Skill RCA e o multiagente
+registram, por métrica, os runs com amostras em fault e com arestas em
+regressão; esses sinais não são tratados como fontes independentes.
 
 IDs/contagens verificam rastreabilidade e diversidade de fontes; não provam
 sozinhos causalidade. O procedimento exige que o modelo compare hipóteses e

@@ -40,11 +40,11 @@ spec:
         image: kbudde/rabbitmq-exporter
         env:
         # Recent exporter images default to 9419; the Service/annotation
-        # scrape 9090, so pin the listener to keep the target reachable.
+        # address 9090, so pin the listener to the Service target port.
         - name: PUBLISH_PORT
-          value: "9090"
+          value: "9419"
         ports:
-        - containerPort: 9090
+        - containerPort: 9419
           name: exporter
       nodeSelector:
         beta.kubernetes.io/os: linux

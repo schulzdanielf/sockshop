@@ -5,6 +5,8 @@ metadata:
   namespace: monitoring
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: prometheus-v3
@@ -28,12 +30,18 @@ spec:
         volumeMounts:
         - name: config-volume
           mountPath: /etc/prometheus
+        - name: alertrules-volume
+          mountPath: /etc/prometheus-rules
+          readOnly: true
         - name: prometheus-data
           mountPath: /prometheus
       volumes:
       - name: config-volume
         configMap:
           name: prometheus-v3-configmap
+      - name: alertrules-volume
+        configMap:
+          name: prometheus-alertrules
       - name: prometheus-data
         persistentVolumeClaim:
           claimName: prometheus-v3-pvc

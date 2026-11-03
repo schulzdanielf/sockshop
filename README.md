@@ -84,10 +84,14 @@ Este repositório evolui o Sock Shop como base experimental para estudos de obse
  
  Fluxo resumido:
  
- 1. os serviços expõem métricas operacionais e de aplicação
- 2. o Prometheus coleta esses dados
- 3. o OpenTelemetry Collector agrega e encaminha métricas conforme a configuração atual
+ 1. Prometheus v3 coleta métricas da aplicação, da infraestrutura e do próprio Collector
+ 2. os SDKs e agentes OpenTelemetry enviam métricas OTLP ao Collector
+ 3. o Collector encaminha métricas OTLP ao Prometheus v3 via remote write
  4. o Grafana consome Prometheus como principal fonte de visualização
+
+O Prometheus legado permanece independente durante a migração. O Collector não
+deve federar as séries do Prometheus legado para o v3: o v3 já coleta os mesmos
+targets diretamente, e a federação pode introduzir amostras fora de ordem.
  
  Exemplos de métricas já usadas nos experimentos:
  
@@ -112,7 +116,9 @@ Este repositório evolui o Sock Shop como base experimental para estudos de obse
  Pontos importantes do estado atual:
  
  - o pipeline de logs foi consolidado em OTel -> Loki
- - Promtail não deve ser executado junto com essa trilha para evitar duplicação
+ - o Collector é o único coletor de logs do namespace `sock-shop`
+ - Promtail pode coletar os demais namespaces, mas deve descartar `sock-shop` para evitar duplicação
+ - eventos Kubernetes do namespace `sock-shop` também são encaminhados pelo OTel
  - o collector foi ajustado para enviar linhas de log em formato mais limpo, reduzindo o ruído de campos redundantes
  
  Consultas úteis de partida no Loki:
@@ -124,6 +130,11 @@ Este repositório evolui o Sock Shop como base experimental para estudos de obse
  ```logql
  {log_source="otel_filelog", namespace="sock-shop", pod=~"front-end.*"}
  ```
+
+O dashboard **OpenTelemetry Pipeline Health** mostra o estado do scrape do
+Collector, a taxa de logs recebidos/enviados, falhas de exportação e targets
+Prometheus indisponíveis. Alertas equivalentes estão definidos em
+`deploy/kubernetes/manifests-monitoring/05-prometheus-alertrules.yaml`.
  
  ### Tracing
  

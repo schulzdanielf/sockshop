@@ -39,6 +39,13 @@ spec:
             memory: 450Mi
         ports:
         - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          periodSeconds: 3
+          timeoutSeconds: 2
+          failureThreshold: 1
         securityContext:
           runAsNonRoot: true
           runAsUser: 10001

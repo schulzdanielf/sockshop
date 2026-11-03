@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-history
+  namespace: monitoring-history
+  labels:
+    app: loki-history
+spec:
+  type: ClusterIP
+  selector:
+    app: loki-history
+  ports:
+    - name: http
+      port: 3100
+      targetPort: 3100

@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-history-config
+  namespace: monitoring-history
+data:
+  tempo.yaml: |
+    usage_report:
+      reporting_enabled: false
+
+    server:
+      http_listen_port: 3200
+
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+            http:
+
+    ingester:
+      max_block_duration: 5m
+      lifecycler:
+        ring:
+          replication_factor: 1
+      trace_idle_period: 10s
+      flush_check_period: 10s
+      max_block_bytes: 100_000_000
+
+    compactor:
+      compaction:
+        block_retention: 8760h
+
+    storage:
+      trace:
+        backend: s3
+        wal:
+          path: /var/tempo/wal
+        s3:
+          bucket: history-tempo
+          endpoint: seaweedfs-history.monitoring-history.svc.cluster.local:8333
+          access_key: ${HISTORY_ACCESS_KEY}
+          secret_key: ${HISTORY_SECRET_KEY}
+          insecure: true
+          forcepathstyle: true
+
+    querier:
+      frontend_worker:
+        frontend_address: 127.0.0.1:9095

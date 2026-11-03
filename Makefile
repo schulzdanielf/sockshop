@@ -40,7 +40,7 @@ QWEN35_MODEL ?= qwen3.5-9b-grafana
 QWEN35_UPSTREAM_URL ?= http://127.0.0.1:$(MODEL_PORT)
 QWEN35_LLM_URL ?= http://$(MODEL_PROXY_HOST):$(MODEL_PROXY_PORT)/v1/chat/completions
 QWEN35_PROXY_HEALTH_URL ?= http://$(MODEL_PROXY_HOST):$(MODEL_PROXY_PORT)/health
-QWEN35_OTEL_ENDPOINT ?= http://127.0.0.1:30318
+QWEN35_OTEL_ENDPOINT ?= http://127.0.0.1:4318
 QWEN35_AUDIT_PATH ?= $(HOME)/.local/share/qwen35-grafana/qwen35-audit.jsonl
 PLATFORM_AUDIT_PATH ?= $(HOME)/.local/share/qwen35-grafana/platform-audit.jsonl
 GRAFANA_MCP_IMAGE ?= grafana/mcp-grafana@sha256:2ed63c4d9d67557c8ea6cc6988743ddd9008e248bd9842e760fec378a0b61062
@@ -55,11 +55,18 @@ GRAFANA_MCP_ENABLED_TOOLS ?= search,dashboard,datasource,prometheus,loki,tempo,n
 PYTHON               ?= .venv/bin/python
 # Health endpoints used to decide whether a service is already up.
 LLM_HEALTH_URL       ?= http://127.0.0.1:$(MODEL_PORT)/health
-PLATFORM_BASE        ?= http://127.0.0.1:8010
+PLATFORM_PORT        ?= 8010
+PLATFORM_BASE        ?= http://127.0.0.1:$(PLATFORM_PORT)
 PLATFORM_HEALTH_URL  ?= $(PLATFORM_BASE)/api/health
 # The platform runs in WSL but is opened from the notebook/browser host.
 # Override with 127.0.0.1 to restrict it to the WSL loopback interface.
 PLATFORM_BIND_HOST   ?= 0.0.0.0
+HISTORY_MIGRATION_ENABLED ?= true
+HISTORY_ARCHIVE_ENABLED ?= false
+HISTORICAL_MCP_SSE_URL ?= http://127.0.0.1:18082/sse
+OPENSEARCH_URL ?= http://127.0.0.1:9200
+OPENSEARCH_HEALTH_URL ?= $(OPENSEARCH_URL)/_cluster/health
+OPENSEARCH_COMPOSE_FILE ?= experiment/eval/memory_hog/opensearch-compose.yml
 # Local port the MCP observability server is port-forwarded to (see `port-forward`).
 MCP_LOCAL_PORT       ?= 18080
 # Experiment harness wiring.
@@ -122,6 +129,17 @@ observability-down:
 	kubectl delete -f deploy/kubernetes/manifests-jaeger/catalogue-dep.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/manifests-jaeger/jaeger.yaml --ignore-not-found
 	kubectl delete -f deploy/kubernetes/manifests-monitoring --ignore-not-found
+
+.PHONY: history-mcp-up
+history-mcp-up:
+	kubectl apply -f deploy/kubernetes/manifests-monitoring/68-history-observability-mcp-configmap.yaml \
+	  -f deploy/kubernetes/manifests-monitoring/69-history-observability-mcp-dep.yaml \
+	  -f deploy/kubernetes/manifests-monitoring/70-history-observability-mcp-svc.yaml
+	kubectl rollout status -n monitoring-history deployment/history-observability-mcp
+
+.PHONY: history-mcp-forward
+history-mcp-forward:
+	kubectl -n monitoring-history port-forward svc/history-observability-mcp 18082:8000
 
 .PHONY: loadtest-up
 loadtest-up:
@@ -327,8 +345,11 @@ model-otel-proxy-serve:
 model: ensure-model
 
 .PHONY: experiment-platform-up
-## Start the experiment platform (FastAPI backend + GUI) on http://localhost:8010
-experiment-platform-up: ensure-model ensure-grafana-mcp
+## Start the experiment platform (FastAPI backend + GUI) on http://localhost:$(PLATFORM_PORT).
+experiment-platform-up: ensure-model ensure-grafana-mcp ensure-opensearch
+	HISTORY_MIGRATION_ENABLED=$(HISTORY_MIGRATION_ENABLED) \
+	HISTORY_ARCHIVE_ENABLED=$(HISTORY_ARCHIVE_ENABLED) \
+	HISTORICAL_MCP_SSE_URL=$(HISTORICAL_MCP_SSE_URL) \
 	LLM_URL=$(QWEN35_LLM_URL) \
 	LLM_MODEL=$(QWEN35_MODEL) \
 	GRAFANA_MCP_SSE_URL=$(GRAFANA_MCP_SSE_URL) \
@@ -339,7 +360,32 @@ experiment-platform-up: ensure-model ensure-grafana-mcp
 	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=0 \
 	DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
 	.venv/bin/python -m uvicorn experiment.platform.backend.main:app \
-		--host $(PLATFORM_BIND_HOST) --port 8010 --reload
+		--host $(PLATFORM_BIND_HOST) --port $(PLATFORM_PORT) --reload
+
+.PHONY: opensearch-up
+## Start the persistent local OpenSearch service used by RAG evaluations.
+opensearch-up:
+	docker compose -f $(OPENSEARCH_COMPOSE_FILE) up -d opensearch
+
+.PHONY: ensure-opensearch
+## Ensure the local OpenSearch service is healthy, starting it if necessary.
+ensure-opensearch:
+	@if curl -sf --max-time 3 $(OPENSEARCH_HEALTH_URL) >/dev/null 2>&1; then \
+		echo ">> OpenSearch already healthy at $(OPENSEARCH_URL)."; \
+	else \
+		echo ">> OpenSearch down — starting the evaluation service..."; \
+		$(MAKE) opensearch-up; \
+		i=0; \
+		until curl -sf --max-time 3 $(OPENSEARCH_HEALTH_URL) >/dev/null 2>&1; do \
+			i=$$((i+1)); \
+			if [ $$i -ge $(HEALTH_RETRIES) ]; then \
+				echo "ERROR: OpenSearch not healthy after $$((HEALTH_RETRIES*HEALTH_DELAY))s. Check 'docker compose -f $(OPENSEARCH_COMPOSE_FILE) logs opensearch'." >&2; \
+				exit 1; \
+			fi; \
+			sleep $(HEALTH_DELAY); \
+		done; \
+		echo ">> OpenSearch is healthy."; \
+	fi
 
 # ── Full experiment orchestration ──────────────────────────────────────────────
 # `make experiment-run` brings up every dependency a complete experiment needs
@@ -377,9 +423,12 @@ model-otel-proxy-bg:
 
 .PHONY: experiment-platform-up-bg
 ## Start the experiment platform in the background.
-experiment-platform-up-bg: ensure-model ensure-grafana-mcp
-	@echo ">> Starting experiment platform on $(PLATFORM_BIND_HOST):8010 (log: /tmp/experiment-platform.log)"
-	@LLM_URL=$(QWEN35_LLM_URL) LLM_MODEL=$(QWEN35_MODEL) \
+experiment-platform-up-bg: ensure-model ensure-grafana-mcp ensure-opensearch
+	@echo ">> Starting experiment platform on $(PLATFORM_BIND_HOST):$(PLATFORM_PORT) (log: /tmp/experiment-platform.log)"
+	@HISTORY_MIGRATION_ENABLED=$(HISTORY_MIGRATION_ENABLED) \
+		HISTORY_ARCHIVE_ENABLED=$(HISTORY_ARCHIVE_ENABLED) \
+		HISTORICAL_MCP_SSE_URL=$(HISTORICAL_MCP_SSE_URL) \
+		LLM_URL=$(QWEN35_LLM_URL) LLM_MODEL=$(QWEN35_MODEL) \
 		GRAFANA_MCP_SSE_URL=$(GRAFANA_MCP_SSE_URL) \
 		GRAFANA_MCP_TIMEOUT_SECONDS=$(GRAFANA_MCP_TIMEOUT_SECONDS) \
 		LLM_IO_AUDIT_PATH="$(PLATFORM_AUDIT_PATH)" \
@@ -388,7 +437,7 @@ experiment-platform-up-bg: ensure-model ensure-grafana-mcp
 		OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=0 \
 		DEPLOYMENT_ENV=$(DEPLOYMENT_ENV) \
 		nohup $(PYTHON) -m uvicorn experiment.platform.backend.main:app \
-		--host $(PLATFORM_BIND_HOST) --port 8010 >/tmp/experiment-platform.log 2>&1 &
+		--host $(PLATFORM_BIND_HOST) --port $(PLATFORM_PORT) >/tmp/experiment-platform.log 2>&1 &
 
 .PHONY: ensure-cluster
 ## Fail fast if the Kubernetes cluster is unreachable.
@@ -513,6 +562,12 @@ experiment-run: ensure-cluster ensure-port-forward ensure-model ensure-platform
 	@echo
 	@echo ">> Launching experiment harness: $(EXPERIMENT_RUNNER) (config: $(EXPERIMENT_CONFIG))"
 	$(PYTHON) $(EXPERIMENT_RUNNER) --config $(EXPERIMENT_CONFIG) $(RUN_ARGS)
+
+.PHONY: experiment-multiagent-rca-evaluation
+## Controlled campaigns followed by multi-agent RCA evaluation; dry-run by default.
+EXPERIMENT_LEVEL ?= small
+experiment-multiagent-rca-evaluation:
+	$(PYTHON) -m experiment.eval.memory_hog.controlled_campaign --level $(EXPERIMENT_LEVEL) $(RUN_ARGS)
 
 .PHONY: git
 git:

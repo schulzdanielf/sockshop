@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seaweedfs-history-bootstrap
+  namespace: monitoring-history
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: seaweedfs-history-bootstrap
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: sockshop/telemetry-history-migrator:local
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /app/bootstrap_history_store.py
+          env:
+            - name: HISTORY_S3_ENDPOINT
+              value: seaweedfs-history.monitoring-history.svc.cluster.local:8333
+            - name: HISTORY_S3_SECURE
+              value: "false"
+            - name: HISTORY_S3_ADMIN_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: seaweedfs-history-credentials
+                  key: admin-access-key
+            - name: HISTORY_S3_ADMIN_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: seaweedfs-history-credentials
+                  key: admin-secret-key
