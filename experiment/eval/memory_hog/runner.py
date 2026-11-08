@@ -46,15 +46,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+from opentelemetry import propagate
+from opentelemetry.trace import SpanKind, Status, StatusCode, Tracer
 from experiment.eval.memory_hog import generate_chaos_manifests
 from experiment.eval.memory_hog.resource_intensity import resource_chaos_environment
 from experiment.platform.backend.history_config import (
     DEFAULT_HISTORICAL_MCP_SSE_URL,
+)
+from experiment.platform.backend.analysis.istio_edges import (
+    HTTP_EDGE_LABELS, http_golden_query, istio_expression,
 )
 
 # ── Module-level constants ──────────────────────────────────────────────────
@@ -76,6 +82,7 @@ DEFAULT_GEMINI_MAX_NEW_TOKENS = int(os.environ.get("GEMINI_MAX_NEW_TOKENS", "512
 class ApiClient:
     base_url: str
     role: str = "operator"
+    tracer: Optional[Tracer] = None
 
     def _req(
         self, method: str, path: str, body: Optional[dict] = None, timeout: int = 60
@@ -86,15 +93,43 @@ class ApiClient:
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body_text = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"HTTP {exc.code} on {method} {path}: {body_text}"
-            ) from exc
+        route = re.sub(r"/api/runs/[^/]+", "/api/runs/{run_id}", path.split("?")[0])
+        span_attributes: dict[str, str] = {
+            "http.request.method": method,
+            "http.route": route,
+        }
+        server = urllib.parse.urlsplit(url).hostname
+        if server:
+            span_attributes["server.address"] = server
+
+        span_context = (
+            self.tracer.start_as_current_span(
+                f"HTTP {method} {route}",
+                kind=SpanKind.CLIENT,
+                attributes=span_attributes,
+            )
+            if self.tracer
+            else nullcontext(None)
+        )
+        with span_context as span:
+            if span:
+                propagate.inject(headers)
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                    if span:
+                        span.set_attribute("http.response.status_code", resp.status)
+            except urllib.error.HTTPError as exc:
+                if span:
+                    span.set_attribute("http.response.status_code", exc.code)
+                    span.set_status(
+                        Status(StatusCode.ERROR, description=f"HTTP {exc.code}")
+                    )
+                body_text = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"HTTP {exc.code} on {method} {path}: {body_text}"
+                ) from exc
         if not raw:
             return None
         return json.loads(raw)
@@ -461,24 +496,12 @@ def build_spec(
                     # ── Traffic ──
                     {
                         "id": "traffic",
-                        "query": (
-                            'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown"}[30s])) by (destination_workload)'
-                        ),
+                        "query": http_golden_query("request_rate", "sock-shop", "30s"),
                     },
                     # ── Errors ──
                     {
                         "id": "error_rate",
-                        "query": (
-                            "100 * ("
-                            'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown",response_code=~"5.."}[30s])) by (destination_workload)'
-                            " or on(destination_workload) 0 * "
-                            'sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown"}[30s])) by (destination_workload)'
-                            ') / clamp_min(sum(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown"}[30s])) by (destination_workload), 0.0001)'
-                        ),
+                        "query": http_golden_query("error_rate", "sock-shop", "30s"),
                     },
                     # Client-reported 5xx scoped to the directed service edge.
                     # A proxy abort can fail before the destination application
@@ -487,37 +510,25 @@ def build_spec(
                     {
                         "id": "http_5xx_by_edge",
                         "query": (
-                            "sum by (source_workload,destination_workload,response_code) "
-                            "(rate(istio_requests_total{"
-                            'destination_workload_namespace="sock-shop",'
-                            'destination_workload!="unknown",source_workload!="unknown",'
-                            'reporter="source",response_code=~"5.."}[30s]))'
+                            f"sum by ({HTTP_EDGE_LABELS}) ("
+                            + istio_expression(
+                                "istio_requests_total", "sock-shop", reporter="source",
+                                codes="5..", lookback="30s",
+                            ) + ")"
                         ),
                     },
                     # ── Latency (RED) — three percentiles ──
                     {
                         "id": "latency_p50",
-                        "query": (
-                            "histogram_quantile(0.50, sum(rate(istio_request_duration_milliseconds_bucket{"
-                            'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            "[30s])) by (le,destination_workload))"
-                        ),
+                        "query": http_golden_query("latency_p50", "sock-shop", "30s"),
                     },
                     {
                         "id": "latency_p95",
-                        "query": (
-                            "histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{"
-                            'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            "[30s])) by (le,destination_workload))"
-                        ),
+                        "query": http_golden_query("latency_p95", "sock-shop", "30s"),
                     },
                     {
                         "id": "latency_p99",
-                        "query": (
-                            "histogram_quantile(0.99, sum(rate(istio_request_duration_milliseconds_bucket{"
-                            'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-                            "[30s])) by (le,destination_workload))"
-                        ),
+                        "query": http_golden_query("latency_p99", "sock-shop", "30s"),
                     },
                     # ── Network signals ─────────────────────────────────
                     # Interface-level counters are collected by cAdvisor and

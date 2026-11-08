@@ -17,7 +17,9 @@ from experiment.platform.backend.rca_knowledge import (
 
 def config(tmp_path):
     source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
-    return campaign.build_config(source, tmp_path, "rag", 42, {})
+    config = campaign.build_config(source, tmp_path, "rag", 42, {})
+    config["historical_observability"] = {"required": False}
+    return config
 
 
 def test_exact_matrix_and_split(tmp_path):
@@ -46,6 +48,27 @@ def test_unvalidated_experimental_policy_only_applies_to_exploratory_rag(tmp_pat
     )
     for mode in ("original", "exploratory_control"):
         assert rag.options_for(cfg, mode)["include_unvalidated_experimental"] is False
+
+
+def test_unvalidated_procedural_policy_only_applies_to_exploratory_rag(tmp_path):
+    cfg = config(tmp_path)
+    cfg["knowledge_campaign"][
+        "include_unvalidated_procedural_experimental"
+    ] = True
+
+    assert (
+        rag.options_for(cfg, "exploratory_rag")[
+            "include_unvalidated_procedural_experimental"
+        ]
+        is True
+    )
+    for mode in ("original", "exploratory_control"):
+        assert (
+            rag.options_for(cfg, mode)[
+                "include_unvalidated_procedural_experimental"
+            ]
+            is False
+        )
 
 
 def test_opensearch_is_enabled_only_for_exploratory_rag(tmp_path):
@@ -276,6 +299,73 @@ def test_historical_diagnostic_rejects_error_status_even_with_evidence(tmp_path)
                 "evidence": evidence,
             },
         )
+
+
+def test_historical_rag_validation_uses_campaign_retriever_version(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    cfg = config(tmp_path)
+    cfg["historical_observability"] = {"required": True, "mode": "dual_write"}
+    knowledge = cfg["knowledge_campaign"]
+    knowledge.update(
+        external_test_evaluation_id="test-base-v4-eval1",
+        external_test_base_sha256="a" * 64,
+        opensearch_base_sha256="a" * 64,
+        opensearch_source_skill_sha256="b" * 64,
+        opensearch_current_skill_sha256="b" * 64,
+        opensearch_source_model="qwen3.5-9b-grafana",
+        opensearch_current_model="qwen3.5-9b-grafana",
+        retriever_version="opensearch-hybrid-rrf-v4",
+    )
+    evidence = [
+        {
+            "family": family,
+            "source": "history",
+            "status": "ok",
+            "observation_count": 1,
+        }
+        for family in ("metrics", "logs", "traces")
+    ]
+    monkeypatch.setattr(
+        rag.IncidentA,
+        "model_validate",
+        lambda *_: SimpleNamespace(
+            text_version="incident-a-v2",
+            metric_facts=[{"metric": "request_rate"}],
+        ),
+    )
+    retrieval = {
+        "backend": "opensearch",
+        "retriever_version": "opensearch-hybrid-rrf-v4",
+        "skill_compatibility": {
+            "source_skill_sha256": "b" * 64,
+            "current_skill_sha256": "b" * 64,
+            "legacy_hash_allowed": False,
+        },
+        "model_compatibility": {
+            "source_model": "qwen3.5-9b-grafana",
+            "current_model": "qwen3.5-9b-grafana",
+            "models_match": True,
+            "legacy_model_mismatch_allowed": False,
+        },
+    }
+
+    rag.validate_historical_diagnostic(
+        cfg,
+        "exploratory_rag",
+        {
+            "status": "confirmed",
+            "observability_source": "history",
+            "evidence": evidence,
+            "a": {},
+            "retrieval": retrieval,
+            "base_sha256": "a" * 64,
+            "external_test_evaluation_id": "test-base-v4-eval1",
+            "external_test_base_sha256": "a" * 64,
+        },
+    )
 
 
 def test_process_cell_retries_one_persisted_diagnostic_error(
@@ -559,6 +649,7 @@ def test_test_requests_contain_no_current_ground_truth_and_are_resumable(tmp_pat
 def test_exploratory_diagnostics_require_best_guess_for_every_method(tmp_path):
     cfg = config(tmp_path)
     cfg["knowledge_campaign"]["exploratory"] = True
+    cfg["historical_observability"]["required"] = False
     cell = cfg["test_experiments"][0]
     api = Mock()
     api.post.return_value = {"version": VERSION, "status": "inconclusive"}
@@ -574,6 +665,22 @@ def test_exploratory_diagnostics_require_best_guess_for_every_method(tmp_path):
         if call.args[0].endswith("/skill-rca")
     )
     assert original_call.kwargs["body"]["possible_fault_types"]
+    assert (
+        original_call.kwargs["body"]["max_additional_checks"]
+        == cfg["knowledge_campaign"]["max_rounds"]
+        == 4
+    )
+    knowledge_calls = [
+        call for call in api.post.call_args_list
+        if call.args[0].endswith("/skill-rag")
+    ]
+    assert len(knowledge_calls) == 2
+    assert all(
+        call.kwargs["body"]["max_rounds"] == 4
+        and call.kwargs["body"]["max_model_calls"] == 30
+        and call.kwargs["body"]["max_total_tokens"] == 200000
+        for call in knowledge_calls
+    )
 
 
 def test_exploratory_evaluation_aggregates_all_35_tests(tmp_path):

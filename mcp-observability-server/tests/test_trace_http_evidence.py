@@ -1,4 +1,4 @@
-from trace_analyzer import extract_features
+from trace_analyzer import extract_features, _parse_spans
 
 
 def test_error_span_retains_http_code_and_remote_destination():
@@ -25,3 +25,13 @@ def test_error_span_retains_http_code_and_remote_destination():
     assert span["remote_endpoint"] == "payment/paymentAuth"
     assert span["remote_service"] == "payment"
     assert features["failure_signatures"][0]["endpoint"] == "payment/paymentAuth"
+
+
+def test_current_http_status_attribute_detects_error_without_span_status():
+    trace = {"batches": [{"resource": {"attributes": []}, "scopeSpans": [{"spans": [{
+        "spanId": "client", "name": "POST", "startTimeUnixNano": "1000",
+        "endTimeUnixNano": "2000", "attributes": [{
+            "key": "http.response.status_code", "value": {"intValue": "500"},
+        }],
+    }]}]}]}
+    assert _parse_spans(trace)[0]["is_error"] is True

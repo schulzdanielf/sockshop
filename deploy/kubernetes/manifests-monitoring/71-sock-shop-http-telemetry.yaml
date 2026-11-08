@@ -1,0 +1,11 @@
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: sock-shop-http
+  namespace: sock-shop
+spec:
+  accessLogging:
+    - providers:
+        - name: sock-shop-http-json
+      filter:
+        expression: 'response.code >= 400'

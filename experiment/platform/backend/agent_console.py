@@ -762,32 +762,36 @@ def _mcp_chat_tools(mcp_client: Any) -> tuple[Dict[str, Dict[str, Any]], List[Di
 def _mcp_chat_model_arguments(
     name: str, arguments: Any, tool: Dict[str, Any]
 ) -> Dict[str, Any]:
-    if name not in _GRAFANA_MCP_CHAT_TOOL_NAMES:
-        if not isinstance(arguments, dict) or arguments:
-            raise LLMClientError("chat telemetry tools do not accept model-controlled arguments")
-        return {}
-
+    is_grafana_tool = name in _GRAFANA_MCP_CHAT_TOOL_NAMES
     input_schema = tool.get("inputSchema") or {}
     properties = input_schema.get("properties") or {}
+    host_managed = (
+        _GRAFANA_MCP_CHAT_HOST_MANAGED_KEYS
+        if is_grafana_tool
+        else _MCP_CHAT_HOST_MANAGED_KEYS
+    )
     model_schema = {
         "type": "object",
         "properties": {
-            key: value
-            for key, value in properties.items()
-            if key not in _GRAFANA_MCP_CHAT_HOST_MANAGED_KEYS
+            key: value for key, value in properties.items() if key not in host_managed
         },
         "required": [
             key
             for key in input_schema.get("required", [])
-            if key not in _GRAFANA_MCP_CHAT_HOST_MANAGED_KEYS
+            if key not in host_managed
         ],
         "additionalProperties": False,
     }
+    tool_family = "Grafana" if is_grafana_tool else "telemetry"
+    if not isinstance(arguments, dict):
+        raise LLMClientError(
+            f"model returned invalid arguments for {tool_family} MCP tool {name!r}"
+        )
     try:
         jsonschema.validate(arguments, model_schema)
     except jsonschema.ValidationError as exc:
         raise LLMClientError(
-            f"model returned invalid arguments for Grafana MCP tool {name!r}"
+            f"model returned invalid arguments for {tool_family} MCP tool {name!r}"
         ) from exc
     return arguments
 
@@ -1123,13 +1127,15 @@ def answer_query_mcp(
                     if key in properties
                 },
             }
-            if name in _GRAFANA_MCP_CHAT_TOOL_NAMES:
-                try:
-                    jsonschema.validate(run_arguments, input_schema)
-                except jsonschema.ValidationError as exc:
-                    raise LLMClientError(
-                        f"host generated invalid arguments for Grafana MCP tool {name!r}"
-                    ) from exc
+            tool_family = (
+                "Grafana" if name in _GRAFANA_MCP_CHAT_TOOL_NAMES else "telemetry"
+            )
+            try:
+                jsonschema.validate(run_arguments, input_schema)
+            except jsonschema.ValidationError as exc:
+                raise LLMClientError(
+                    f"host generated invalid arguments for {tool_family} MCP tool {name!r}"
+                ) from exc
             tool_description = remote_tools[name].get("description")
             result = mcp_client.call_tool_json(
                 name,

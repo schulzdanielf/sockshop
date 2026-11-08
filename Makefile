@@ -63,7 +63,8 @@ PLATFORM_HEALTH_URL  ?= $(PLATFORM_BASE)/api/health
 PLATFORM_BIND_HOST   ?= 0.0.0.0
 HISTORY_MIGRATION_ENABLED ?= true
 HISTORY_ARCHIVE_ENABLED ?= false
-HISTORICAL_MCP_SSE_URL ?= http://127.0.0.1:18082/sse
+HISTORICAL_MCP_LOCAL_PORT ?= 18082
+HISTORICAL_MCP_SSE_URL ?= http://127.0.0.1:$(HISTORICAL_MCP_LOCAL_PORT)/sse
 OPENSEARCH_URL ?= http://127.0.0.1:9200
 OPENSEARCH_HEALTH_URL ?= $(OPENSEARCH_URL)/_cluster/health
 OPENSEARCH_COMPOSE_FILE ?= experiment/eval/memory_hog/opensearch-compose.yml
@@ -139,7 +140,27 @@ history-mcp-up:
 
 .PHONY: history-mcp-forward
 history-mcp-forward:
-	kubectl -n monitoring-history port-forward svc/history-observability-mcp 18082:8000
+	kubectl -n monitoring-history port-forward svc/history-observability-mcp $(HISTORICAL_MCP_LOCAL_PORT):8000
+
+.PHONY: ensure-history-mcp-forward
+## Ensure the historical observability MCP is reachable on loopback.
+ensure-history-mcp-forward: ensure-cluster
+	@if $(PYTHON) -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',$(HISTORICAL_MCP_LOCAL_PORT)))==0 else 1)" 2>/dev/null; then \
+		echo ">> Historical MCP port-forward already up (:$(HISTORICAL_MCP_LOCAL_PORT))."; \
+	else \
+		echo ">> Historical MCP port-forward down — starting it..."; \
+		nohup kubectl -n monitoring-history port-forward --address 127.0.0.1 svc/history-observability-mcp $(HISTORICAL_MCP_LOCAL_PORT):8000 >/tmp/pf-history-observability-mcp.log 2>&1 & \
+		i=0; \
+		until $(PYTHON) -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',$(HISTORICAL_MCP_LOCAL_PORT)))==0 else 1)" 2>/dev/null; do \
+			i=$$((i+1)); \
+			if [ $$i -ge 10 ]; then \
+				echo "ERROR: historical MCP port-forward did not become ready; see /tmp/pf-history-observability-mcp.log." >&2; \
+				exit 1; \
+			fi; \
+			sleep 1; \
+		done; \
+		echo ">> Historical MCP is reachable at $(HISTORICAL_MCP_SSE_URL)."; \
+	fi
 
 .PHONY: loadtest-up
 loadtest-up:
@@ -263,6 +284,7 @@ port-forward:
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE) $(LITMUS_CHAOS_CENTER_SERVER_PORT):9002 >/tmp/pf-chaos-center-server.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE) $(LITMUS_CHAOS_CENTER_SERVER_WS_PORT):8000 >/tmp/pf-chaos-center-server-ws.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n mcp-server svc/mcp-observability 18080:8000 >/tmp/pf-mcp-observability.log 2>&1 &
+	nohup kubectl port-forward --address 0.0.0.0 -n monitoring-history svc/history-observability-mcp $(HISTORICAL_MCP_LOCAL_PORT):8000 >/tmp/pf-history-observability-mcp.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/loki 3100:3100 >/tmp/pf-loki.log 2>&1 &
 	nohup kubectl port-forward --address 0.0.0.0 -n monitoring svc/tempo 3200:3200 >/tmp/pf-tempo.log 2>&1 &
 	nohup kubectl port-forward --address 127.0.0.1 -n monitoring svc/otel-collector 4318:4318 >/tmp/pf-otel-collector.log 2>&1 &
@@ -282,6 +304,7 @@ port-forward-stop:
 	pkill -f "^kubectl port-forward .* -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_FRONTEND_SERVICE)" || true
 	pkill -f "^kubectl port-forward .* -n $(LITMUS_CHAOS_CENTER_NAMESPACE) svc/$(LITMUS_CHAOS_CENTER_SERVER_SERVICE)" || true
 	pkill -f "^kubectl port-forward .* -n mcp-server svc/mcp-observability" || true
+	pkill -f "^kubectl .* -n monitoring-history .*svc/history-observability-mcp $(HISTORICAL_MCP_LOCAL_PORT):8000" || true
 	pkill -f "^kubectl port-forward .* -n monitoring svc/loki" || true
 	pkill -f "^kubectl port-forward .* -n monitoring svc/otel-collector" || true
 
@@ -346,7 +369,7 @@ model: ensure-model
 
 .PHONY: experiment-platform-up
 ## Start the experiment platform (FastAPI backend + GUI) on http://localhost:$(PLATFORM_PORT).
-experiment-platform-up: ensure-model ensure-grafana-mcp ensure-opensearch
+experiment-platform-up: ensure-model ensure-grafana-mcp ensure-opensearch ensure-history-mcp-forward
 	HISTORY_MIGRATION_ENABLED=$(HISTORY_MIGRATION_ENABLED) \
 	HISTORY_ARCHIVE_ENABLED=$(HISTORY_ARCHIVE_ENABLED) \
 	HISTORICAL_MCP_SSE_URL=$(HISTORICAL_MCP_SSE_URL) \
@@ -423,7 +446,7 @@ model-otel-proxy-bg:
 
 .PHONY: experiment-platform-up-bg
 ## Start the experiment platform in the background.
-experiment-platform-up-bg: ensure-model ensure-grafana-mcp ensure-opensearch
+experiment-platform-up-bg: ensure-model ensure-grafana-mcp ensure-opensearch ensure-history-mcp-forward
 	@echo ">> Starting experiment platform on $(PLATFORM_BIND_HOST):$(PLATFORM_PORT) (log: /tmp/experiment-platform.log)"
 	@HISTORY_MIGRATION_ENABLED=$(HISTORY_MIGRATION_ENABLED) \
 		HISTORY_ARCHIVE_ENABLED=$(HISTORY_ARCHIVE_ENABLED) \

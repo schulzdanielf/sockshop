@@ -35,7 +35,12 @@ from experiment.eval.memory_hog.rag_campaign import (
 )
 from experiment.platform.backend.rca_knowledge import (
     DEFAULT_LLM_MODEL,
+    OPENSEARCH_RETRIEVER_V3,
+    OPENSEARCH_RETRIEVER_V6,
     OPENSEARCH_RETRIEVER_VERSION,
+    QWEN35_MODEL_ID,
+    TRAINING_B_SCHEMA_VERSION,
+    TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
     VERSION,
     DiagnosticGuide,
     Diagnosis,
@@ -299,7 +304,8 @@ def prepare_campaign(
         parent_campaign_id=source_campaign.name,
         top_k=3,
         min_score=0.05,
-        max_rounds=2,
+        max_rounds=4,
+        max_model_calls=30,
     )
     new_config["output"].update(
         results_dir=str(directory),
@@ -390,12 +396,36 @@ def prepare_test_only_campaign(
     if not base_path.is_file():
         raise ValueError("reused corpus has no installed exploratory base")
     stored_base = json.loads(base_path.read_text(encoding="utf-8"))
+    rebuilt_qwen35 = stored_base.get("b_rebuild_version") in {
+        TRAINING_B_SCHEMA_VERSION,
+        TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
+    }
+    procedural_qwen35 = (
+        stored_base.get("b_rebuild_version")
+        == TRAINING_B_PROCEDURAL_SCHEMA_VERSION
+    )
     source_skill_sha256 = stored_base.get("skill_sha256")
     source_model = stored_base.get("model")
-    current_model = DEFAULT_LLM_MODEL
+    current_model = QWEN35_MODEL_ID if rebuilt_qwen35 else DEFAULT_LLM_MODEL
+    retriever_version = (
+        OPENSEARCH_RETRIEVER_V6
+        if procedural_qwen35
+        else (
+            OPENSEARCH_RETRIEVER_V3
+            if rebuilt_qwen35
+            else OPENSEARCH_RETRIEVER_VERSION
+        )
+    )
     _, _, current_skill_sha256 = load_skill()
     legacy_skill_mismatch = source_skill_sha256 != current_skill_sha256
     legacy_model_mismatch = source_model != current_model
+    if rebuilt_qwen35 and (
+        source_model != QWEN35_MODEL_ID
+        or opensearch_base_sha256 != stored_base.get("sha256")
+    ):
+        raise ValueError("Qwen 3.5 RAG corpus model or frozen base SHA mismatch")
+    if rebuilt_qwen35 and include_unvalidated_experimental:
+        raise ValueError("Qwen 3.5 RAG never includes unvalidated guides")
     if legacy_skill_mismatch and not allow_legacy_skill_hash:
         raise ValueError(
             "existing corpus Skill hash differs; pass the explicit legacy-corpus "
@@ -415,7 +445,11 @@ def prepare_test_only_campaign(
     )
     if not set(base["training_run_ids"]).issubset(completed_training_ids):
         raise ValueError("reused corpus contains runs outside the historical train split")
-    index = OpenSearchExperimentIndex(DEFAULT_OPENSEARCH_URL, opensearch_base_sha256)
+    index = OpenSearchExperimentIndex(
+        DEFAULT_OPENSEARCH_URL,
+        opensearch_base_sha256,
+        retriever_version=retriever_version,
+    )
     index_metadata = index.connect_existing(
         expected_pair_ids={pair["pair_id"] for pair in base["pairs"]},
         expected_a_text_version="incident-a-v2",
@@ -460,6 +494,11 @@ def prepare_test_only_campaign(
         raise ValueError("reused corpus label audit checksum mismatch")
     if audit.get("counts", {}).get("exploratory_pairs") != len(base["pairs"]):
         raise ValueError("reused corpus label audit does not match its pair count")
+    if rebuilt_qwen35 and (
+        audit.get("version") != TRAINING_B_SCHEMA_VERSION
+        or audit.get("base_sha256") != base["sha256"]
+    ):
+        raise ValueError("Qwen 3.5 RAG corpus audit does not match the frozen base")
 
     output_root = output_root or (CAMPAIGN_DIR / "out" / "exploratory_campaigns")
     campaign_id = "exploratory-rag-" + datetime.now(timezone.utc).strftime(
@@ -485,13 +524,16 @@ def prepare_test_only_campaign(
         allow_legacy_skill_hash=allow_legacy_skill_hash,
         opensearch_source_model=source_model,
         opensearch_current_model=current_model,
-        allow_legacy_model_mismatch=allow_legacy_model_mismatch,
+        allow_legacy_model_mismatch=(
+            allow_legacy_model_mismatch and legacy_model_mismatch
+        ),
         opensearch_a_text_version=index_metadata["a_text_version"],
-        retriever_version=OPENSEARCH_RETRIEVER_VERSION,
+        retriever_version=retriever_version,
         include_unvalidated_experimental=include_unvalidated_experimental,
         top_k=3,
-        min_score=0.05,
-        max_rounds=2,
+        min_score=0 if procedural_qwen35 else 0.05,
+        max_rounds=4,
+        max_model_calls=30,
         max_total_tokens=EXPLORATORY_MAX_TOTAL_TOKENS,
     )
     new_config["historical_observability"] = {
@@ -578,7 +620,7 @@ def prepare_test_only_campaign(
                 "current_model": current_model,
                 "models_match": not legacy_model_mismatch,
                 "legacy_model_mismatch_allowed": (
-                    allow_legacy_model_mismatch
+                    allow_legacy_model_mismatch and legacy_model_mismatch
                 ),
             },
             "candidate_count": len(base["pairs"]),
@@ -586,11 +628,58 @@ def prepare_test_only_campaign(
                 not pair["effect_validated"] for pair in base["pairs"]
             ),
             "include_unvalidated_experimental": include_unvalidated_experimental,
-            "guide_status": "pending",
-            "causal_status": "inconclusive",
+            "b_rebuild_version": (
+                TRAINING_B_SCHEMA_VERSION if rebuilt_qwen35 else None
+            ),
+            "published_guide_count": sum(
+                pair.get("guide_status") == "validated_success"
+                for pair in base["pairs"]
+            ),
+            "guide_status_counts": {
+                status: sum(pair.get("guide_status") == status for pair in base["pairs"])
+                for status in sorted(
+                    {pair.get("guide_status") for pair in base["pairs"]}
+                )
+            },
+            "guide_status": (
+                "mixed"
+                if rebuilt_qwen35
+                and len({pair.get("guide_status") for pair in base["pairs"]}) > 1
+                else (
+                    base["pairs"][0].get("guide_status")
+                    if rebuilt_qwen35
+                    else "pending"
+                )
+            ),
+            "causal_status": (
+                (
+                    "supported"
+                    if all(
+                        pair.get("guide_status") == "validated_success"
+                        for pair in base["pairs"]
+                    )
+                    else (
+                        "inconclusive"
+                        if not any(
+                            pair.get("guide_status") == "validated_success"
+                            for pair in base["pairs"]
+                        )
+                        else "mixed"
+                    )
+                )
+                if rebuilt_qwen35
+                else "inconclusive"
+            ),
             "require_best_guess": True,
             "test_runs_started": 0,
-            "base_is_validated": False,
+            "base_is_validated": (
+                rebuilt_qwen35
+                and all(
+                    pair.get("guide_status") == "validated_success"
+                    for pair in base["pairs"]
+                )
+            ),
+            "corpus_integrity_validated": rebuilt_qwen35,
         },
     )
     return directory
@@ -636,7 +725,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Explicitly allow an exploratory corpus produced by a different model; "
-            "the online model remains the configured LLM_MODEL"
+            "the online model remains pinned in the prepared knowledge options"
         ),
     )
     parser.add_argument(

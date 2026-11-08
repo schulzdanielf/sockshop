@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any, Literal
 from datetime import datetime
 
 import pytest
@@ -203,6 +204,8 @@ class FakeMCP:
             "loki_range_query",
             "tempo_service_graph_phases",
             "tempo_analyze_trace",
+            "get_cpu_saturation_top",
+            "get_memory_saturation_top",
         )
         properties = {
             key: {}
@@ -287,13 +290,21 @@ def run_executor(
     candidate="front-end",
     possible_fault_types=None,
     require_best_guess=False,
+    max_additional_checks=0,
+    additional_checks=0,
     archive_traces=None,
-    evidence_source="live",
+    evidence_source: Literal["live", "history"] = "live",
+    model_id: str | None = None,
+    temperature: float | None = None,
+    seed: int | None = None,
+    captured_model_kwargs: list[dict[str, Any]] | None = None,
 ):
     contexts = []
 
     def model(messages, tools, **kwargs):
         assert tools == [] and kwargs["tool_choice"] == "none"
+        if captured_model_kwargs is not None:
+            captured_model_kwargs.append(kwargs)
         context = json.loads(messages[-1]["content"])
         contexts.append(context)
         if context["stage"] == "plan":
@@ -302,6 +313,29 @@ def run_executor(
                 "hypotheses": ["Rede", "CPU"],
                 "reasoning": "Comparar sinais",
             }
+        elif context["stage"] == "additional_mcp_check":
+            check_context = context["context"]
+            if check_context["round"] <= additional_checks:
+                selected = check_context["executable_checks"][0]
+                value = {
+                    "action": "query",
+                    "reason": "Verificar a hipótese com sinal atual",
+                    "check": {
+                        "kind": selected["kind"],
+                        "service": selected["service"],
+                        "phase": selected["phase"],
+                        "hypothesis": "Distinguir a hipótese principal",
+                        "expected_support": "Sinal compatível na janela consultada",
+                        "expected_refutation": "Sinal ausente ou comportamento basal",
+                        "patterns": ["timeout"] if selected["kind"] == "logs" else [],
+                    },
+                }
+            else:
+                value = {
+                    "action": "stop",
+                    "reason": "Nenhum check adicional necessário",
+                    "check": None,
+                }
         else:
             evidence_by_family = {
                 item["family"]: item["id"]
@@ -333,14 +367,38 @@ def run_executor(
         mcp_client=client,
         phases=PHASES,
         namespace="sock-shop",
+        max_additional_checks=max_additional_checks,
         llm=model,
         window_metadata=metadata,
         possible_fault_types=possible_fault_types,
         require_best_guess=require_best_guess,
         archive_traces=archive_traces,
         evidence_source=evidence_source,
+        model=model_id,
+        temperature=temperature,
+        seed=seed,
     )
     return result, contexts
+
+
+def test_model_generation_settings_are_forwarded_to_skill_calls():
+    captured_model_kwargs = []
+
+    run_executor(
+        FakeMCP(),
+        model_id="qwen3.5-9b-grafana",
+        temperature=0.1,
+        seed=20261107,
+        captured_model_kwargs=captured_model_kwargs,
+    )
+
+    assert captured_model_kwargs
+    assert all(
+        kwargs["model"] == "qwen3.5-9b-grafana"
+        and kwargs["temperature"] == 0.1
+        and kwargs["seed"] == 20261107
+        for kwargs in captured_model_kwargs
+    )
 
 
 def test_progressive_execution_exact_log_identity_and_windows():
@@ -357,7 +415,7 @@ def test_progressive_execution_exact_log_identity_and_windows():
     assert len(logs) == 3
     assert logs[1]["start"] == PHASES["fault"]["start"]
     assert logs[1]["end"] == PHASES["fault"]["end"]
-    assert 'container="front-end"' in logs[1]["query"]
+    assert 'container=~"front-end|istio-proxy"' in logs[1]["query"]
     assert "\\-" not in logs[1]["query"]
     assert logs[1]["limit"] == 150
     term_query = next(
@@ -377,6 +435,50 @@ def test_progressive_execution_exact_log_identity_and_windows():
     assert fault_log["fault_observation_count"] == 1
     assert "prometheus_range_query" in result["tools_used"]
     assert [context["stage"] for context in contexts] == ["plan", "diagnosis"]
+
+
+def test_skill_additional_mcp_check_budget_is_capped_and_recorded():
+    client = FakeMCP()
+    result, contexts = run_executor(
+        client,
+        max_additional_checks=rca_skill.MAX_ADDITIONAL_MCP_CHECKS,
+        additional_checks=rca_skill.MAX_ADDITIONAL_MCP_CHECKS + 2,
+    )
+
+    followup_calls = [call for call in result["calls"] if call["level"] == 5]
+    assert len(followup_calls) == rca_skill.MAX_ADDITIONAL_MCP_CHECKS
+    assert len(result["additional_checks"]) == rca_skill.MAX_ADDITIONAL_MCP_CHECKS
+    assert all(
+        check["evidence_id"] in {item["id"] for item in result["evidence"]}
+        for check in result["additional_checks"]
+    )
+    assert result["additional_check_stop_reason"] == "max_additional_mcp_checks"
+    assert [context["stage"] for context in contexts].count(
+        "additional_mcp_check"
+    ) == rca_skill.MAX_ADDITIONAL_MCP_CHECKS
+    assert len(
+        [
+            call
+            for call in client.calls
+            if call[0] in {"get_cpu_saturation_top", "get_memory_saturation_top"}
+        ]
+    ) == rca_skill.MAX_ADDITIONAL_MCP_CHECKS
+
+
+def test_skill_additional_mcp_check_budget_can_stop_early():
+    client = FakeMCP()
+    result, contexts = run_executor(
+        client,
+        max_additional_checks=rca_skill.MAX_ADDITIONAL_MCP_CHECKS,
+        additional_checks=0,
+    )
+
+    assert result["additional_checks"] == []
+    assert not any(call["level"] == 5 for call in result["calls"])
+    assert result["additional_check_stop_reason"] == "Nenhum check adicional necessário"
+    assert [context["stage"] for context in contexts].count(
+        "additional_mcp_check"
+    ) == 1
 
 
 def test_historical_evidence_source_and_trace_query_budget_are_explicit():
@@ -554,14 +656,15 @@ def test_edge_latency_profiles_are_collected_before_planning():
         if name == "prometheus_range_query"
         and "last_terminated" not in arguments["query"]
     ]
-    assert len(edge_calls) == 3
+    assert len(edge_calls) == 4
+    assert any("response_flags" in arguments["query"] for arguments in edge_calls)
     assert all(arguments["step"] == "15s" for arguments in edge_calls)
     assert all(arguments["start"] == "2026-10-02T10:01:15Z" for arguments in edge_calls)
     assert all(arguments["end"] == PHASES["post"]["end"] for arguments in edge_calls)
     assert contexts[0]["context"]["edge_latency_candidates"] == ["orders"]
     assert contexts[1]["context"]["edge_latency_candidates"] == ["orders"]
     assert any(
-        'container="orders"' in arguments["query"]
+        'container=~"orders|istio-proxy"' in arguments["query"]
         for name, arguments in client.calls
         if name == "loki_range_query"
     )

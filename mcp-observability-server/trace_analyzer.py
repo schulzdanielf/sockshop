@@ -519,7 +519,7 @@ def _parse_spans(trace_data: Dict) -> List[Dict]:
                 # Fallback: HTTP spans with 4xx/5xx status codes that don't set OTLP status
                 if not is_error:
                     for attr in span.get("attributes", []):
-                        if attr.get("key") == "http.status_code":
+                        if attr.get("key") in {"http.status_code", "http.response.status_code"}:
                             try:
                                 if int(_attr_value(attr)) >= 400:
                                     is_error = True

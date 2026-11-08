@@ -1,0 +1,11 @@
+version: controlled-cpu-fault-mean80-v1
+campaign_id: controlled-20261103T234452388707Z
+user_authorized: true
+scope: completed and remaining cpu-hog cells in this campaign
+aggregation: arithmetic_mean
+window: fault
+minimum_quota_fraction: 0.8
+sustained_duration_required: false
+upper_bound: null
+preserve_original_ledger: true
+preserve_recovery_cleanup_load_stop_and_history_gates: true

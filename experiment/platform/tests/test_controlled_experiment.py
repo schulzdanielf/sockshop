@@ -62,6 +62,16 @@ def test_cpu_requires_profile_and_does_not_equate_load_to_quota():
     })
     assert candidate["candidate_target_quota_fraction"] == 1.0
     assert candidate["calibration_status"] == "candidate"
+    minimum = controlled.resource_environment("cpu-hog", limits, baseline, {
+        "cpu": {
+            "cores": 2, "load": 100, "minimum_quota_fraction": .8,
+            "calibration_status": "candidate", "rationale": "minimum acceptance rule",
+        },
+    })
+    assert minimum["cpu_acceptance_mode"] == "minimum_mean"
+    assert minimum["minimum_quota_fraction"] == .8
+    assert minimum["environment"]["CPU_CORES"] == "2"
+    assert minimum["environment"]["CPU_LOAD"] == "100"
 
 
 @pytest.mark.parametrize("key,value", [
@@ -69,12 +79,22 @@ def test_cpu_requires_profile_and_does_not_equate_load_to_quota():
     ("load", 100.5), ("load", "100"), ("load", 101),
     ("target_quota_fraction", float("nan")), ("target_quota_fraction", 1.1),
     ("target_tolerance_fraction", float("inf")), ("target_tolerance_fraction", False),
+    ("minimum_quota_fraction", float("nan")), ("minimum_quota_fraction", .69),
+    ("minimum_quota_fraction", True),
 ])
 def test_cpu_profile_rejects_malformed_values_before_a_campaign(key, value):
     profile = {"cores": 1, "load": 100, "evidence": "calibration"}
     profile[key] = value
     with pytest.raises(controlled.GateBlocked, match="invalid candidate CPU"):
         controlled.validate_cpu_profile({"cpu": profile})
+
+
+def test_cpu_profile_rejects_mixed_target_and_minimum_modes():
+    with pytest.raises(controlled.GateBlocked, match="invalid candidate CPU"):
+        controlled.validate_cpu_profile({"cpu": {
+            "cores": 2, "load": 100, "target_quota_fraction": .9,
+            "minimum_quota_fraction": .8, "evidence": "calibration",
+        }})
 
 
 @pytest.mark.parametrize("fraction,passes", [(.699, True), (.70, False), (.92, False)])
@@ -92,10 +112,14 @@ def test_cpu_baseline_gate_keeps_exact_seventy_percent_boundary(fraction, passes
 def test_orchestration_budget_keeps_stage_limits_and_outlives_load():
     budget = controlled.build_time_budget({
         "workflow_timeout_seconds": 600, "recovery_timeout_seconds": 300,
-        "resilience": {"operational_timeout_seconds": 600},
+        "resilience": {
+            "operational_timeout_seconds": 600,
+            "late_operational_timeout_seconds": 600,
+        },
     })
     assert budget["stages"]["experimental_recovery"] == 300
     assert budget["stages"]["operational_recovery"] == 600
+    assert budget["stages"]["late_operational_recovery"] == 600
     assert budget["load_seconds"] == sum(budget["stages"].values())
     assert budget["load_seconds"] > 1800
     assert budget["poll_seconds"] == budget["load_seconds"] + 300
@@ -1255,6 +1279,85 @@ def test_cpu_candidate_for_100_percent_requires_sustained_quota_attainment(measu
     assert run.report["gates"]["intervention_confirmed_on_target"] is expected
 
 
+@pytest.mark.parametrize(
+    "last_at_minimum,expected_seconds",
+    [(35, 5), (85, 55), (90, 60)],
+)
+def test_cpu_minimum_quota_gate_uses_fault_phase_mean_only(
+    last_at_minimum, expected_seconds,
+):
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec("cpu-hog"))
+    run.baseline = {
+        "cpu_cores": {"status": "ok", "mean": .03, "p95": .04},
+        "errors_percent": {"status": "ok", "mean": 0, "p95": 0},
+        "latency_ms": {"status": "ok", "mean": 20, "p95": 20},
+    }
+    run.report["intensity"] = {
+        "quota_cores": .3, "calibration_status": "candidate",
+        "calibration": {"minimum_quota_fraction": .8},
+    }
+    run.window = {"phase_sources": {"fault": "estimated"}}
+    points = []
+    fractions = []
+    for timestamp in range(0, 181, 5):
+        fraction = .90 if timestamp < 30 else .80 if timestamp <= last_at_minimum else .79
+        fractions.append(fraction)
+        points.append([timestamp, str(.3 * fraction)])
+    mean_fraction = sum(fractions) / len(fractions)
+    run.raw["intervention"] = {"data": {
+        "cpu_cores": {"status": "success", "data": {"result": [{"values": points}]}},
+        "errors_percent": {"status": "success", "data": {"result": []}},
+    }}
+    run.evaluate_effect({
+        "cpu_cores": {"status": "ok", "mean": .3 * mean_fraction},
+        "errors_percent": {"status": "ok", "mean": 0},
+        "latency_ms": {"status": "ok", "mean": 20},
+    }, "1970-01-01T00:00:00+00:00")
+    attainment = run.report["gates"]["mechanism_observed"]["target_attainment"]
+    assert attainment["mode"] == "minimum_mean"
+    assert attainment["minimum_quota_fraction"] == .8
+    assert attainment["mean_passed"] is True
+    assert attainment["passed"] is True
+    assert attainment["sustained_requirement_applied"] is False
+    assert attainment["observed_seconds"] == pytest.approx(expected_seconds)
+    assert run.report["gates"]["mechanism_observed"][
+        "cpu_delta_sustained_diagnostic"
+    ]["passed"] is (expected_seconds == 60)
+    assert run.report["gates"]["mechanism_observed"]["passed"] is True
+    assert run.report["gates"]["intervention_confirmed_on_target"] is True
+
+
+@pytest.mark.parametrize("fraction,expected", [(.8, True), (.799, False)])
+def test_cpu_minimum_mean_gate_uses_inclusive_80_percent_floor(fraction, expected):
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec("cpu-hog"))
+    run.baseline = {
+        "cpu_cores": {"status": "ok", "mean": .03, "p95": .04},
+        "errors_percent": {"status": "ok", "mean": 0, "p95": 0},
+        "latency_ms": {"status": "ok", "mean": 20, "p95": 20},
+    }
+    run.report["intensity"] = {
+        "quota_cores": .3, "calibration_status": "candidate",
+        "calibration": {"minimum_quota_fraction": .8},
+    }
+    run.window = {"phase_sources": {"fault": "estimated"}}
+    points = [[timestamp, str(.3 * fraction)] for timestamp in range(0, 181, 5)]
+    run.raw["intervention"] = {"data": {
+        "cpu_cores": {"status": "success", "data": {"result": [{"values": points}]}},
+        "errors_percent": {"status": "success", "data": {"result": []}},
+    }}
+    run.evaluate_effect({
+        "cpu_cores": {"status": "ok", "mean": .3 * fraction},
+        "errors_percent": {"status": "ok", "mean": 0},
+        "latency_ms": {"status": "ok", "mean": 20},
+    }, "1970-01-01T00:00:00+00:00")
+    mechanism = run.report["gates"]["mechanism_observed"]
+    assert mechanism["target_attainment"]["observed_mean_fraction"] == pytest.approx(fraction)
+    assert mechanism["target_attainment"]["mean_passed"] is expected
+    assert mechanism["target_attainment"]["passed"] is expected
+    assert mechanism["passed"] is expected
+    assert run.report["gates"]["intervention_confirmed_on_target"] is expected
+
+
 @pytest.mark.parametrize("sampling_fails", [False, True])
 def test_memory_workflow_samples_after_submission_before_first_safety_check(monkeypatch, sampling_fails):
     chaos = Mock()
@@ -1529,6 +1632,40 @@ def test_recovery_timeout_stays_a_failure_after_operational_success(monkeypatch)
     run.operational_recovery.assert_called_once()
 
 
+def test_recovery_timeout_gets_one_bounded_late_passive_window(monkeypatch):
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec())
+    run.policy["recovery_timeout_seconds"] = 1
+    run.policy["resilience"] = {
+        "version": 1,
+        "operational_timeout_seconds": 600,
+        "late_operational_timeout_seconds": 600,
+        "stable_seconds": 120,
+    }
+    run.wait = Mock()
+    run.mark = Mock()
+    run.checkpoint = Mock()
+    run.recovery_check = Mock(return_value={"passed": False})
+    monkeypatch.setattr(controlled.time, "monotonic", Mock(side_effect=[0, 2]))
+
+    def recovery_window(*, gate_name="operational_recovery", timeout_seconds=None):
+        run.report["gates"][gate_name] = {"passed": True}
+        if gate_name == "operational_recovery":
+            run.report["gates"][gate_name]["passed"] = False
+            return False
+        assert gate_name == "late_operational_recovery"
+        assert timeout_seconds == 600
+        return run.report["gates"][gate_name]["passed"]
+
+    run.operational_recovery = Mock(side_effect=recovery_window)
+    with pytest.raises(RuntimeError, match="recovery not confirmed"):
+        run.recover()
+
+    assert run.report["gates"]["recovery"]["passed"] is False
+    assert run.report["gates"]["operational_recovery"]["passed"] is False
+    assert run.report["gates"]["late_operational_recovery"]["passed"] is True
+    assert run.operational_recovery.call_count == 2
+
+
 def test_operational_recovery_not_enabled_for_old_specs():
     run = controlled.ControlledRun(Mock(), "run-1", make_spec())
     run.policy.pop("resilience", None)
@@ -1571,4 +1708,54 @@ def test_recovery_check_keeps_original_thresholds_and_rejects_missing_data(faile
         summary[failed_metric]["p95"] = {"cpu_cores": .151, "latency_ms": 481}[failed_metric]
     run.collect = Mock(return_value=summary)
     run.health = Mock(return_value={"healthy": True})
-    assert run.recovery_check()["passed"] is (failed_metric is None)
+    result = run.recovery_check()
+    assert result["passed"] is (failed_metric is None)
+    assert result["metric_checks"]["traffic"]["passed"] is (
+        failed_metric not in {"traffic"}
+    )
+    assert result["metric_checks"]["cpu_cores"]["passed"] is (
+        failed_metric not in {"cpu_cores", "no_data"}
+    )
+    assert result["metric_checks"]["latency_ms"]["passed"] is (
+        failed_metric != "latency_ms"
+    )
+    if failed_metric == "no_data":
+        assert result["metric_checks"]["cpu_cores"]["reason"] == (
+            "missing_or_insufficient_samples"
+        )
+    elif failed_metric:
+        assert result["metric_checks"][failed_metric]["reason"] == "threshold_not_met"
+
+
+def test_recovery_check_applies_only_explicit_latency_limit_override():
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec())
+    values = {
+        "traffic": 5,
+        "cpu_cores": .1,
+        "memory_bytes": 400 * 2**20,
+        "errors_percent": 0,
+        "latency_ms": 305,
+    }
+    run.baseline = {
+        key: {"status": "ok", "samples": 12, "mean": value, "p95": value}
+        for key, value in values.items()
+    }
+    summary = copy.deepcopy(run.baseline)
+    summary["latency_ms"]["p95"] = 369
+    run.collect = Mock(return_value=summary)
+    run.health = Mock(return_value={"healthy": True})
+
+    original = run.recovery_check()
+    amended = run.recovery_check(latency_p95_limit_override_ms=370)
+
+    assert original["passed"] is False
+    assert original["metric_checks"]["latency_ms"]["threshold"] == 366
+    assert amended["passed"] is True
+    assert amended["metric_checks"]["latency_ms"]["threshold"] == 370
+    for metric in ("traffic", "cpu_cores", "memory_bytes", "errors_percent"):
+        assert (
+            amended["metric_checks"][metric]["threshold"]
+            == original["metric_checks"][metric]["threshold"]
+        )
+    with pytest.raises(ValueError, match="cannot lower"):
+        run.recovery_check(latency_p95_limit_override_ms=365)

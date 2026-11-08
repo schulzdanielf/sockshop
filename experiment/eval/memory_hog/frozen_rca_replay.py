@@ -364,6 +364,7 @@ def _prepare_cases(
                     include_unvalidated_experimental=(
                         include_unvalidated_experimental
                     ),
+                    query_fields=a.retrieval_fields(),
                 )
             else:
                 retrieved = retrieve_pairs(

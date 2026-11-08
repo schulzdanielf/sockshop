@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -56,6 +57,7 @@ from .controlled_experiment import CONTROLLED_CAMPAIGN_PROTOCOL_VERSION
 from .domain import DomainEvent
 from .analysis.mcp_investigator import investigate_metric_window
 from .agent_console import (
+    _mcp_exception_detail,
     answer_query,
     answer_query_mcp,
     answer_run_rca_mcp,
@@ -97,9 +99,18 @@ from .history_archive import (
 )
 from .history_stream import validate_history_stream
 from .security import require_roles
-from .rca_skill import SkillRCAError, answer_skill_rca
+from .rca_skill import (
+    SkillRCAError,
+    answer_skill_rca,
+)
 from .rca_options import RCABenchmarkOptions
 from .rca_knowledge import (
+    OPENSEARCH_RETRIEVER_V4,
+    OPENSEARCH_RETRIEVER_V5,
+    OPENSEARCH_RETRIEVER_V6,
+    QWEN35_MODEL_ID,
+    TRAINING_B_SCHEMA_VERSION,
+    TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
     VERSION as KNOWLEDGE_VERSION,
     FreezeRequest,
     KnowledgeOptions,
@@ -121,6 +132,15 @@ from .multiagent_rca import (
 )
 from .analysis.system_card import SystemCardError, load_system_card
 from .storage.sqlite_storage import SqliteStorage
+
+logger = logging.getLogger(__name__)
+KNOWLEDGE_EVALUATION_ROOT = (
+    Path(__file__).resolve().parents[2]
+    / "eval"
+    / "memory_hog"
+    / "out"
+    / "knowledge_evaluation"
+)
 
 
 def _select_telemetry_windows(
@@ -267,6 +287,14 @@ def create_app() -> FastAPI:
                 "annotate", "control", "rag", "exploratory_control",
                 "exploratory_rag",
             ],
+            "procedural_opensearch_retrievers": [
+                OPENSEARCH_RETRIEVER_V4,
+                OPENSEARCH_RETRIEVER_V5,
+                OPENSEARCH_RETRIEVER_V6,
+            ],
+            "recommended_procedural_retriever": OPENSEARCH_RETRIEVER_V6,
+            "recommended_evaluation_min_score": 0,
+            "a_text_version": "incident-a-v2",
         }
 
     def knowledge_store(corpus_id: str) -> KnowledgeStore:
@@ -337,6 +365,53 @@ def create_app() -> FastAPI:
         mode = "exploratory" if path.name == "exploratory_base.json" else "validated"
         return base, mode
 
+    def latest_corpus_evaluation(corpus_id: str, corpus_sha256: str) -> dict | None:
+        if not KNOWLEDGE_EVALUATION_ROOT.is_dir():
+            return None
+
+        matches = []
+        report_paths = sorted(
+            KNOWLEDGE_EVALUATION_ROOT.glob("test-base-*/test_base_rag_evaluation.json")
+        )
+        for report_path in report_paths:
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "Skipping unreadable RAG evaluation report %s: %s",
+                    report_path,
+                    exc,
+                )
+                continue
+            if not isinstance(report, dict):
+                logger.warning(
+                    "Skipping malformed RAG evaluation report %s", report_path
+                )
+                continue
+
+            provenance = report.get("provenance")
+            evaluation_id = report.get("evaluation_id")
+            if (
+                not isinstance(provenance, dict)
+                or not isinstance(evaluation_id, str)
+                or evaluation_id != report_path.parent.name
+                or provenance.get("corpus_id") != corpus_id
+                or provenance.get("corpus_sha256") != corpus_sha256
+            ):
+                continue
+            matches.append(
+                {
+                    "evaluation_id": evaluation_id,
+                    "retriever_version": provenance.get("retriever_version"),
+                }
+            )
+
+        return max(
+            matches,
+            key=lambda evaluation: evaluation["evaluation_id"].rsplit("-", 1)[-1],
+            default=None,
+        )
+
     @app.get("/api/skill-rag/corpora")
     def list_skill_knowledge_corpora(
         _: str = Depends(require_roles({"chaos_engineer", "admin"})),
@@ -370,6 +445,9 @@ def create_app() -> FastAPI:
                         pair.get("effect_validated") is True for pair in pairs
                     ),
                     "training_run_count": len(base["training_run_ids"]),
+                    "latest_evaluation": latest_corpus_evaluation(
+                        directory.name, base["sha256"]
+                    ),
                 }
             )
         return corpora
@@ -393,6 +471,7 @@ def create_app() -> FastAPI:
             "labels",
             "guide_status",
             "causal_status",
+            "b_procedural_status",
             "effect_validated",
             "review_status",
             "sha256",
@@ -407,7 +486,15 @@ def create_app() -> FastAPI:
             "a_text_version": base.get("a_text_version"),
             "pair_count": len(base["pairs"]),
             "pairs": [
-                {key: pair[key] for key in pair_fields if key in pair}
+                {
+                    **{key: pair[key] for key in pair_fields if key in pair},
+                    "b_eligible": (
+                        pair["guide_status"] == "procedurally_validated"
+                        and pair["b_procedural_status"] == "passed"
+                        if "guide_status" in pair and "b_procedural_status" in pair
+                        else None
+                    ),
+                }
                 for pair in base["pairs"]
             ],
         }
@@ -463,6 +550,14 @@ def create_app() -> FastAPI:
                 allow_legacy_model_mismatch=allow_legacy_model_mismatch,
             )
             _, _, current_skill_sha256 = load_skill()
+            current_model = (
+                QWEN35_MODEL_ID
+                if base.get("b_rebuild_version") in {
+                    TRAINING_B_SCHEMA_VERSION,
+                    TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
+                }
+                else DEFAULT_LLM_MODEL
+            )
             if (
                 not allow_legacy_skill_hash
                 and base["skill_sha256"] != current_skill_sha256
@@ -483,8 +578,8 @@ def create_app() -> FastAPI:
                 ),
                 "legacy_skill_hash_allowed": allow_legacy_skill_hash,
                 "source_model": base["model"],
-                "current_model": DEFAULT_LLM_MODEL,
-                "models_match": base["model"] == DEFAULT_LLM_MODEL,
+                "current_model": current_model,
+                "models_match": base["model"] == current_model,
                 "legacy_model_mismatch_allowed": allow_legacy_model_mismatch,
             }
         except (ValueError, KeyError, OSError) as exc:
@@ -500,19 +595,76 @@ def create_app() -> FastAPI:
             run = storage.get_run(run_id)
             spec = storage.get_experiment(run.experiment_id, run.experiment_version).spec
             expected_split = "train" if options.mode == "annotate" else "test"
-            if spec.get("knowledge_campaign") != {
+            store = knowledge_store(options.corpus_id)
+            pinned_campaign = spec.get("knowledge_campaign") or {}
+            external_test_base = None
+            if options.external_test_evaluation_id is not None:
+                if (
+                    options.mode not in {"exploratory_control", "exploratory_rag"}
+                    or getattr(getattr(run, "status", None), "value", None)
+                    != "completed"
+                    or pinned_campaign.get("split") != "test"
+                ):
+                    raise ValueError(
+                        "external test evaluation requires a completed run pinned "
+                        "to the test split and an exploratory mode"
+                    )
+                external_test_base = store.load_exploratory_base(
+                    expected_skill_sha256=(
+                        options.opensearch_source_skill_sha256
+                        if options.mode == "exploratory_rag"
+                        and options.retrieval_backend == "opensearch"
+                        else None
+                    ),
+                    expected_model=(
+                        options.opensearch_source_model
+                        if options.mode == "exploratory_rag"
+                        and options.retrieval_backend == "opensearch"
+                        else None
+                    ),
+                    allow_legacy_model_mismatch=(
+                        options.allow_legacy_model_mismatch
+                        if options.mode == "exploratory_rag"
+                        and options.retrieval_backend == "opensearch"
+                        else False
+                    ),
+                )
+                if (
+                    external_test_base.get("sha256")
+                    != options.external_test_base_sha256
+                ):
+                    raise ValueError(
+                        "external test evaluation base SHA-256 does not match"
+                    )
+                if run_id in set(external_test_base.get("training_run_ids") or []):
+                    raise ValueError(
+                        "external test run is present in the frozen corpus training set"
+                    )
+                if (
+                    options.mode == "exploratory_rag"
+                    and options.opensearch_base_sha256
+                    != external_test_base.get("sha256")
+                ):
+                    raise ValueError(
+                        "external test evaluation and OpenSearch base SHA-256 differ"
+                    )
+            elif pinned_campaign != {
                 "corpus_id": options.corpus_id, "split": expected_split
             }:
                 raise ValueError("knowledge mode does not match the run's pinned split/corpus")
-            store = knowledge_store(options.corpus_id)
             experimental_suffix = (
                 "_include_unvalidated_experimental"
                 if options.include_unvalidated_experimental
                 else ""
             )
+            external_test_suffix = (
+                f"_external_{options.external_test_evaluation_id}"
+                if options.external_test_evaluation_id is not None
+                else ""
+            )
             key = (
                 f"skill_knowledge_{options.corpus_id}_{options.mode}"
-                f"{experimental_suffix}"
+                f"{experimental_suffix}{external_test_suffix}"
             )
             fingerprint = knowledge_digest(options.model_dump())
             with store.locked():
@@ -530,23 +682,24 @@ def create_app() -> FastAPI:
                     if history_cache_valid:
                         return {**previous, "cached": True}
                 if options.mode == "exploratory_rag":
-                    store.load_exploratory_base(
-                        expected_skill_sha256=(
-                            options.opensearch_source_skill_sha256
-                            if options.retrieval_backend == "opensearch"
-                            else None
-                        ),
-                        expected_model=(
-                            options.opensearch_source_model
-                            if options.retrieval_backend == "opensearch"
-                            else None
-                        ),
-                        allow_legacy_model_mismatch=(
-                            options.allow_legacy_model_mismatch
-                            if options.retrieval_backend == "opensearch"
-                            else False
-                        ),
-                    )
+                    if external_test_base is None:
+                        store.load_exploratory_base(
+                            expected_skill_sha256=(
+                                options.opensearch_source_skill_sha256
+                                if options.retrieval_backend == "opensearch"
+                                else None
+                            ),
+                            expected_model=(
+                                options.opensearch_source_model
+                                if options.retrieval_backend == "opensearch"
+                                else None
+                            ),
+                            allow_legacy_model_mismatch=(
+                                options.allow_legacy_model_mismatch
+                                if options.retrieval_backend == "opensearch"
+                                else False
+                            ),
+                        )
                 elif options.mode not in {"annotate", "exploratory_control"}:
                     store.load_base()
                 controlled = spec.get("controlled_campaign") or {}
@@ -585,9 +738,25 @@ def create_app() -> FastAPI:
                 )
                 result.update(
                     run_id=run_id, attempt_id=uuid4().hex,
-                    options_sha256=fingerprint, model=DEFAULT_LLM_MODEL,
+                    options_sha256=fingerprint,
+                    model=(
+                        options.opensearch_current_model
+                        or options.model
+                        or DEFAULT_LLM_MODEL
+                    ),
+                    temperature=options.temperature,
+                    seed=options.seed,
                     observability_source="history",
                 )
+                if options.external_test_evaluation_id is not None:
+                    result.update(
+                        external_test_evaluation_id=(
+                            options.external_test_evaluation_id
+                        ),
+                        external_test_base_sha256=(
+                            options.external_test_base_sha256
+                        ),
+                    )
                 path = storage.save_artifact(
                     run_id, f"{key}_{result['attempt_id']}", result
                 )
@@ -884,15 +1053,16 @@ def create_app() -> FastAPI:
         metrics_config = (
             experiment.spec.get("observability", {}).get("metrics", {}) or {}
         )
-        mcp_url = metrics_config.get("mcp_sse_url")
-        if not mcp_url:
-            raise HTTPException(
-                status_code=409,
-                detail="experiment has no MCP metrics endpoint configured",
-            )
-
+        traces_config = (
+            experiment.spec.get("observability", {}).get("traces", {}) or {}
+        )
+        historical = experiment.spec.get("historical_observability") or {}
+        mcp_url = (
+            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
+        )
         mcp_client = MCPToolClient(
-            str(mcp_url), int(metrics_config.get("timeout_seconds", 10))
+            str(mcp_url),
+            _mcp_client_timeout_seconds(metrics_config, traces_config, historical),
         )
         grafana_mcp_url = os.getenv("GRAFANA_MCP_SSE_URL", "").strip()
         if req.use_model and grafana_mcp_url:
@@ -975,7 +1145,9 @@ def create_app() -> FastAPI:
             except Exception as exc:
                 span.record_exception(exc)
                 span.set_status(Status(StatusCode.ERROR, str(exc)))
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=502, detail=_mcp_exception_detail(exc)
+                ) from exc
 
             span.set_attribute("rca.agent.answer_chars", len(answer))
             span.add_event(
@@ -1277,15 +1449,17 @@ def create_app() -> FastAPI:
                     "error": str(exc),
                 }
         attempt_id = uuid4().hex
+        model = options.model or DEFAULT_LLM_MODEL
         with get_tracer().start_as_current_span("agent.skill_rca") as span:
             span.set_attribute("rca.run_id", run_id)
             span.set_attribute("rca.attempt_id", attempt_id)
-            span.set_attribute(GenAI.REQUEST_MODEL, DEFAULT_LLM_MODEL)
+            span.set_attribute(GenAI.REQUEST_MODEL, model)
             try:
                 result = answer_skill_rca(
                     mcp_client=MCPToolClient(str(historical_url), timeout),
                     phases=phases,
                     namespace=str(experiment.spec.get("scope", {}).get("namespace", "sock-shop")),
+                    max_additional_checks=options.max_additional_checks,
                     window_metadata={
                         key: window[key]
                         for key in ("phase_sources", "partial", "sampling_interval_seconds")
@@ -1295,6 +1469,9 @@ def create_app() -> FastAPI:
                     require_best_guess=options.require_best_guess,
                     archive_traces=archive_traces,
                     evidence_source="history",
+                    model=model,
+                    temperature=options.temperature,
+                    seed=options.seed,
                 )
             except (SkillRCAError, OSError) as exc:
                 span.record_exception(exc)
@@ -1305,7 +1482,9 @@ def create_app() -> FastAPI:
                     "run_id": run_id,
                     "attempt_id": attempt_id,
                     "window": window["window"],
-                    "model": DEFAULT_LLM_MODEL,
+                    "model": model,
+                    "temperature": options.temperature,
+                    "seed": options.seed,
                     "history_archive": {
                         "status": archive_status,
                         "campaign_id": (

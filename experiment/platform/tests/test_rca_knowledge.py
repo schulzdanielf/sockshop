@@ -146,6 +146,24 @@ def investigate(
     )
 
 
+@pytest.mark.parametrize("required", [False, True])
+def test_initial_diagnosis_receives_best_guess_option(tmp_path, monkeypatch, required):
+    received = []
+    answer_skill_rca = knowledge.answer_skill_rca
+
+    def tracking_answer_skill_rca(*args, **kwargs):
+        received.append(kwargs.get("require_best_guess"))
+        return answer_skill_rca(*args, **kwargs)
+
+    monkeypatch.setattr(knowledge, "answer_skill_rca", tracking_answer_skill_rca)
+    result = investigate(
+        tmp_path, model=Model(query=True), require_best_guess=required
+    )
+
+    assert result["status"] == "confirmed", result
+    assert received == [required]
+
+
 def test_model_builds_a_blind_and_b_guided_with_actual_queries(tmp_path):
     model = Model(query=True)
     result = investigate(tmp_path, model=model)
@@ -511,7 +529,7 @@ def test_repeated_check_is_recorded_and_marks_diagnosis_inconclusive(tmp_path):
     )
 
     assert result["status"] == "inconclusive"
-    assert result["stop_reason"] == "reserved_final_budget"
+    assert result["stop_reason"] == "repeated_check"
     assert result["unresolved_check_rejection"] == "repeated_check"
     assert [item["status"] for item in result["additional_checks"]] == [
         "ok",
@@ -731,6 +749,67 @@ def test_exploratory_rag_retrieves_inconclusive_pairs_without_promoting_them(
         assert "Os exemplos fornecidos tiveram efeito" not in notice
     with pytest.raises(ValueError, match="cannot be frozen as a validated base"):
         store.freeze(["train"])
+
+
+def test_blind_live_review_keeps_predictions_separate_from_labels(
+    tmp_path, monkeypatch
+):
+    import numpy as np
+
+    pair = investigate(tmp_path)["pair"]
+    pair["guide_status"] = "pending"
+    pair["causal_status"] = "inconclusive"
+    pair["review_status"] = knowledge.BLIND_LIVE_REVIEW_STATUS
+    pair["review_manifest_sha256"] = "a" * 64
+    pair["b"]["diagnosis"]["status"] = "inconclusive"
+    pair["labels"]["causal_category"] = pair["b"]["diagnosis"]["category"]
+    pair["b"]["diagnosis"]["primary_service"] = "unverified-service"
+    pair["b"]["diagnosis"]["fault_type"] = "memory-hog"
+    pair["b"]["diagnosis"]["category"] = "unknown"
+    pair["sha256"] = knowledge.digest(
+        {key: value for key, value in pair.items() if key != "sha256"}
+    )
+
+    provider = type(
+        "Provider",
+        (),
+        {
+            "name": "test-provider",
+            "dim": 2,
+            "embed": staticmethod(lambda _text: np.asarray([1.0, 0.0])),
+        },
+    )()
+    monkeypatch.setattr(knowledge, "get_embedding_provider", lambda: provider)
+    monkeypatch.setattr(
+        knowledge, "load_skill", lambda: ("", {}, pair["skill_hash"])
+    )
+    payload = {
+        "version": knowledge.VERSION,
+        "a_text_version": pair["a"]["text_version"],
+        "mode": "exploratory",
+        "embedding_provider": provider.name,
+        "embedding_dim": provider.dim,
+        "skill_sha256": pair["skill_hash"],
+        "model": knowledge.DEFAULT_LLM_MODEL,
+        "training_run_ids": [pair["source_run_id"]],
+        "pairs": [pair],
+        "index": {pair["pair_id"]: [1.0, 0.0]},
+    }
+    store = knowledge.KnowledgeStore(tmp_path, "blind-review-corpus")
+    store.directory.mkdir(parents=True, exist_ok=True)
+    (store.directory / "exploratory_base.json").write_text(
+        json.dumps({**payload, "sha256": knowledge.digest(payload)}),
+        encoding="utf-8",
+    )
+
+    loaded = store.load_exploratory_base()
+    projected = knowledge.compact_exploratory_history(loaded["pairs"][0])
+
+    assert loaded["pairs"][0]["review_status"] == knowledge.BLIND_LIVE_REVIEW_STATUS
+    assert loaded["pairs"][0]["labels"]["service"] != "unverified-service"
+    assert loaded["pairs"][0]["b"]["diagnosis"]["fault_type"] == "memory-hog"
+    assert "labels" not in projected
+    assert "diagnosis" not in projected
 
 
 def test_unvalidated_experimental_inclusion_requires_exploratory_rag():
@@ -1215,6 +1294,45 @@ def test_a_v2_extracts_metric_links_from_evidence_not_model_descriptions():
     assert "metric=cpu_saturation_pct service=catalogue" in a.retrieval_text()
     assert "E001" not in a.retrieval_text()
     assert PHASES["fault"]["start"] not in a.retrieval_text()
+    assert a.metric_narrative_version == "facts-v1"
+    assert "Servico=catalogue" in a.metric_changes[0].description
+    assert "fault=54.73" in a.metric_changes[0].description
+    assert "orders" not in a.metric_changes[0].description
+
+
+@pytest.mark.parametrize("replacement", [
+    "Servico=carts; request_rate=99.94/95.53",
+    "Servico=front-end; latency_p95 aumentou de 0.69 para 0.62",
+    "Servico=orders; error_rate aumentou de 0.04 para 0.02",
+])
+def test_factual_metric_narrative_rejects_entity_direction_and_value_changes(replacement):
+    evidence = metric_evidence()
+    a = knowledge.enrich_incident_a(
+        knowledge.IncidentA.model_validate(document()), evidence,
+        {"catalogue", "front-end"},
+    )
+    saved = knowledge.IncidentA.model_validate(a.model_dump())
+    knowledge.validate_a(saved, evidence, {"catalogue", "front-end"})
+    saved.metric_changes[0].description = replacement
+    with pytest.raises(ValueError, match="metric narrative differs"):
+        knowledge.validate_a(saved, evidence, {"catalogue", "front-end"})
+
+
+def test_factual_a_supports_online_historical_golden_mean_rows():
+    evidence = metric_evidence()
+    metric = evidence[0]["digest"]["metrics"]["cpu_saturation_pct"]
+    metric["top"] = [{
+        "service": "catalogue", "baseline_mean": 15.07, "fault_mean": 54.73,
+    }]
+    del metric["top_delta"]
+    a = knowledge.enrich_incident_a(
+        knowledge.IncidentA.model_validate(document()), evidence,
+        {"catalogue", "front-end"},
+    )
+    assert len(a.metric_facts) == 1
+    assert a.metric_facts[0].source_path.endswith("/top/0")
+    assert a.metric_facts[0].delta == 39.66
+    knowledge.validate_a(a, evidence, {"catalogue", "front-end"})
 
 
 def test_historical_metric_projection_is_diverse_and_retains_source_links():
@@ -1666,3 +1784,286 @@ def test_rag_prompt_treats_historical_ground_truth_as_nontransferable():
     assert "target_result" in prompts[0]
     assert "descrevem somente o caso historico" in prompts[0]
     assert "nao transfira sua conclusao para o caso atual" in prompts[0]
+
+
+def test_qwen35_retriever_pins_model_for_options_and_model_calls():
+    options = knowledge.KnowledgeOptions(
+        corpus_id="qwen35-corpus",
+        mode="exploratory_rag",
+        possible_fault_types=["container-kill"],
+        retrieval_backend="opensearch",
+        opensearch_base_sha256="a" * 64,
+        opensearch_source_skill_sha256="b" * 64,
+        opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+        opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+        retriever_version=knowledge.OPENSEARCH_RETRIEVER_V3,
+    )
+    received = {}
+
+    def capture(messages, tools, **kwargs):
+        received.update(kwargs)
+        return {"content": "ok", "usage": {"total_tokens": 1}}
+
+    session = knowledge.ModelSession(capture, options)
+    session.invoke([{"role": "user", "content": "teste"}], [], max_new_tokens=8)
+
+    assert received["model"] == knowledge.QWEN35_MODEL_ID
+    with pytest.raises(ValueError, match="Qwen 3.5"):
+        knowledge.KnowledgeOptions(
+            corpus_id="qwen35-corpus",
+            mode="exploratory_rag",
+            possible_fault_types=["container-kill"],
+            retrieval_backend="opensearch",
+            opensearch_base_sha256="a" * 64,
+            opensearch_source_skill_sha256="b" * 64,
+            opensearch_source_model="qwen-14b",
+            opensearch_current_model="qwen-14b",
+            retriever_version=knowledge.OPENSEARCH_RETRIEVER_V3,
+        )
+
+
+def test_model_session_forwards_configured_temperature_and_seed():
+    received = {}
+    options = knowledge.KnowledgeOptions(
+        corpus_id="qwen35-corpus",
+        mode="exploratory_rag",
+        possible_fault_types=["container-kill"],
+        model="qwen3.5-9b-grafana",
+        temperature=0.1,
+        seed=20261107,
+    )
+
+    def capture(messages, tools, **kwargs):
+        received.update(kwargs)
+        return {"content": "ok", "usage": {"total_tokens": 1}}
+
+    knowledge.ModelSession(capture, options).invoke(
+        [{"role": "user", "content": "test"}], []
+    )
+
+    assert received["temperature"] == 0.1
+    assert received["seed"] == 20261107
+    assert received["model"] == "qwen3.5-9b-grafana"
+
+
+def test_qwen35_procedural_retriever_has_separate_effect_eligibility():
+    options = knowledge.KnowledgeOptions(
+        corpus_id="qwen35-procedural-corpus",
+        mode="exploratory_rag",
+        possible_fault_types=["container-kill"],
+        retrieval_backend="opensearch",
+        opensearch_base_sha256="a" * 64,
+        opensearch_source_skill_sha256="b" * 64,
+        opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+        opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+        retriever_version=knowledge.OPENSEARCH_RETRIEVER_V4,
+    )
+    assert options.retriever_version == knowledge.OPENSEARCH_RETRIEVER_V4
+
+    bm25_options = knowledge.KnowledgeOptions(
+        corpus_id="qwen35-procedural-bm25-corpus",
+        mode="exploratory_rag",
+        possible_fault_types=["container-kill"],
+        retrieval_backend="opensearch",
+        opensearch_base_sha256="a" * 64,
+        opensearch_source_skill_sha256="b" * 64,
+        opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+        opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+        retriever_version=knowledge.OPENSEARCH_RETRIEVER_V5,
+    )
+    assert bm25_options.retriever_version == knowledge.OPENSEARCH_RETRIEVER_V5
+    quantitative_options = bm25_options.model_dump()
+    quantitative_options["retriever_version"] = knowledge.OPENSEARCH_RETRIEVER_V6
+    assert (
+        knowledge.KnowledgeOptions(**quantitative_options).retriever_version
+        == knowledge.OPENSEARCH_RETRIEVER_V6
+    )
+    with pytest.raises(ValueError, match="incident-a-v2"):
+        knowledge.KnowledgeOptions(
+            **{**quantitative_options, "opensearch_a_text_version": "incident-a-v1"}
+        )
+
+    with pytest.raises(ValueError, match="legacy experimental inclusion"):
+        knowledge.KnowledgeOptions(
+            corpus_id="qwen35-procedural-corpus",
+            mode="exploratory_rag",
+            possible_fault_types=["container-kill"],
+            retrieval_backend="opensearch",
+            opensearch_base_sha256="a" * 64,
+            opensearch_source_skill_sha256="b" * 64,
+            opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+            opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+            retriever_version=knowledge.OPENSEARCH_RETRIEVER_V4,
+            include_unvalidated_experimental=True,
+        )
+
+
+def test_unvalidated_procedural_retrieval_is_limited_to_external_v4_test_rag():
+    options = knowledge.KnowledgeOptions(
+        corpus_id="qwen35-procedural-corpus",
+        mode="exploratory_rag",
+        possible_fault_types=["container-kill"],
+        retrieval_backend="opensearch",
+        opensearch_base_sha256="a" * 64,
+        opensearch_source_skill_sha256="b" * 64,
+        opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+        opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+        retriever_version=knowledge.OPENSEARCH_RETRIEVER_V4,
+        external_test_evaluation_id="test-v4-eval",
+        external_test_base_sha256="a" * 64,
+        include_unvalidated_procedural_experimental=True,
+    )
+    assert options.include_unvalidated_procedural_experimental is True
+
+    bm25_options = knowledge.KnowledgeOptions(
+        corpus_id="qwen35-procedural-bm25-corpus",
+        mode="exploratory_rag",
+        possible_fault_types=["container-kill"],
+        retrieval_backend="opensearch",
+        opensearch_base_sha256="a" * 64,
+        opensearch_source_skill_sha256="b" * 64,
+        opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+        opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+        retriever_version=knowledge.OPENSEARCH_RETRIEVER_V5,
+        external_test_evaluation_id="test-v5-eval",
+        external_test_base_sha256="a" * 64,
+        include_unvalidated_procedural_experimental=True,
+    )
+    assert bm25_options.include_unvalidated_procedural_experimental is True
+    quantitative_options = bm25_options.model_dump()
+    quantitative_options["retriever_version"] = knowledge.OPENSEARCH_RETRIEVER_V6
+    assert (
+        knowledge.KnowledgeOptions(
+            **quantitative_options
+        ).include_unvalidated_procedural_experimental
+        is True
+    )
+    with pytest.raises(ValueError, match="external test evaluation"):
+        knowledge.KnowledgeOptions(
+            **{
+                **quantitative_options,
+                "external_test_evaluation_id": None,
+                "external_test_base_sha256": None,
+            }
+        )
+
+    with pytest.raises(ValueError, match="external test evaluation"):
+        knowledge.KnowledgeOptions(
+            corpus_id="qwen35-procedural-corpus",
+            mode="exploratory_rag",
+            possible_fault_types=["container-kill"],
+            retrieval_backend="opensearch",
+            opensearch_base_sha256="a" * 64,
+            opensearch_source_skill_sha256="b" * 64,
+            opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+            opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+            retriever_version=knowledge.OPENSEARCH_RETRIEVER_V4,
+            include_unvalidated_procedural_experimental=True,
+        )
+
+    with pytest.raises(ValueError, match="match the OpenSearch base"):
+        knowledge.KnowledgeOptions(
+            corpus_id="qwen35-procedural-corpus",
+            mode="exploratory_rag",
+            possible_fault_types=["container-kill"],
+            retrieval_backend="opensearch",
+            opensearch_base_sha256="a" * 64,
+            opensearch_source_skill_sha256="b" * 64,
+            opensearch_source_model=knowledge.QWEN35_MODEL_ID,
+            opensearch_current_model=knowledge.QWEN35_MODEL_ID,
+            retriever_version=knowledge.OPENSEARCH_RETRIEVER_V4,
+            external_test_evaluation_id="test-v4-eval",
+            external_test_base_sha256="c" * 64,
+            include_unvalidated_procedural_experimental=True,
+        )
+
+
+def test_unvalidated_procedural_notice_marks_pending_guides_as_hypotheses():
+    notice = knowledge.exploratory_guidance_notice(
+        False,
+        procedural_guidance=True,
+        include_unvalidated_procedural=True,
+    )
+
+    assert "procedural_pending" in notice
+    assert "somente como hipoteses exploratorias" in notice
+
+
+def test_qwen35_retrieval_projection_only_exposes_validated_guides():
+    history = {
+        "pair_id": "pair",
+        "historical_status": "validated_success",
+        "validated_outcome": {
+            "service": "user",
+            "fault_type": "container-kill",
+            "category": "pod-failure",
+            "supporting_evidence": ["E1"],
+        },
+        "investigation_steps": [],
+    }
+    pair = {
+        "pair_id": "pair",
+        "b_rebuild_version": knowledge.TRAINING_B_SCHEMA_VERSION,
+        "guide_status": "validated_success",
+        "retrieval_history": history,
+        "labels": {"service": "user"},
+    }
+
+    assert knowledge.compact_exploratory_history(pair) is history
+    with pytest.raises(ValueError, match="private labels"):
+        knowledge.compact_exploratory_history(
+            {**pair, "retrieval_history": {**history, "diagnosis": {}}}
+        )
+
+
+def test_procedural_qwen35_projection_separates_guide_and_effect_status():
+    history = {
+        "pair_id": "pair",
+        "historical_status": "procedurally_validated",
+        "procedural_status": "passed",
+        "source_effect_validated": False,
+        "validated_outcome": {
+            "service": "user",
+            "fault_type": "container-kill",
+            "category": "pod-failure",
+            "supporting_evidence": ["N1"],
+        },
+        "metric_confirmation_step_id": "S1",
+        "investigation_steps": [],
+    }
+    pair = {
+        "pair_id": "pair",
+        "b_rebuild_version": knowledge.TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
+        "b_procedural_status": "passed",
+        "guide_status": "procedurally_validated",
+        "causal_status": "not_assessed",
+        "retrieval_history": history,
+        "labels": {"service": "user"},
+        "effect_validated": False,
+    }
+    assert knowledge.compact_exploratory_history(pair) is history
+
+    with pytest.raises(ValueError, match="procedural guidance status"):
+        knowledge.compact_exploratory_history({
+            **pair, "b_procedural_status": "pending",
+        })
+
+
+def test_procedural_metric_confirmation_allows_lifecycle_for_container_kill():
+    step = {
+        "kind": "observed",
+        "family": "lifecycle",
+        "service": "catalogue",
+        "phase": "fault",
+        "evidence_ids": ["N002"],
+    }
+
+    assert knowledge.procedural_metric_step_matches_target(
+        step, "container-kill", "catalogue"
+    )
+    assert not knowledge.procedural_metric_step_matches_target(
+        step, "cpu-hog", "catalogue"
+    )
+    assert not knowledge.procedural_metric_step_matches_target(
+        {**step, "service": "orders"}, "container-kill", "catalogue"
+    )

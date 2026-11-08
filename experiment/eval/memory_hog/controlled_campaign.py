@@ -13,6 +13,7 @@ import re
 import subprocess
 import time
 import urllib.error
+from urllib.parse import quote
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +29,7 @@ from experiment.platform.backend.controlled_experiment import (
 from experiment.platform.backend.history_config import (
     DEFAULT_HISTORICAL_MCP_SSE_URL,
 )
+from experiment.platform.backend.plugins.locust_plugin import LocustLoadPlugin
 from experiment.eval.memory_hog.resource_intensity import _CPU_SUFFIXES, _MEMORY_SUFFIXES, _parse_quantity
 from experiment.platform.backend.plugins.mcp_client import MCPToolClient
 from experiment.eval.memory_hog import runner
@@ -38,10 +40,25 @@ from experiment.eval.memory_hog.evaluate_multiagent_rca import (
 
 HERE = Path(__file__).resolve().parent
 SEED = 20261018
+TRAIN_ONLY_PLAN_VERSION = "controlled-train-only-35-v1"
+TRAIN_ONLY_TRANCHES = (1, 5, 10, 20, 35)
 RAG_REVIEWED_RETRY_PROTOCOL_VERSION = "skill-rag-ab-reviewed-retry-v1"
 RAG_REVIEWED_RETRY_PROTOCOL_FILE = "rag_reviewed_retry_protocol.json"
 PRE_INTERVENTION_RETRY_VERSION = "blocked-before-injection-v1"
 PRE_INTERVENTION_RETRY_MODE = "automatic_pre_intervention"
+SAFE_PRE_INTERVENTION_SKIP_VERSION = "clean-pre-intervention-block-skip-v1"
+TECHNICAL_FAILURE_CONTINUATION_VERSION = (
+    "controlled-train-only-technical-failure-continuation-v2"
+)
+CPU_MEAN80_AMENDMENT_VERSION = "controlled-cpu-fault-mean80-v1"
+CPU_MEAN80_AMENDMENT_FILE = "cpu-mean80-amendment.yaml"
+CPU_MEAN80_REVALIDATION_FILE = "cpu_mean80_revalidation.jsonl"
+PASSIVE_RECOVERY_EXTENSION_VERSION = "controlled-passive-recovery-extension-v1"
+PASSIVE_RECOVERY_EXTENSION_FILE = "passive-recovery-extension-amendment.yaml"
+LATE_RECOVERY_CHECK_VERSION = "controlled-late-operational-recovery-check-v3"
+LATE_RECOVERY_CHECK_FILE = "late-operational-recovery-check-amendment-v3.yaml"
+LATE_RECOVERY_CHECK_MAX_ATTEMPTS = 4
+LATE_RECOVERY_CHECK_CAMPAIGN_ID = "controlled-20261103T234452388707Z"
 LATE_RECOVERY_AMENDMENT_VERSION = "controlled-campaign-late-recovery-v1"
 LATE_RECOVERY_AMENDMENT_FILE = "late_recovery_amendment.json"
 UNSUBMITTED_ABORT_AMENDMENT_VERSION = "controlled-campaign-unsubmitted-abort-v1"
@@ -64,8 +81,29 @@ def build_plan(level: str, seed: int = SEED) -> list[dict[str, Any]]:
             for repetition, phase in enumerate(("train", "test"))
             for cell in build_plan("medium", seed + repetition)
         ]
+    if level == "train-only":
+        priority = build_plan("small", seed)
+        priority_order = {
+            (cell["service"], cell["chaos_type"]): index
+            for index, cell in enumerate(SMALL_CELLS)
+        }
+        priority.sort(
+            key=lambda cell: priority_order[(cell["service"], cell["chaos_type"])]
+        )
+        remaining = build_plan("medium", seed)
+        priority_ids = {cell["cell_id"] for cell in priority}
+        remaining = [cell for cell in remaining if cell["cell_id"] not in priority_ids]
+        ordered = [{**cell, "phase": "train"} for cell in priority]
+        while remaining:
+            index = next(
+                (i for i, cell in enumerate(remaining)
+                 if cell["service"] != ordered[-1]["service"]),
+                0,
+            )
+            ordered.append({**remaining.pop(index), "phase": "train"})
+        return ordered
     if level not in {"small", "medium", "large"}:
-        raise ValueError("level must be small, medium, large or rag")
+        raise ValueError("level must be small, medium, large, rag or train-only")
     base = SMALL_CELLS if level == "small" else [
         {"service": service, "chaos_type": fault} for service in SERVICES for fault in FAULTS
     ]
@@ -102,12 +140,19 @@ def build_config(
     plan = build_plan(level, seed)
     config["test_experiments"] = [c for c in plan if c.get("phase", "test") == "test"]
     config["train_experiments"] = [c for c in plan if c.get("phase") == "train"]
+    if level == "train-only":
+        config["train_only_campaign"] = {
+            "version": TRAIN_ONLY_PLAN_VERSION,
+            "tranches": list(TRAIN_ONLY_TRANCHES),
+            "automatic_advance": False,
+            "test_split_included": False,
+        }
     if level == "rag":
         config["knowledge_campaign"] = {
             "version": "skill-rag-ab-v1", "corpus_id": directory.name,
-            "top_k": 3, "min_score": 0.05, "max_rounds": 2,
-            "max_model_calls": 12, "timeout_seconds": 600,
-            "max_total_tokens": 120000, "history_char_budget": 24000,
+            "top_k": 3, "min_score": 0.05, "max_rounds": 4,
+            "max_model_calls": 30, "timeout_seconds": 600,
+            "max_total_tokens": 200000, "history_char_budget": 24000,
         }
     config["replicas"] = 1  # Repetition is explicit in each cell/ledger key.
     config["ordering"] = {"shuffle": False, "seed": seed}
@@ -127,6 +172,7 @@ def build_config(
         "resilience": {
             "version": 1,
             "operational_timeout_seconds": 600,
+            "late_operational_timeout_seconds": 600,
             "stable_seconds": 120,
             "max_consecutive_recoveries": 2,
             "max_total_recoveries": 5,
@@ -179,6 +225,439 @@ def build_config(
 
 def campaign_cells(config: dict[str, Any]) -> list[dict[str, Any]]:
     return list(config.get("train_experiments") or []) + list(config["test_experiments"])
+
+
+def validate_train_only_plan(
+    config: dict[str, Any], cells: list[dict[str, Any]]
+) -> None:
+    protocol = config.get("train_only_campaign") or {}
+    seed = (config.get("ordering") or {}).get("seed")
+    if type(seed) is not int:
+        raise RuntimeError("train-only campaign is missing its integer ordering seed")
+    expected = build_plan("train-only", seed)
+    if (
+        protocol.get("version") != TRAIN_ONLY_PLAN_VERSION
+        or protocol.get("tranches") != list(TRAIN_ONLY_TRANCHES)
+        or protocol.get("automatic_advance") is not False
+        or protocol.get("test_split_included") is not False
+        or config.get("train_experiments") != expected
+        or config.get("test_experiments") != []
+        or cells != expected
+        or len(cells) != 35
+        or any(cell.get("phase") != "train" for cell in cells)
+    ):
+        raise RuntimeError(
+            "train-only campaign must preserve the versioned 35-cell train matrix "
+            "with no test cells"
+        )
+
+
+def train_history_validation_passed(validation: Any) -> bool:
+    if not isinstance(validation, dict):
+        return False
+    telemetry = validation.get("telemetry")
+    source_counts = validation.get("source_counts")
+    return bool(
+        validation.get("status") == "complete"
+        and validation.get("mode") == "dual_write"
+        and validation.get("source") == "historical_mcp"
+        and isinstance(telemetry, dict)
+        and all(
+            isinstance(telemetry.get(family), dict)
+            and telemetry[family].get("status") == "complete"
+            for family in ("metrics", "logs", "traces")
+        )
+        and isinstance(source_counts, dict)
+        and all(
+            isinstance(source_counts.get(family), int)
+            and source_counts[family] > 0
+            for family in ("metrics", "logs", "traces")
+        )
+    )
+
+
+def cpu_mean80_revalidation_record(
+    cell: dict[str, Any], entry: dict[str, Any], amendment: dict[str, Any],
+) -> dict[str, Any] | None:
+    if cell.get("chaos_type") != "cpu-hog" or entry.get("status") != "completed":
+        return None
+    if amendment.get("version") != CPU_MEAN80_AMENDMENT_VERSION:
+        raise RuntimeError("CPU mean amendment version is unsupported")
+    threshold = amendment.get("minimum_quota_fraction")
+    if type(threshold) not in (int, float) or not math.isfinite(threshold):
+        raise RuntimeError("CPU mean amendment threshold is invalid")
+
+    gates = entry.get("gates") or {}
+    mechanism = gates.get("mechanism_observed") or {}
+    baseline = mechanism.get("baseline") or {}
+    intervention = mechanism.get("intervention") or {}
+    mean_fraction = mechanism.get("intervention_mean_quota_fraction")
+    nested_mean = (mechanism.get("target_attainment") or {}).get(
+        "observed_mean_fraction"
+    )
+    valid_mean = type(mean_fraction) in (int, float) and math.isfinite(mean_fraction)
+    nested_mean_valid = type(nested_mean) in (int, float) and math.isfinite(nested_mean)
+    mean_consistent = (
+        not nested_mean_valid
+        or valid_mean and math.isclose(mean_fraction, nested_mean, rel_tol=0, abs_tol=1e-6)
+    )
+    measurement_valid = bool(
+        gates.get("submitted") is True
+        and mechanism.get("metric") == "cpu_cores"
+        and baseline.get("status") == "ok"
+        and intervention.get("status") == "ok"
+        and valid_mean
+        and mean_consistent
+    )
+    mean_passed = bool(measurement_valid and mean_fraction >= threshold)
+    checks = {
+        "completed": entry.get("status") == "completed",
+        "submitted": gates.get("submitted") is True,
+        "target_cpu_measurement_valid": measurement_valid,
+        "fault_phase_mean_at_least_minimum": mean_passed,
+        "recovery": (gates.get("recovery") or {}).get("passed") is True,
+        "cleanup": (gates.get("cleanup") or {}).get("passed") is True,
+        "load_stopped": (gates.get("load_stopped") or {}).get("stopped") is True,
+        "historical_readback": train_history_validation_passed(
+            entry.get("historical_validation")
+        ),
+    }
+    eligible = all(checks.values())
+    target_attainment = mechanism.get("target_attainment") or {}
+    return {
+        "version": amendment["version"],
+        "criterion": "fault-phase arithmetic mean CPU/quota fraction >= minimum",
+        "threshold": threshold,
+        "observed_mean_fraction": mean_fraction if valid_mean else None,
+        "mean_passed": mean_passed,
+        "measurement_valid": measurement_valid,
+        "diagnostic_seconds_above_legacy_threshold": target_attainment.get(
+            "observed_seconds"
+        ),
+        "original_backend_gates": {
+            "intervention_confirmed_on_target": gates.get(
+                "intervention_confirmed_on_target"
+            ),
+            "mechanism_observed_passed": mechanism.get("passed"),
+            "legacy_target_attainment_passed": target_attainment.get("passed"),
+        },
+        "checks": checks,
+        "eligible_for_training": eligible,
+    }
+
+
+def train_cell_gate_passed(entry: dict[str, Any]) -> bool:
+    gates = entry.get("gates") or {}
+    mechanism = gates.get("mechanism_observed") or {}
+    cpu_revalidation = entry.get("cpu_mean80_revalidation") or {}
+    if cpu_revalidation.get("version") == CPU_MEAN80_AMENDMENT_VERSION:
+        effect_passed = cpu_revalidation.get("eligible_for_training") is True
+    else:
+        effect_passed = (
+            gates.get("intervention_confirmed_on_target") is True
+            and mechanism.get("passed") is True
+        )
+    return bool(
+        entry.get("status") == "completed"
+        and gates.get("submitted") is True
+        and effect_passed
+        and (gates.get("recovery") or {}).get("passed") is True
+        and (gates.get("cleanup") or {}).get("passed") is True
+        and (gates.get("load_stopped") or {}).get("stopped") is True
+        and train_history_validation_passed(entry.get("historical_validation"))
+    )
+
+
+def train_cell_technical_failure_continuable(entry: dict[str, Any]) -> bool:
+    if entry.get("status") != "completed":
+        return False
+    gates = entry.get("gates") or {}
+    mechanism = gates.get("mechanism_observed") or {}
+    recovery = gates.get("recovery")
+    cleanup = gates.get("cleanup")
+    load_stopped = gates.get("load_stopped")
+    if (
+        not isinstance(mechanism, dict)
+        or not isinstance(recovery, dict)
+        or not isinstance(cleanup, dict)
+        or not isinstance(load_stopped, dict)
+        or gates.get("submitted") is not True
+        or (
+            gates.get("intervention_confirmed_on_target") is not False
+            and mechanism.get("passed") is not False
+        )
+        or recovery.get("passed") is not True
+        or cleanup.get("passed") is not True
+        or load_stopped.get("stopped") is not True
+        or not train_history_validation_passed(entry.get("historical_validation"))
+        or mechanism.get("status") in {"no_data", "missing_baseline", "not_checked"}
+    ):
+        return False
+    baseline = mechanism.get("baseline")
+    intervention = mechanism.get("intervention")
+    if baseline is not None or intervention is not None:
+        return bool(
+            isinstance(baseline, dict)
+            and baseline.get("status") == "ok"
+            and isinstance(intervention, dict)
+            and intervention.get("status") == "ok"
+        )
+    return bool(
+        mechanism.get("status") == "not_confirmed"
+        and type(mechanism.get("spec_matches_submitted")) is bool
+    )
+
+
+def apply_train_continuation_calibration(
+    config: dict[str, Any], calibration_path: Path,
+) -> dict[str, Any]:
+    if not calibration_path.is_file():
+        raise RuntimeError(f"CPU calibration file is missing: {calibration_path}")
+    raw_bytes = calibration_path.read_bytes()
+    values = yaml.safe_load(raw_bytes)
+    if not isinstance(values, dict) or set(values) - {"policy"} != set(SERVICES):
+        raise RuntimeError("continuation calibration must define every campaign service")
+    controlled = config.get("controlled_campaign") or {}
+    calibrations = controlled.get("calibrations")
+    if not isinstance(calibrations, dict):
+        raise RuntimeError("saved campaign has no per-service calibration profiles")
+    profiles = {}
+    for service in SERVICES:
+        service_values = values.get(service)
+        cpu_profile = service_values.get("cpu") if isinstance(service_values, dict) else None
+        if not isinstance(cpu_profile, dict):
+            raise RuntimeError(f"continuation calibration is missing CPU profile for {service}")
+        validate_cpu_profile({"cpu": cpu_profile})
+        if (
+            cpu_profile.get("minimum_quota_fraction") != .8
+            or "target_quota_fraction" in cpu_profile
+            or "target_tolerance_fraction" in cpu_profile
+        ):
+            raise RuntimeError("continuation CPU calibration must use only the approved 80% minimum")
+        previous = calibrations.get(service)
+        previous_cpu = previous.get("cpu") if isinstance(previous, dict) else None
+        if not isinstance(previous_cpu, dict) or any(
+            cpu_profile.get(key) != previous_cpu.get(key)
+            for key in ("cores", "load")
+        ):
+            raise RuntimeError(
+                f"continuation calibration would change the saved CPU load for {service}"
+            )
+        profiles[service] = dict(cpu_profile)
+        calibrations[service] = {**previous, "cpu": dict(cpu_profile)}
+    amendment = {
+        "version": TECHNICAL_FAILURE_CONTINUATION_VERSION,
+        "scope": "remaining train-only cells in the saved campaign",
+        "continue_after": "completed technical gate failures with valid measured evidence",
+        "exclude_failed_runs_from_training": True,
+        "hard_stops": [
+            "safety",
+            "recovery",
+            "cleanup",
+            "load_not_stopped",
+            "invalid_or_incomplete_historical_telemetry",
+            "unconfirmed_or_unresolved_run_state",
+        ],
+        "cpu_calibration_source": str(calibration_path.resolve()),
+        "cpu_calibration_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "cpu_minimum_quota_fraction": .8,
+        "cpu_acceptance_mode": "fault_phase_arithmetic_mean",
+        "cpu_sustained_duration_required": False,
+        "cpu_profiles": profiles,
+    }
+    controlled["calibrations"] = calibrations
+    controlled["continuation_amendment"] = {
+        key: value for key, value in amendment.items()
+        if key != "cpu_profiles"
+    }
+    config["controlled_campaign"] = controlled
+    return amendment
+
+
+def record_train_continuation_authorization(
+    directory: Path, amendment: dict[str, Any],
+) -> None:
+    path = directory / "campaign_events.jsonl"
+    existing = [
+        row for row in read_ledger(path)
+        if row.get("event") == "technical_failure_continuation_authorized"
+    ]
+    matching_version = [
+        row for row in existing
+        if (row.get("amendment") or {}).get("version") == amendment.get("version")
+    ]
+    if matching_version:
+        if any(row.get("amendment") != amendment for row in matching_version):
+            raise RuntimeError(
+                "saved technical-failure amendment differs from the requested continuation"
+            )
+        return
+    append_ledger(path, {
+        "event": "technical_failure_continuation_authorized",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "user_authorization": "continue_technical_failures_with_cpu_mean80",
+        "amendment": amendment,
+    })
+
+
+def clean_pre_intervention_block_skip_amendment() -> dict[str, Any]:
+    return {
+        "version": SAFE_PRE_INTERVENTION_SKIP_VERSION,
+        "scope": "full train-only campaign after the pre-registered retry limit",
+        "skip_only_if": [
+            "pre-intervention retry limit exhausted",
+            "no fault submission or target intervention",
+            "cleanup passed and load stopped",
+            "application healthy with no unhealthy services or nodes",
+            "fresh environment preflight passed before advancing",
+        ],
+        "hard_stops": [
+            "submitted or ambiguous intervention",
+            "cleanup or load-stop failure",
+            "unhealthy application or failed preflight",
+            "invalid or incomplete historical telemetry",
+            "unresolved run state",
+        ],
+        "skipped_cells_remain_ineligible_for_training": True,
+    }
+
+
+def record_clean_pre_intervention_block_skip_authorization(
+    directory: Path,
+) -> None:
+    path = directory / "campaign_events.jsonl"
+    amendment = clean_pre_intervention_block_skip_amendment()
+    existing = [
+        row for row in read_ledger(path)
+        if row.get("event") == "clean_pre_intervention_block_skip_authorized"
+    ]
+    if existing:
+        if any(row.get("amendment") != amendment for row in existing):
+            raise RuntimeError(
+                "saved clean-block continuation amendment differs from the requested policy"
+            )
+        return
+    append_ledger(path, {
+        "event": "clean_pre_intervention_block_skip_authorized",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "user_authorization": "safe_skip_after_max_pre_intervention_retries",
+        "amendment": amendment,
+    })
+
+
+def clean_pre_intervention_block_skip_recorded(
+    directory: Path, entry: dict[str, Any],
+) -> bool:
+    return any(
+        row.get("event") == "clean_pre_intervention_block_skipped"
+        and row.get("cell_id") == entry.get("cell_id")
+        and row.get("run_id") == entry.get("run_id")
+        and row.get("attempt") == entry.get("attempt")
+        for row in read_ledger(directory / "campaign_events.jsonl")
+    )
+
+
+def record_clean_pre_intervention_block_skip(
+    directory: Path, entry: dict[str, Any],
+) -> None:
+    if clean_pre_intervention_block_skip_recorded(directory, entry):
+        return
+    append_ledger(directory / "campaign_events.jsonl", {
+        "event": "clean_pre_intervention_block_skipped",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "cell_id": entry["cell_id"],
+        "run_id": entry["run_id"],
+        "attempt": entry["attempt"],
+        "reason": entry.get("reason", ""),
+        "status_preserved": "blocked",
+        "eligible_for_training": False,
+        "retry_policy_version": PRE_INTERVENTION_RETRY_VERSION,
+    })
+
+
+def record_train_technical_failure_exclusion(
+    directory: Path, cell: dict[str, Any], entry: dict[str, Any],
+) -> None:
+    path = directory / "campaign_events.jsonl"
+    run_id = entry.get("run_id")
+    if any(
+        row.get("event") == "technical_failure_excluded_from_training"
+        and row.get("cell_id") == cell["cell_id"]
+        and row.get("run_id") == run_id
+        for row in read_ledger(path)
+    ):
+        return
+    gates = entry.get("gates") or {}
+    failed_gates = []
+    if gates.get("intervention_confirmed_on_target") is not True:
+        failed_gates.append("intervention_confirmed_on_target")
+    if (gates.get("mechanism_observed") or {}).get("passed") is not True:
+        failed_gates.append("mechanism_observed")
+    append_ledger(path, {
+        "event": "technical_failure_excluded_from_training",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "cell_id": cell["cell_id"],
+        "run_id": run_id,
+        "failed_gates": failed_gates,
+        "recovery_passed": gates.get("recovery", {}).get("passed") is True,
+        "cleanup_passed": gates.get("cleanup", {}).get("passed") is True,
+        "load_stopped": gates.get("load_stopped", {}).get("stopped") is True,
+        "historical_readback_passed": train_history_validation_passed(
+            entry.get("historical_validation")
+        ),
+        "eligible_for_training": False,
+        "campaign_continued_under": TECHNICAL_FAILURE_CONTINUATION_VERSION,
+    })
+
+
+def ensure_train_history_validation(
+    directory: Path, config: dict[str, Any], cell: dict[str, Any],
+    entry: dict[str, Any], api: Any, *, wait_for_completion: bool = True,
+) -> dict[str, Any]:
+    if train_history_validation_passed(entry.get("historical_validation")):
+        return entry
+    run_id = entry.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise RuntimeError(
+            f"train cell {cell['cell_id']} has no run_id for historical read-back"
+        )
+    try:
+        if wait_for_completion:
+            from experiment.eval.memory_hog.rag_campaign import wait_for_history_archive
+
+            validation = wait_for_history_archive(config, run_id, api)
+        else:
+            validation = api.get(
+                f"/api/runs/{quote(run_id, safe='')}/history/validation"
+            )
+    except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        validation = {
+            "status": "failed",
+            "run_id": run_id,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        history_path = directory / "history_validation" / f"{cell['cell_id']}.json"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text(
+            json.dumps(validation, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        failed_entry = {**entry, "historical_validation": validation}
+        append_ledger(directory / "ledger.jsonl", failed_entry)
+        raise
+    history_path = directory / "history_validation" / f"{cell['cell_id']}.json"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(
+        json.dumps(validation, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    validated_entry = {**entry, "historical_validation": validation}
+    append_ledger(directory / "ledger.jsonl", validated_entry)
+    if not train_history_validation_passed(validation):
+        raise RuntimeError(
+            f"train cell {cell['cell_id']} did not pass historical metrics/logs/traces read-back"
+        )
+    return validated_entry
 
 
 def build_spec(config: dict[str, Any], cell: dict[str, Any], attempt: Path) -> dict[str, Any]:
@@ -247,18 +726,68 @@ def operationally_recovered(config: dict[str, Any], entry: dict[str, Any]) -> bo
     policy = config["controlled_campaign"].get("resilience")
     gates = entry.get("gates") or {}
     operational = gates.get("operational_recovery") or {}
+    late_operational = gates.get("late_operational_recovery") or {}
+    original_target = operational.get("target") or {}
+    late_target = late_operational.get("target") or {}
+    stable_seconds = policy.get("stable_seconds") if isinstance(policy, dict) else None
+    late_timeout = (
+        policy.get("late_operational_timeout_seconds", 0)
+        if isinstance(policy, dict) else 0
+    )
+    amended_latency_source = (
+        entry.get("cell_id") == "orders-container-kill-r0"
+        and entry.get("run_id") == "run-503646080ca5"
+        and late_operational.get("source")
+        == "same_load_same_baseline_user_authorized_latency_p95_limit_override"
+        and late_operational.get("latency_p95_limit_override_ms") == 370.0
+        and late_operational.get("late_check_amendment_version")
+        == LATE_RECOVERY_CHECK_VERSION
+        and late_operational.get("late_check_attempt") == 4
+        and isinstance(late_operational.get("late_check_amendment_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            late_operational.get("late_check_amendment_sha256", ""),
+        ) is not None
+    )
+    late_passed = bool(
+        type(late_timeout) is int and 120 <= late_timeout <= 600
+        and type(stable_seconds) is int and 120 <= stable_seconds < late_timeout
+        and late_operational.get("passed") is True
+        and late_operational.get("policy_version") == 1
+        and (
+            late_operational.get("source")
+            == "same_load_same_baseline_unchanged_recovery_thresholds"
+            or amended_latency_source
+        )
+        and late_operational.get("stable_seconds", 0) >= stable_seconds
+        and original_target.get("container_id")
+        and late_target.get("container_id") == original_target.get("container_id")
+        and late_target.get("restart_count") == original_target.get("restart_count")
+        and (
+            late_operational.get("late_check_id") is None
+            or (
+                isinstance(late_operational.get("late_check_id"), str)
+                and late_operational.get("late_check_cleanup_passed") is True
+                and late_operational.get("late_check_load_stopped") is True
+            )
+        )
+    )
     return bool(
         isinstance(policy, dict) and policy.get("version") == 1
+        and type(stable_seconds) is int
         and entry.get("status") == "aborted"
         and entry.get("reason") == "recovery not confirmed; campaign must stop before next service"
         and gates.get("submitted") is True
         and gates.get("intervention_confirmed_on_target") is True
         and (gates.get("mechanism_observed") or {}).get("passed") is True
         and (gates.get("recovery") or {}).get("passed") is False
-        and operational.get("passed") is True
+        and (operational.get("passed") is True or late_passed)
         and operational.get("policy_version") == 1
         and operational.get("source") == "same_load_same_baseline_unchanged_recovery_thresholds"
-        and operational.get("stable_seconds", 0) >= policy["stable_seconds"]
+        and (
+            operational.get("passed") is not True
+            or operational.get("stable_seconds", 0) >= stable_seconds
+        )
         and (gates.get("cleanup") or {}).get("passed") is True
         and (gates.get("load_stopped") or {}).get("stopped") is True
         and (gates.get("cgroup_telemetry") or {}).get("passed") is not False
@@ -305,6 +834,51 @@ def automatic_pre_intervention_retry_authorized(
         and clean_unsubmitted_block(entry)
         and type(attempt) is int
         and attempt < policy["max_attempts"]
+    )
+
+
+def clean_pre_intervention_block_skip_authorized(
+    config: dict[str, Any],
+    entry: dict[str, Any],
+) -> bool:
+    policy = pre_intervention_retry_policy(config)
+    attempt = entry.get("attempt", 1)
+    gates = entry.get("gates") or {}
+    application = gates.get("application_stability") or {}
+    return bool(
+        policy
+        and clean_unsubmitted_block(entry)
+        and type(attempt) is int
+        and attempt == policy["max_attempts"]
+        and application.get("healthy") is True
+        and application.get("unhealthy_services") == []
+        and application.get("unhealthy_nodes") == []
+    )
+
+
+def train_cell_failure_continuation_authorized(
+    config: dict[str, Any], entry: dict[str, Any], *,
+    allow_clean_pre_intervention_skip: bool = False,
+) -> bool:
+    return bool(
+        train_cell_technical_failure_continuable(entry)
+        or operationally_recovered(config, entry)
+        or late_recovery_authorized(config, entry)
+        or automatic_pre_intervention_retry_authorized(config, entry)
+        or (
+            allow_clean_pre_intervention_skip
+            and clean_pre_intervention_block_skip_authorized(config, entry)
+        )
+    )
+
+
+def train_only_prior_cell_continuation_authorized(
+    config: dict[str, Any], entry: dict[str, Any], *,
+    continue_after_technical_failure: bool,
+) -> bool:
+    return bool(
+        continue_after_technical_failure
+        and train_cell_failure_continuation_authorized(config, entry)
     )
 
 
@@ -798,6 +1372,716 @@ def read_ledger(path: Path) -> list[dict[str, Any]]:
         return []
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def load_cpu_mean80_amendment(
+    path: Path | None = None,
+) -> dict[str, Any]:
+    amendment_path = path or HERE / CPU_MEAN80_AMENDMENT_FILE
+    amendment = yaml.safe_load(amendment_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(amendment, dict)
+        or amendment.get("version") != CPU_MEAN80_AMENDMENT_VERSION
+        or not isinstance(amendment.get("campaign_id"), str)
+        or type(amendment.get("minimum_quota_fraction")) not in (int, float)
+        or amendment.get("minimum_quota_fraction") != .8
+        or amendment.get("aggregation") != "arithmetic_mean"
+        or amendment.get("window") != "fault"
+        or amendment.get("sustained_duration_required") is not False
+        or amendment.get("upper_bound") is not None
+    ):
+        raise RuntimeError(f"invalid CPU mean amendment: {amendment_path}")
+    return amendment
+
+
+def load_passive_recovery_extension_amendment(
+    path: Path | None = None,
+) -> dict[str, Any]:
+    amendment_path = path or HERE / PASSIVE_RECOVERY_EXTENSION_FILE
+    amendment = yaml.safe_load(amendment_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(amendment, dict)
+        or amendment.get("version") != PASSIVE_RECOVERY_EXTENSION_VERSION
+        or amendment.get("campaign_id") != LATE_RECOVERY_CHECK_CAMPAIGN_ID
+        or amendment.get("user_authorized") is not True
+        or amendment.get("scope") != "future_runs_only"
+        or amendment.get("operational_timeout_seconds") != 600
+        or amendment.get("late_operational_timeout_seconds") != 600
+        or amendment.get("stable_seconds") != 120
+        or amendment.get("thresholds_unchanged") is not True
+        or amendment.get("automatic_restart") is not False
+        or amendment.get("aborted_run_status_preserved") is not True
+        or amendment.get("skip_only_after_recovery_and_cleanup") is not True
+    ):
+        raise RuntimeError(f"invalid passive recovery extension amendment: {amendment_path}")
+    return amendment
+
+
+def apply_passive_recovery_extension_amendment(
+    directory: Path, config: dict[str, Any],
+) -> bool:
+    amendment = load_passive_recovery_extension_amendment()
+    if config.get("experiment_campaign_id") != amendment["campaign_id"]:
+        return False
+    policy = config["controlled_campaign"].get("resilience")
+    if (
+        not isinstance(policy, dict)
+        or policy.get("version") != 1
+        or policy.get("operational_timeout_seconds") != amendment["operational_timeout_seconds"]
+        or policy.get("stable_seconds") != amendment["stable_seconds"]
+        or type(policy.get("late_operational_timeout_seconds", 0)) is not int
+        or policy.get("late_operational_timeout_seconds", 0)
+        not in (0, amendment["late_operational_timeout_seconds"])
+    ):
+        raise RuntimeError("saved campaign recovery policy conflicts with its amendment")
+
+    content = (HERE / PASSIVE_RECOVERY_EXTENSION_FILE).read_bytes()
+    amendment_hash = hashlib.sha256(content).hexdigest()
+    policy["late_operational_timeout_seconds"] = amendment["late_operational_timeout_seconds"]
+    config["controlled_campaign"]["time_budget"] = build_time_budget(
+        config["controlled_campaign"],
+    )
+    config["platform"]["run_timeout_seconds"] = (
+        config["controlled_campaign"]["time_budget"]["poll_seconds"]
+    )
+    events_path = directory / "campaign_events.jsonl"
+    events = read_ledger(events_path)
+    prior = [
+        event for event in events
+        if event.get("event") == "passive_recovery_extension_amendment_applied"
+    ]
+    if prior and any(event.get("amendment_sha256") != amendment_hash for event in prior):
+        raise RuntimeError("campaign has a conflicting passive recovery amendment")
+    if not prior:
+        append_ledger(events_path, {
+            "event": "passive_recovery_extension_amendment_applied",
+            "at": datetime.now(timezone.utc).isoformat(),
+            "version": amendment["version"],
+            "campaign_id": amendment["campaign_id"],
+            "amendment_sha256": amendment_hash,
+            "scope": amendment["scope"],
+            "operational_timeout_seconds": amendment["operational_timeout_seconds"],
+            "late_operational_timeout_seconds": amendment["late_operational_timeout_seconds"],
+            "stable_seconds": amendment["stable_seconds"],
+            "thresholds_unchanged": True,
+            "automatic_restart": False,
+            "aborted_run_status_preserved": True,
+        })
+    return True
+
+
+def load_late_operational_recovery_check_amendment(
+    path: Path | None = None,
+) -> dict[str, Any]:
+    amendment_path = path or HERE / LATE_RECOVERY_CHECK_FILE
+    amendment = yaml.safe_load(amendment_path.read_text(encoding="utf-8"))
+    target = amendment.get("target_run") if isinstance(amendment, dict) else None
+    if (
+        not isinstance(amendment, dict)
+        or amendment.get("version") != LATE_RECOVERY_CHECK_VERSION
+        or amendment.get("campaign_id") != "controlled-20261103T234452388707Z"
+        or amendment.get("user_authorized") is not True
+        or amendment.get("scope") != "single_aborted_run_only"
+        or target != {
+            "cell_id": "orders-container-kill-r0",
+            "run_id": "run-503646080ca5",
+        }
+        or amendment.get("timeout_seconds") != 600
+        or amendment.get("stable_seconds") != 120
+        or amendment.get("same_load") is not True
+        or amendment.get("same_baseline") is not True
+        or amendment.get("thresholds_unchanged") is not False
+        or amendment.get("other_thresholds_unchanged") is not True
+        or amendment.get("latency_p95_limit_override_ms") != 370.0
+        or amendment.get("fault_injection") is not False
+        or amendment.get("automatic_restart") is not False
+        or amendment.get("original_run_status_preserved") is not True
+        or amendment.get("continue_only_after_recovery_and_cleanup") is not True
+        or amendment.get("max_attempts") != LATE_RECOVERY_CHECK_MAX_ATTEMPTS
+        or amendment.get("retry_after_cgroup_sampling_fix_only") is not True
+        or amendment.get("retry_after_marginal_latency_stability_failure_only") is not True
+    ):
+        raise RuntimeError(f"invalid late operational recovery check amendment: {amendment_path}")
+    return amendment
+
+
+def cleanup_interrupted_late_recovery_load(
+    check_report: dict[str, Any],
+) -> dict[str, Any]:
+    check_id = check_report.get("run_id")
+    if not isinstance(check_id, str) or not check_id:
+        raise RuntimeError("interrupted late recovery report has no check identifier")
+    context = {"run_id": check_id}
+    handle = check_report.get("load_handle")
+    if handle:
+        if not isinstance(handle, dict) or handle.get("controlled_remote") is not True:
+            raise RuntimeError("interrupted late recovery has an unsupported load handle")
+        plugin = LocustLoadPlugin()
+        before = plugin.status(context, handle)
+        stop_result = None
+        if before.get("state") == "running":
+            stop_result = plugin.stop_load(context, handle)
+            if stop_result.get("stopped") is not True:
+                raise RuntimeError("interrupted late recovery load stop was not confirmed")
+        after = plugin.status(context, handle)
+        if after.get("state") != "completed":
+            raise RuntimeError("interrupted late recovery load termination could not be verified")
+        return {
+            "found": True,
+            "stopped": after.get("stopped") is True,
+            "remote_pid": handle.get("remote_pid"),
+            "pod_uid": handle.get("pod_uid"),
+            "container_id": handle.get("container_id"),
+            "status_before": before,
+            "stop_result": stop_result,
+            "status_after": after,
+            "identity_source": "persisted_load_handle",
+        }
+    return LocustLoadPlugin().stop_orphaned_remote_load(context, check_id)
+
+
+def late_recovery_resource_telemetry_retry_authorized(
+    check_report: dict[str, Any], prior_gate: dict[str, Any],
+) -> bool:
+    if (
+        prior_gate.get("passed") is not False
+        or prior_gate.get("late_check_cleanup_passed") is not True
+        or check_report.get("passed") is not False
+        or check_report.get("late_operational_recovery_passed") is not False
+        or check_report.get("error") is not None
+        or check_report.get("load_stop_error") is not None
+        or (check_report.get("load_stopped") or {}).get("stopped") is not True
+        or (check_report.get("pre_load_health") or {}).get("healthy") is not True
+    ):
+        return False
+    gate = (check_report.get("gates") or {}).get("late_operational_recovery") or {}
+    health = gate.get("health") or {}
+    target = gate.get("target") or {}
+    event = check_report.get("container_kill_event") or {}
+    checks = gate.get("metric_checks") or {}
+    failed = {
+        key for key, check in checks.items()
+        if check.get("passed") is not True
+    }
+    if (
+        gate.get("passed") is not False
+        or gate.get("stable_seconds") != 0
+        or gate.get("required_stable_seconds") != 120
+        or health.get("healthy") is not True
+        or target.get("running") is not True
+        or target.get("ready") is not True
+        or target.get("container_id") != event.get("container_id_after_restart")
+        or target.get("restart_count") != event.get("restart_count_after_signal")
+        or failed != {"cpu_cores", "memory_bytes"}
+    ):
+        return False
+    return all(
+        checks[key].get("reason") == "missing_or_insufficient_samples"
+        and checks[key].get("observed_status") == "no_data"
+        and checks[key].get("sample_count") == 0
+        and checks[key].get("minimum_samples") == 4
+        for key in ("cpu_cores", "memory_bytes")
+    )
+
+
+def late_recovery_marginal_latency_retry_authorized(
+    check_report: dict[str, Any],
+    prior_gate: dict[str, Any],
+    source_report: dict[str, Any],
+    amendment: dict[str, Any],
+) -> bool:
+    if (
+        prior_gate.get("passed") is not False
+        or prior_gate.get("late_check_cleanup_passed") is not True
+        or prior_gate.get("late_check_attempt") != 3
+        or check_report.get("passed") is not False
+        or check_report.get("late_operational_recovery_passed") is not False
+        or check_report.get("error") is not None
+        or check_report.get("load_stop_error") is not None
+        or (check_report.get("load_stopped") or {}).get("stopped") is not True
+        or (check_report.get("pre_load_health") or {}).get("healthy") is not True
+        or (check_report.get("late_recovery_policy") or {}).get("attempt") != 3
+        or amendment.get("latency_p95_limit_override_ms") != 370.0
+    ):
+        return False
+
+    gate = (check_report.get("gates") or {}).get("late_operational_recovery") or {}
+    checks = gate.get("metric_checks") or {}
+    stable_seconds = gate.get("stable_seconds")
+    target = gate.get("target") or {}
+    event = check_report.get("container_kill_event") or {}
+    cgroup = ((check_report.get("telemetry") or {}).get("cgroup_v2") or {})
+    if (
+        gate.get("passed") is not False
+        or gate.get("required_stable_seconds") != 120
+        or type(stable_seconds) not in (int, float)
+        or not 90 <= stable_seconds < 120
+        or (gate.get("health") or {}).get("healthy") is not True
+        or target.get("running") is not True
+        or target.get("ready") is not True
+        or target.get("container_id") != event.get("container_id_after_restart")
+        or target.get("restart_count") != event.get("restart_count_after_signal")
+        or set(checks) != {
+            "traffic", "cpu_cores", "memory_bytes", "errors_percent", "latency_ms",
+        }
+        or any(check.get("passed") is not True for check in checks.values())
+        or cgroup.get("source") != "kubectl_exec_inside_application_container"
+        or cgroup.get("scope") != "exact application container; sidecars excluded"
+        or cgroup.get("container_id_after_restart") != target.get("container_id")
+        or type(cgroup.get("sample_count")) is not int
+        or cgroup["sample_count"] < 4
+        or (check_report.get("telemetry") or {}).get("cgroup_v2_read_failures")
+    ):
+        return False
+
+    baseline_observation = next(
+        (
+            observation for observation in source_report.get("observations", [])
+            if observation.get("phase") == "baseline"
+        ),
+        None,
+    )
+    baseline = (baseline_observation or {}).get("summary") or {}
+    metric_names = ("traffic", "cpu_cores", "memory_bytes", "errors_percent", "latency_ms")
+    if any((baseline.get(name) or {}).get("status") != "ok" for name in metric_names):
+        return False
+    latency_baseline = baseline["latency_ms"]
+    original_latency_limit = max(
+        latency_baseline["p95"] * 1.2,
+        latency_baseline["p95"] + 50,
+    )
+    recorded_latency_limit = checks["latency_ms"].get("threshold")
+    amended_latency_limit = amendment["latency_p95_limit_override_ms"]
+    if (
+        type(recorded_latency_limit) not in (int, float)
+        or abs(recorded_latency_limit - original_latency_limit) > 1e-6
+        or amended_latency_limit <= original_latency_limit
+        or checks["latency_ms"].get("observed", float("inf")) > original_latency_limit
+    ):
+        return False
+
+    margins = {
+        "cpu_cores": .05,
+        "memory_bytes": 16 * 2**20,
+        "errors_percent": 1,
+        "latency_ms": 50,
+    }
+
+    def observation_passes(summary: dict[str, Any]) -> bool:
+        for name in metric_names:
+            observed = summary.get(name) or {}
+            reference = baseline[name]
+            if observed.get("status") != "ok" or observed.get("samples", 0) < 4:
+                return False
+            if name == "traffic":
+                if observed.get("mean", float("-inf")) < reference["mean"] * .8:
+                    return False
+                continue
+            threshold = max(reference["p95"] * 1.2, reference["p95"] + margins[name])
+            if name == "latency_ms":
+                threshold = amended_latency_limit
+            if observed.get("p95", float("inf")) > threshold:
+                return False
+        return True
+
+    observations = check_report.get("observations") or []
+    if not observations:
+        return False
+    last_failure = max(
+        (index for index, observation in enumerate(observations)
+         if not observation_passes(observation.get("summary") or {})),
+        default=-1,
+    )
+    tail = observations[last_failure + 1:]
+    if len(tail) < 2:
+        return False
+    first_tail_latency = (
+        (tail[0].get("summary") or {}).get("latency_ms") or {}
+    ).get("p95")
+    if (
+        type(first_tail_latency) not in (int, float)
+        or not original_latency_limit < first_tail_latency <= amended_latency_limit
+        or any(
+            ((observation.get("summary") or {}).get("latency_ms") or {}).get(
+                "p95", float("inf"),
+            ) > original_latency_limit
+            for observation in tail[1:]
+        )
+    ):
+        return False
+    try:
+        tail_start = datetime.fromisoformat(tail[0]["end"].replace("Z", "+00:00"))
+        tail_end = datetime.fromisoformat(observations[-1]["end"].replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (tail_end - tail_start).total_seconds() >= amendment["stable_seconds"]
+
+
+def apply_late_operational_recovery_check(
+    directory: Path, config: dict[str, Any], ledger: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if config.get("experiment_campaign_id") != LATE_RECOVERY_CHECK_CAMPAIGN_ID:
+        return ledger
+    amendment = load_late_operational_recovery_check_amendment()
+    target = amendment["target_run"]
+    latest = {row["cell_id"]: row for row in ledger}
+    entry = latest.get(target["cell_id"])
+    if entry is None:
+        return ledger
+    if entry.get("run_id") != target["run_id"]:
+        raise RuntimeError("late recovery amendment does not match the saved campaign run")
+    if entry.get("status") != "aborted":
+        return ledger
+    prior_late_gate = (entry.get("gates") or {}).get("late_operational_recovery")
+    if prior_late_gate:
+        if prior_late_gate.get("passed") is True:
+            return ledger
+        if prior_late_gate.get("passed") is not False:
+            raise RuntimeError("saved late recovery gate has no explicit result")
+
+    plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+    planned = next((cell for cell in plan if cell.get("cell_id") == target["cell_id"]), None)
+    if (
+        planned is None
+        or planned.get("service") != "orders"
+        or planned.get("chaos_type") != "container-kill"
+    ):
+        raise RuntimeError("late recovery amendment does not match the immutable campaign plan")
+
+    object_store = HERE.parents[1] / "platform" / "data" / "object_store" / target["run_id"]
+    source_report_path = object_store / "controlled_report.json"
+    effective_spec_path = object_store / "effective_spec.json"
+    if not source_report_path.is_file() or not effective_spec_path.is_file():
+        raise RuntimeError("late recovery source report or effective spec is missing")
+    source_report_sha256 = hashlib.sha256(source_report_path.read_bytes()).hexdigest()
+    effective_spec = json.loads(effective_spec_path.read_text(encoding="utf-8"))
+    saved_load_profile = effective_spec.get("load_profile", {})
+    campaign_load_profile = config.get("load_profile", {})
+    for key in ("command", "locust_file", "host", "users", "spawn_rate", "grace_seconds", "extra_args"):
+        saved_value = saved_load_profile.get(key)
+        campaign_value = campaign_load_profile.get(key)
+        if key == "extra_args":
+            saved_value = [] if saved_value is None else saved_value
+            campaign_value = [] if campaign_value is None else campaign_value
+        if saved_value != campaign_value:
+            raise RuntimeError(f"late recovery load profile differs from the original run: {key}")
+
+    late_directory = directory / "late_recoveries" / target["run_id"]
+    report_path = late_directory / "report.json"
+    report_paths: list[Path] = []
+    if late_directory.exists():
+        if not report_path.is_file():
+            raise RuntimeError("late recovery check exists without a final report; refusing to rerun load")
+        attempt_directories = sorted(
+            (path for path in late_directory.glob("attempt-*") if path.is_dir()),
+            key=lambda path: path.name,
+        )
+        attempt_reports = [path / "report.json" for path in attempt_directories]
+        if any(not path.is_file() for path in attempt_reports):
+            raise RuntimeError("late recovery retry exists without a report; refusing to start another load")
+        report_paths = [report_path, *attempt_reports]
+        report_path = report_paths[-1]
+        check_report = json.loads(report_path.read_text(encoding="utf-8"))
+        if (
+            check_report.get("source_run_id") != target["run_id"]
+            or check_report.get("source_report_sha256") != source_report_sha256
+        ):
+            raise RuntimeError("late recovery check is incomplete or does not match its source")
+        if not check_report.get("ended_at"):
+            cleanup = cleanup_interrupted_late_recovery_load(check_report)
+            append_ledger(directory / "campaign_events.jsonl", {
+                "event": "late_recovery_interrupted_attempt_cleanup_verified",
+                "at": datetime.now(timezone.utc).isoformat(),
+                "cell_id": target["cell_id"],
+                "run_id": target["run_id"],
+                "late_check_id": check_report.get("run_id"),
+                "late_check_attempt": len(report_paths),
+                "cleanup": cleanup,
+                "late_check_report_path": str(report_path),
+                "original_status_preserved": "aborted",
+            })
+            if prior_late_gate:
+                raise RuntimeError(
+                    "saved late recovery gate points to an incomplete later attempt"
+                )
+            if (
+                check_report.get("late_operational_recovery_passed") is not None
+                or (check_report.get("gates") or {}).get("late_operational_recovery")
+            ):
+                raise RuntimeError(
+                    "late recovery observation already produced a gate; refusing to repeat it"
+                )
+            max_attempts = amendment["max_attempts"]
+            if len(report_paths) >= max_attempts:
+                raise RuntimeError("late recovery check retry limit reached")
+            attempt_number = len(report_paths) + 1
+            late_directory = late_directory / f"attempt-{attempt_number}"
+            require_environment(config, directory)
+            from experiment.eval.memory_hog.load_check import run_late_operational_recovery_check
+
+            check_report = run_late_operational_recovery_check(
+                target["run_id"],
+                source_report_path,
+                effective_spec_path,
+                late_directory,
+                attempt_number=attempt_number,
+            )
+            report_path = late_directory / "report.json"
+        elif (
+            check_report.get("load_handle")
+            and (check_report.get("load_stopped") or {}).get("stopped") is not True
+        ):
+            cleanup = cleanup_interrupted_late_recovery_load(check_report)
+            append_ledger(directory / "campaign_events.jsonl", {
+                "event": "late_recovery_completed_attempt_cleanup_verified",
+                "at": datetime.now(timezone.utc).isoformat(),
+                "cell_id": target["cell_id"],
+                "run_id": target["run_id"],
+                "late_check_id": check_report.get("run_id"),
+                "cleanup": cleanup,
+                "late_check_report_path": str(report_path),
+            })
+            raise RuntimeError(
+                "late recovery check completed without recorded load cleanup; refusing to continue"
+            )
+    else:
+        if prior_late_gate:
+            raise RuntimeError("saved late recovery gate has no corresponding report")
+        require_environment(config, directory)
+        from experiment.eval.memory_hog.load_check import run_late_operational_recovery_check
+
+        check_report = run_late_operational_recovery_check(
+            target["run_id"],
+            source_report_path,
+            effective_spec_path,
+            late_directory,
+            attempt_number=1,
+        )
+        report_paths = [report_path]
+
+    amendment_hash: str | None = None
+    latency_limit_override: float | None = None
+    if prior_late_gate:
+        if not report_paths:
+            raise RuntimeError("late recovery retry has no attempt history")
+        prior_report_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        if (
+            prior_late_gate.get("late_check_report_path") != str(report_path)
+            or prior_late_gate.get("late_check_report_sha256") != prior_report_sha256
+        ):
+            raise RuntimeError("saved late recovery gate does not match the latest check report")
+        retry_kind = None
+        if (
+            len(report_paths) == 2
+            and late_recovery_resource_telemetry_retry_authorized(
+                check_report, prior_late_gate,
+            )
+        ):
+            retry_kind = "cgroup_sampling"
+        elif len(report_paths) == 3 and late_recovery_marginal_latency_retry_authorized(
+            check_report,
+            prior_late_gate,
+            json.loads(source_report_path.read_text(encoding="utf-8")),
+            amendment,
+        ):
+            retry_kind = "latency_threshold"
+            latency_limit_override = amendment["latency_p95_limit_override_ms"]
+        if retry_kind is None:
+            raise RuntimeError(
+                "late recovery retry is not covered by the scoped telemetry or latency amendment"
+            )
+        max_attempts = amendment["max_attempts"]
+        if len(report_paths) >= max_attempts:
+            raise RuntimeError("late recovery check retry limit reached")
+        require_environment(config, directory)
+        attempt_number = len(report_paths) + 1
+        events_path = directory / "campaign_events.jsonl"
+        if retry_kind == "latency_threshold":
+            amendment_bytes = (HERE / LATE_RECOVERY_CHECK_FILE).read_bytes()
+            amendment_hash = hashlib.sha256(amendment_bytes).hexdigest()
+            prior_amendments = [
+                event for event in read_ledger(events_path)
+                if event.get("event") == "late_recovery_latency_amendment_applied"
+            ]
+            if any(event.get("amendment_sha256") != amendment_hash for event in prior_amendments):
+                raise RuntimeError("campaign has a conflicting late recovery latency amendment")
+            if not prior_amendments:
+                append_ledger(events_path, {
+                    "event": "late_recovery_latency_amendment_applied",
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "version": amendment["version"],
+                    "campaign_id": amendment["campaign_id"],
+                    "amendment_sha256": amendment_hash,
+                    "scope": amendment["scope"],
+                    "target_run": target["run_id"],
+                    "latency_p95_limit_override_ms": latency_limit_override,
+                    "previous_latency_p95_limit_ms": check_report["gates"][
+                        "late_operational_recovery"
+                    ]["metric_checks"]["latency_ms"]["threshold"],
+                    "same_load": True,
+                    "same_baseline": True,
+                    "timeout_seconds": amendment["timeout_seconds"],
+                    "stable_seconds": amendment["stable_seconds"],
+                    "other_thresholds_unchanged": True,
+                    "fault_injection": False,
+                    "original_run_status_preserved": "aborted",
+                })
+        append_ledger(events_path, {
+            "event": (
+                "late_recovery_cgroup_sampler_retry_authorized"
+                if retry_kind == "cgroup_sampling"
+                else "late_recovery_latency_threshold_retry_authorized"
+            ),
+            "at": datetime.now(timezone.utc).isoformat(),
+            "cell_id": target["cell_id"],
+            "run_id": target["run_id"],
+            "prior_late_check_id": check_report.get("run_id"),
+            "prior_report_path": str(report_path),
+            "prior_report_sha256": prior_report_sha256,
+            "attempt_number": attempt_number,
+            "max_attempts": max_attempts,
+            "reason": (
+                "only CPU and memory were no_data; exact-container cgroup-v2 sampling is now enabled"
+                if retry_kind == "cgroup_sampling"
+                else "the prior check missed 120 seconds only after one marginal latency window"
+            ),
+            "latency_p95_limit_override_ms": latency_limit_override,
+            "amendment_sha256": amendment_hash,
+            "other_thresholds_unchanged": True,
+            "fault_injection": False,
+        })
+        late_directory = late_directory / f"attempt-{attempt_number}"
+        from experiment.eval.memory_hog.load_check import run_late_operational_recovery_check
+
+        check_report = run_late_operational_recovery_check(
+            target["run_id"],
+            source_report_path,
+            effective_spec_path,
+            late_directory,
+            attempt_number=attempt_number,
+            latency_p95_limit_override_ms=latency_limit_override,
+        )
+        report_path = late_directory / "report.json"
+
+    check_gate = check_report.get("gates", {}).get("late_operational_recovery") or {}
+    check_load_stopped = (
+        bool(check_report.get("load_handle"))
+        and (check_report.get("load_stopped") or {}).get("stopped") is True
+    )
+    late_gate = {
+        **check_gate,
+        "passed": (
+            check_report.get("passed") is True
+            and check_gate.get("passed") is True
+            and check_load_stopped
+        ),
+        "late_check_id": check_report.get("run_id"),
+        "late_check_attempt": (check_report.get("late_recovery_policy") or {}).get("attempt"),
+        "late_check_amendment_version": (check_report.get("late_recovery_policy") or {}).get(
+            "amendment_version"
+        ),
+        "late_check_amendment_sha256": amendment_hash,
+        "latency_p95_limit_override_ms": (
+            check_report.get("late_recovery_policy") or {}
+        ).get("latency_p95_limit_override_ms"),
+        "late_check_cleanup_passed": check_load_stopped,
+        "late_check_load_stopped": check_load_stopped,
+        "source_run_id": target["run_id"],
+        "source_report_sha256": source_report_sha256,
+        "late_check_report_path": str(report_path),
+        "late_check_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+    }
+    updated = {**entry, "gates": {**(entry.get("gates") or {}), "late_operational_recovery": late_gate}}
+    append_ledger(directory / "ledger.jsonl", updated)
+    append_ledger(directory / "campaign_events.jsonl", {
+        "event": "late_operational_recovery_check_completed",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "cell_id": target["cell_id"],
+        "run_id": target["run_id"],
+        "late_check_id": check_report.get("run_id"),
+        "late_check_attempt": (check_report.get("late_recovery_policy") or {}).get("attempt"),
+        "latency_p95_limit_override_ms": (
+            check_report.get("late_recovery_policy") or {}
+        ).get("latency_p95_limit_override_ms"),
+        "amendment_sha256": amendment_hash,
+        "passed": late_gate["passed"],
+        "late_check_cleanup_passed": check_load_stopped,
+        "source_report_sha256": source_report_sha256,
+        "late_check_report_path": str(report_path),
+        "late_check_report_sha256": late_gate["late_check_report_sha256"],
+        "original_status_preserved": "aborted",
+        "eligible_for_training": False,
+    })
+    return [*ledger, updated]
+
+
+def load_cpu_mean80_revalidation_records(
+    directory: Path,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    path = directory / CPU_MEAN80_REVALIDATION_FILE
+    records: dict[tuple[str, int], dict[str, Any]] = {}
+    for row in read_ledger(path):
+        run_id = row.get("run_id")
+        attempt = row.get("attempt")
+        assessment = row.get("assessment")
+        if (
+            row.get("event") != "cpu_mean80_revalidation"
+            or not isinstance(run_id, str)
+            or type(attempt) is not int
+            or not isinstance(assessment, dict)
+            or assessment.get("version") != CPU_MEAN80_AMENDMENT_VERSION
+        ):
+            raise RuntimeError(f"invalid CPU mean revalidation record in {path}")
+        key = (run_id, attempt)
+        existing = records.get(key)
+        if existing is not None and existing != assessment:
+            raise RuntimeError(f"conflicting CPU mean revalidation records for {run_id}")
+        records[key] = assessment
+    return records
+
+
+def attach_cpu_mean80_revalidation(
+    entry: dict[str, Any], assessment: dict[str, Any],
+) -> dict[str, Any]:
+    existing = entry.get("cpu_mean80_revalidation")
+    if existing is not None and existing != assessment:
+        raise RuntimeError(
+            f"conflicting in-ledger CPU mean revalidation for {entry.get('run_id')}"
+        )
+    return {**entry, "cpu_mean80_revalidation": assessment}
+
+
+def record_cpu_mean80_revalidation(
+    directory: Path, entry: dict[str, Any], assessment: dict[str, Any],
+    campaign_id: str,
+) -> None:
+    path = directory / CPU_MEAN80_REVALIDATION_FILE
+    run_id = entry.get("run_id")
+    attempt = int(entry.get("attempt", 1))
+    if not isinstance(run_id, str) or not run_id:
+        raise RuntimeError("CPU mean revalidation requires a run_id")
+    existing = load_cpu_mean80_revalidation_records(directory).get((run_id, attempt))
+    if existing is not None:
+        if existing != assessment:
+            raise RuntimeError(
+                f"CPU mean revalidation differs from the saved result for {run_id}"
+            )
+        return
+    ledger_path = directory / "ledger.jsonl"
+    ledger_sha256 = (
+        hashlib.sha256(ledger_path.read_bytes()).hexdigest()
+        if ledger_path.is_file() else None
+    )
+    append_ledger(path, {
+        "event": "cpu_mean80_revalidation",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "campaign_id": campaign_id,
+        "cell_id": entry.get("cell_id"),
+        "run_id": run_id,
+        "attempt": attempt,
+        "source_ledger_sha256": ledger_sha256,
+        "assessment": assessment,
+    })
 
 
 def reconcile_exploratory_manifest(
@@ -1323,7 +2607,9 @@ def require_scrape_metadata_tool(config: dict[str, Any], cell: dict[str, Any]) -
 def environment_preflight(config: dict[str, Any]) -> dict[str, Any]:
     """Read-only infrastructure checks; never a substitute for loaded run gates."""
     namespace = config["cluster"]["app_namespace"]
-    cells = config["test_experiments"]
+    cells = campaign_cells(config)
+    if not cells:
+        raise ValueError("campaign preflight requires at least one planned cell")
     checks: list[dict[str, Any]] = []
     report: dict[str, Any] = {
         "at": datetime.now(timezone.utc).isoformat(), "checks": checks,
@@ -1606,6 +2892,10 @@ def execute(
     retry_invalid_window: set[str] | None = None,
     retry_reviewed_container_kill: set[str] | None = None,
     stop_after_first_test: bool = False,
+    through_train_count: int | None = None,
+    continue_after_technical_failure: bool = False,
+    continue_after_safe_blocked_cell: bool = False,
+    cpu_calibration_path: Path | None = None,
 ) -> int:
     with (directory / ".campaign.lock").open("a") as lock:
         try:
@@ -1619,6 +2909,10 @@ def execute(
                 retry_invalid_window=retry_invalid_window,
                 retry_reviewed_container_kill=retry_reviewed_container_kill,
                 stop_after_first_test=stop_after_first_test,
+                through_train_count=through_train_count,
+                continue_after_technical_failure=continue_after_technical_failure,
+                continue_after_safe_blocked_cell=continue_after_safe_blocked_cell,
+                cpu_calibration_path=cpu_calibration_path,
             )
         except Exception as exc:
             append_ledger(directory / "campaign_events.jsonl", {
@@ -1638,10 +2932,63 @@ def _execute(
     retry_invalid_window: set[str] | None = None,
     retry_reviewed_container_kill: set[str] | None = None,
     stop_after_first_test: bool = False,
+    through_train_count: int | None = None,
+    continue_after_technical_failure: bool = False,
+    continue_after_safe_blocked_cell: bool = False,
+    cpu_calibration_path: Path | None = None,
 ) -> int:
     config = yaml.safe_load((directory / "config.yaml").read_text(encoding="utf-8"))
+    apply_passive_recovery_extension_amendment(directory, config)
+    cpu_mean80_amendment = load_cpu_mean80_amendment()
+    cpu_mean80_active = (
+        config.get("experiment_campaign_id") == cpu_mean80_amendment["campaign_id"]
+    )
     pre_intervention_policy = pre_intervention_retry_policy(config)
     cells = campaign_cells(config)
+    train_only = (
+        (config.get("controlled_campaign") or {}).get("level") == "train-only"
+    )
+    if train_only:
+        validate_train_only_plan(config, cells)
+        if (
+            type(through_train_count) is not int
+            or through_train_count not in TRAIN_ONLY_TRANCHES
+        ):
+            raise RuntimeError(
+                f"train-only execution requires an explicitly approved tranche "
+                f"from {TRAIN_ONLY_TRANCHES}"
+            )
+        if stop_after_first_test:
+            raise RuntimeError("train-only campaigns do not contain a test split")
+    elif through_train_count is not None:
+        raise RuntimeError("--through-train-count is valid only for train-only campaigns")
+    if continue_after_technical_failure:
+        if (
+            not resume
+            or not train_only
+            or through_train_count != len(cells)
+            or cpu_calibration_path is None
+        ):
+            raise RuntimeError(
+                "technical-failure continuation requires a full train-only resume "
+                "and an explicit amended CPU calibration"
+            )
+        amendment = apply_train_continuation_calibration(config, cpu_calibration_path)
+        record_train_continuation_authorization(directory, amendment)
+    elif cpu_calibration_path is not None:
+        raise RuntimeError("CPU calibration override requires technical-failure continuation")
+    if continue_after_safe_blocked_cell:
+        if (
+            not resume
+            or not train_only
+            or through_train_count != len(cells)
+            or not continue_after_technical_failure
+        ):
+            raise RuntimeError(
+                "safe blocked-cell continuation requires a full train-only resume "
+                "with technical-failure continuation enabled"
+            )
+        record_clean_pre_intervention_block_skip_authorization(directory)
     rag = config.get("knowledge_campaign")
     if rag:
         from experiment.platform.backend.rca_knowledge import VERSION, digest, write_once
@@ -1766,6 +3113,25 @@ def _execute(
         )
     if requested_retries and not resume:
         raise RuntimeError("campaign retries require --resume")
+    if resume:
+        ledger = apply_late_operational_recovery_check(directory, config, ledger)
+        latest = {entry["cell_id"]: entry for entry in ledger}
+    if cpu_mean80_active:
+        saved_revalidations = load_cpu_mean80_revalidation_records(directory)
+        for cell in cells:
+            entry = latest.get(cell["cell_id"], {})
+            if entry.get("status") != "completed" or cell.get("chaos_type") != "cpu-hog":
+                continue
+            key = (entry.get("run_id"), int(entry.get("attempt", 1)))
+            assessment = saved_revalidations.get(key)
+            if assessment is None:
+                assessment = cpu_mean80_revalidation_record(
+                    cell, entry, cpu_mean80_amendment,
+                )
+            if assessment is not None:
+                latest[cell["cell_id"]] = attach_cpu_mean80_revalidation(
+                    entry, assessment,
+                )
     if any(
         entry.get("status") in {"aborted", "failed", "stopped"}
         and not operationally_recovered(config, entry)
@@ -1833,6 +3199,8 @@ def _execute(
     if any(r["run_id"] not in owned and r["experiment_id"] not in owned_experiments for r in active):
         raise RuntimeError("another run is active; refusing concurrent load or interventions")
     execution_cells = list(cells)
+    if train_only:
+        execution_cells = cells[:through_train_count]
     if retry_reviewed_container_kill:
         if rag:
             execution_cells = [
@@ -1851,6 +3219,39 @@ def _execute(
             ]
     paused_for_validation = False
     for cell in execution_cells:
+        if train_only:
+            cell_index = cells.index(cell)
+            for prior_cell in cells[:cell_index]:
+                prior = latest.get(prior_cell["cell_id"], {})
+                if not train_cell_gate_passed(prior):
+                    if (
+                        train_only_prior_cell_continuation_authorized(
+                            config,
+                            prior,
+                            continue_after_technical_failure=(
+                                continue_after_technical_failure
+                            ),
+                        )
+                    ):
+                        if train_cell_technical_failure_continuable(prior):
+                            record_train_technical_failure_exclusion(
+                                directory, prior_cell, prior,
+                            )
+                        continue
+                    if (
+                        continue_after_safe_blocked_cell
+                        and clean_pre_intervention_block_skip_authorized(
+                            config, prior,
+                        )
+                        and clean_pre_intervention_block_skip_recorded(
+                            directory, prior,
+                        )
+                    ):
+                        continue
+                    raise RuntimeError(
+                        f"train-only gate failed before {cell['cell_id']}; "
+                        f"prior cell {prior_cell['cell_id']} is not fully validated"
+                    )
         if rag:
             from experiment.eval.memory_hog.rag_campaign import prepare_test, process_cell
 
@@ -1880,7 +3281,31 @@ def _execute(
             retrying_blocked or retrying_unconfirmed
             or retrying_invalid_window or retrying_reviewed_container_kill
         )
+        if (
+            entry.get("status") == "blocked"
+            and not retrying
+            and continue_after_safe_blocked_cell
+            and clean_pre_intervention_block_skip_authorized(config, entry)
+        ):
+            require_environment(config, directory)
+            record_clean_pre_intervention_block_skip(directory, entry)
         if entry.get("status") in {"completed", "blocked", "failed", "stopped", "aborted"} and not retrying:
+            if train_only and entry.get("status") == "completed":
+                entry = ensure_train_history_validation(
+                    directory, config, cell, entry, api,
+                )
+                latest[cell["cell_id"]] = entry
+                if not train_cell_gate_passed(entry):
+                    if (
+                        not continue_after_technical_failure
+                        or not train_cell_technical_failure_continuable(entry)
+                    ):
+                        raise RuntimeError(
+                            f"train-only gate failed for completed cell {cell['cell_id']}"
+                        )
+                    record_train_technical_failure_exclusion(
+                        directory, cell, entry,
+                    )
             if rag and entry.get("status") == "completed":
                 process_cell(directory, config, cell, entry, api)
             if stop_after_first_test and cell["phase"] == "test":
@@ -2097,6 +3522,22 @@ def _execute(
         (directory / "effect_validation.json").write_text(
             json.dumps(effects, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
+        if train_only and state != "blocked":
+            entry = ensure_train_history_validation(
+                directory, config, cell, entry, api,
+                wait_for_completion=state == "completed",
+            )
+            if cpu_mean80_active and cell.get("chaos_type") == "cpu-hog":
+                assessment = cpu_mean80_revalidation_record(
+                    cell, entry, cpu_mean80_amendment,
+                )
+                if assessment is not None:
+                    entry = attach_cpu_mean80_revalidation(entry, assessment)
+                    record_cpu_mean80_revalidation(
+                        directory, entry, assessment,
+                        cpu_mean80_amendment["campaign_id"],
+                    )
+            latest[cell["cell_id"]] = entry
         if validation_cell == cell["cell_id"]:
             require_continuation_validation(config, latest)
             append_ledger(directory / "campaign_events.jsonl", {
@@ -2106,14 +3547,41 @@ def _execute(
                 "parent_campaign_id": config["continuation"]["parent_campaign_id"],
             })
             print(f"{cell['cell_id']}: validation passed; remaining cells authorized", flush=True)
+        if (
+            train_only
+            and continue_after_technical_failure
+            and state != "completed"
+            and not train_cell_failure_continuation_authorized(
+                config,
+                entry,
+                allow_clean_pre_intervention_skip=continue_after_safe_blocked_cell,
+            )
+        ):
+            raise RuntimeError(
+                f"technical-failure continuation stopped on run state {state!r} "
+                f"for {cell['cell_id']}; no later cell was started"
+            )
         if state not in {"completed", "blocked"}:
-            if not operationally_recovered(config, entry):
+            operational_recovery_passed = operationally_recovered(config, entry)
+            amendment_recovery_passed = late_recovery_authorized(config, entry)
+            if not (operational_recovery_passed or amendment_recovery_passed):
                 raise RuntimeError(f"run failed/aborted; stop before next target: {entry['reason']}")
+            late_operational = (
+                (entry.get("gates") or {}).get("late_operational_recovery") or {}
+            )
+            recovery_gate = (
+                "late_operational_recovery"
+                if late_operational.get("passed")
+                else "late_recovery_amendment"
+                if amendment_recovery_passed
+                else "operational_recovery"
+            )
             append_ledger(directory / "campaign_events.jsonl", {
                 "event": "continuation_after_operational_recovery",
                 "at": datetime.now(timezone.utc).isoformat(),
                 "cell_id": cell["cell_id"], "run_id": entry["run_id"],
                 "experimental_status_unchanged": state,
+                "recovery_gate": recovery_gate,
             })
             print(f"{cell['cell_id']}: remains aborted; operational recovery permits next cell", flush=True)
         if state == "completed":
@@ -2157,6 +3625,31 @@ def _execute(
                         "reason": entry.get("reason", ""),
                     },
                 )
+            elif (
+                continue_after_safe_blocked_cell
+                and clean_pre_intervention_block_skip_authorized(config, entry)
+            ):
+                require_environment(config, directory)
+                record_clean_pre_intervention_block_skip(directory, entry)
+        if (
+            train_only
+            and state != "blocked"
+            and not train_cell_gate_passed(entry)
+        ):
+            if (
+                not continue_after_technical_failure
+                or not train_cell_technical_failure_continuable(entry)
+            ):
+                raise RuntimeError(
+                    f"train-only gate failed for {cell['cell_id']}; "
+                    "campaign stopped before the next cell"
+                )
+            record_train_technical_failure_exclusion(directory, cell, entry)
+            print(
+                f"{cell['cell_id']}: technical gate failed; run excluded from training, "
+                "recovery/read-back gates passed",
+                flush=True,
+            )
         retry_pending_for_canary = bool(
             state == "blocked"
             and cell["cell_id"] in automatic_retry_blocked
@@ -2179,7 +3672,134 @@ def _execute(
             break
     export_runs(directory, cells, read_ledger(ledger_path))
     # Keep all completed runs, not only those with a detectable intervention.
-    if rag:
+    if train_only:
+        assert through_train_count is not None
+        prefix = cells[:through_train_count]
+        prefix_gates_passed = all(
+            train_cell_gate_passed(latest.get(cell["cell_id"], {}))
+            for cell in prefix
+        )
+        excluded_technical_failures = sum(
+            not train_cell_gate_passed(latest.get(cell["cell_id"], {}))
+            and train_cell_technical_failure_continuable(
+                latest.get(cell["cell_id"], {})
+            )
+            for cell in prefix
+        )
+        excluded_clean_blocks = sum(
+            continue_after_safe_blocked_cell
+            and clean_pre_intervention_block_skip_authorized(
+                config, latest.get(cell["cell_id"], {}),
+            )
+            and clean_pre_intervention_block_skip_recorded(
+                directory, latest.get(cell["cell_id"], {}),
+            )
+            for cell in prefix
+        )
+        continuation_complete = all(
+            train_cell_gate_passed(latest.get(cell["cell_id"], {}))
+            or (
+                continue_after_technical_failure
+                and train_cell_technical_failure_continuable(
+                    latest.get(cell["cell_id"], {})
+                )
+            )
+            or (
+                continue_after_safe_blocked_cell
+                and clean_pre_intervention_block_skip_authorized(
+                    config, latest.get(cell["cell_id"], {}),
+                )
+                and clean_pre_intervention_block_skip_recorded(
+                    directory, latest.get(cell["cell_id"], {}),
+                )
+            )
+            for cell in prefix
+        )
+        excluded_cells = excluded_technical_failures + excluded_clean_blocks
+        progress = {
+            "version": TRAIN_ONLY_PLAN_VERSION,
+            "campaign_id": config["experiment_campaign_id"],
+            "approved_through_cell_count": through_train_count,
+            "planned_cell_count": len(cells),
+            "collection_complete": continuation_complete,
+            "all_gates_passed": prefix_gates_passed,
+            "continue_after_technical_failure": continue_after_technical_failure,
+            "continue_after_safe_blocked_cell": continue_after_safe_blocked_cell,
+            "completed_and_gated_count": sum(
+                train_cell_gate_passed(latest.get(cell["cell_id"], {}))
+                for cell in cells
+            ),
+            "excluded_technical_failure_count": excluded_technical_failures,
+            "excluded_clean_pre_intervention_block_count": excluded_clean_blocks,
+            "not_started_count": sum(
+                cell["cell_id"] not in latest for cell in prefix
+            ),
+            "prefix_gates_passed": prefix_gates_passed,
+            "next_tranche": next(
+                (count for count in TRAIN_ONLY_TRANCHES
+                 if count > through_train_count),
+                None,
+            ),
+            "cells": [
+                {
+                    "cell_id": cell["cell_id"],
+                    "status": latest.get(cell["cell_id"], {}).get("status", "not_run"),
+                    "run_id": latest.get(cell["cell_id"], {}).get("run_id"),
+                    "gates_passed": train_cell_gate_passed(
+                        latest.get(cell["cell_id"], {})
+                    ),
+                    "eligible_for_training": train_cell_gate_passed(
+                        latest.get(cell["cell_id"], {})
+                    ),
+                    "cpu_mean80_revalidation": latest.get(
+                        cell["cell_id"], {},
+                    ).get("cpu_mean80_revalidation"),
+                    "training_exclusion_reason": (
+                        "clean_pre_intervention_block"
+                        if continue_after_safe_blocked_cell
+                        and clean_pre_intervention_block_skip_recorded(
+                            directory, latest.get(cell["cell_id"], {}),
+                        )
+                        else (
+                            "technical_gate_failure"
+                            if (
+                                not train_cell_gate_passed(
+                                    latest.get(cell["cell_id"], {})
+                                )
+                                and train_cell_technical_failure_continuable(
+                                    latest.get(cell["cell_id"], {})
+                                )
+                            )
+                            else None
+                        )
+                    ),
+                }
+                for cell in cells
+            ],
+        }
+        (directory / "train_only_progress.json").write_text(
+            json.dumps(progress, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        append_ledger(directory / "campaign_events.jsonl", {
+            "event": (
+                "paused_after_train_tranche"
+                if continuation_complete and through_train_count < len(cells)
+                else "train_tranche_gate_failed"
+                if not continuation_complete
+                else "train_only_campaign_completed_with_exclusions"
+                if excluded_cells
+                else "train_only_campaign_completed"
+            ),
+            "at": datetime.now(timezone.utc).isoformat(),
+            "approved_through_cell_count": through_train_count,
+            "prefix_gates_passed": prefix_gates_passed,
+            "collection_complete": continuation_complete,
+            "excluded_technical_failure_count": excluded_technical_failures,
+            "excluded_clean_pre_intervention_block_count": excluded_clean_blocks,
+            "not_started_count": progress["not_started_count"],
+        })
+    elif rag:
         from experiment.eval.memory_hog.rag_campaign import write_evaluation
 
         write_evaluation(directory, config)
@@ -2200,6 +3820,28 @@ def _execute(
     }
     print(f"Campaign outcomes ({len(cells)} planned): {counts}", flush=True)
     print(f"Submitted interventions: {sum((entry.get('gates') or {}).get('submitted') is True for entry in latest.values())}", flush=True)
+    if train_only:
+        if progress["collection_complete"]:
+            if progress["excluded_technical_failure_count"]:
+                print(
+                    "Train-only collection complete with "
+                    f"{progress['excluded_technical_failure_count']} technical "
+                    "failure(s) explicitly excluded from training; "
+                    f"{progress['completed_and_gated_count']} cells are training-eligible.",
+                    flush=True,
+                )
+                return 0
+            print(
+                f"Train-only campaign paused at approved tranche "
+                f"{through_train_count}/{len(cells)}; no next tranche was started.",
+                flush=True,
+            )
+            return 0
+        print(
+            f"Train-only campaign stopped: tranche {through_train_count} did not pass all gates.",
+            flush=True,
+        )
+        return 1
     if paused_for_validation:
         first_test = next(
             cell for cell in config["test_experiments"] if cell["phase"] == "test"
@@ -2295,16 +3937,47 @@ def require_continuation_validation(config: dict[str, Any], latest: dict[str, An
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--level", choices=["small", "medium", "large", "rag"], default="small")
+    parser.add_argument(
+        "--level",
+        choices=["small", "medium", "large", "rag", "train-only"],
+        default="small",
+    )
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--through-train-count",
+        type=int,
+        choices=TRAIN_ONLY_TRANCHES,
+        help="Explicit approval boundary for train-only campaigns (1, 5, 10, 20 or 35).",
+    )
     parser.add_argument("--rag-top-k", type=int, help="Maximum retrieved training pairs (rag profile only).")
     parser.add_argument("--rag-min-score", type=float, help="Minimum retrieval score (rag profile only).")
-    parser.add_argument("--rag-max-rounds", type=int, help="Maximum extra read-only checks (rag profile only).")
+    parser.add_argument(
+        "--rag-max-rounds",
+        type=int,
+        choices=range(1, 5),
+        help="Maximum extra read-only checks shared by original, control and RAG.",
+    )
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--preflight", action="store_true", help="Read-only infrastructure checks; no load, injection or campaign files.")
     parser.add_argument("--load-check", action="store_true",
                         help="Single 30-user load-only rehearsal across all services; no fault or campaign evaluation.")
     parser.add_argument("--resume", type=Path, help="Existing campaign; never re-inject terminal cells.")
+    parser.add_argument(
+        "--continue-after-technical-failure",
+        action="store_true",
+        help=(
+            "Train-only full-campaign resume: continue only after a completed, measured "
+            "technical gate failure with recovery, cleanup and historical read-back passed."
+        ),
+    )
+    parser.add_argument(
+        "--continue-after-safe-blocked-cell",
+        action="store_true",
+        help=(
+            "After the pre-registered retry limit, skip only a clean unsubmitted "
+            "pre-intervention block after a fresh passing environment preflight."
+        ),
+    )
     parser.add_argument(
         "--continue-from", type=Path,
         help="New environment segment containing only unfinished parent combinations.",
@@ -2361,20 +4034,65 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--preflight cannot be combined with --run or --resume")
     if args.load_check and (args.run or args.resume or args.preflight):
         parser.error("--load-check cannot be combined with --run, --resume or --preflight")
+    if args.continue_after_technical_failure and not args.resume:
+        parser.error("--continue-after-technical-failure requires --resume")
+    if args.continue_after_safe_blocked_cell and (
+        not args.resume or not args.continue_after_technical_failure
+    ):
+        parser.error(
+            "--continue-after-safe-blocked-cell requires --resume and "
+            "--continue-after-technical-failure"
+        )
+    if args.continue_after_technical_failure and (
+        args.retry_blocked or args.retry_unconfirmed_container_kill
+        or args.retry_invalid_window or args.retry_reviewed_container_kill
+    ):
+        parser.error(
+            "--continue-after-technical-failure cannot be combined with retry options"
+        )
     if args.resume:
         if not args.run:
             parser.error("--resume requires --run")
+        try:
+            resume_config = yaml.safe_load(
+                (args.resume / "config.yaml").read_text(encoding="utf-8")
+            )
+        except (OSError, yaml.YAMLError) as exc:
+            parser.error(f"cannot read resume campaign config: {exc}")
+        is_train_only = (
+            (resume_config.get("controlled_campaign") or {}).get("level")
+            == "train-only"
+        )
+        if is_train_only != (args.through_train_count is not None):
+            parser.error(
+                "train-only resume requires --through-train-count; other campaigns "
+                "cannot use it"
+            )
         return execute(
             args.resume.resolve(), resume=True, retry_blocked=set(args.retry_blocked),
             retry_unconfirmed_container_kill=set(args.retry_unconfirmed_container_kill),
             retry_invalid_window=set(args.retry_invalid_window),
             retry_reviewed_container_kill=set(args.retry_reviewed_container_kill),
+            through_train_count=args.through_train_count,
+            continue_after_technical_failure=args.continue_after_technical_failure,
+            continue_after_safe_blocked_cell=args.continue_after_safe_blocked_cell,
+            cpu_calibration_path=(
+                args.calibration if args.continue_after_technical_failure else None
+            ),
         )
     if (
         args.retry_blocked or args.retry_unconfirmed_container_kill
         or args.retry_invalid_window or args.retry_reviewed_container_kill
     ):
         parser.error("campaign retries require --resume")
+    if args.level == "train-only":
+        if args.run and args.through_train_count is None:
+            parser.error(
+                "--run with --level train-only requires an explicit "
+                "--through-train-count"
+            )
+    elif args.through_train_count is not None:
+        parser.error("--through-train-count requires --level train-only")
     calibration = {}
     if args.calibration and not args.continue_from:
         if not args.calibration.is_file():
@@ -2412,6 +4130,16 @@ def main(argv: list[str] | None = None) -> int:
     cells = campaign_cells(config)
     print(f"{config['controlled_campaign']['level']}: "
           f"{len(cells)} planned runs; seed={config['ordering']['seed']}")
+    if args.level == "train-only":
+        tranche_label = (
+            str(args.through_train_count)
+            if args.through_train_count is not None
+            else "not selected for dry-run"
+        )
+        print(
+            f"Train-only protocol {TRAIN_ONLY_PLAN_VERSION}: "
+            f"35 train / 0 test; tranche boundary={tranche_label}."
+        )
     if config.get("knowledge_campaign"):
         print("RAG: 35 train -> frozen A/B base -> 35 test; no mandatory human guide approval.")
     print("30 users, spawn=5/s; not a fixed RPS. Warmup >=60s + stable gate; baseline=90s.")
@@ -2427,7 +4155,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.preflight or args.load_check:
             api = runner.ApiClient(config["platform"]["api_base"], role=config["platform"]["user_role"])
             require_controlled_backend(api)
-            require_scrape_metadata_tool(config, config["test_experiments"][0])
+            target_cell = (
+                config["test_experiments"] or config["train_experiments"]
+            )[0]
+            require_scrape_metadata_tool(config, target_cell)
             rag = config.get("knowledge_campaign")
             info = api.get("/api/skill-rag/strategy") if rag else _get_strategy_info(api_base=api.base_url, timeout_seconds=10)
             expected_modes = [
@@ -2459,7 +4190,9 @@ def main(argv: list[str] | None = None) -> int:
     (directory / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     (directory / "plan.json").write_text(json.dumps(cells, indent=2) + "\n", encoding="utf-8")
     print(f"Saved immutable plan: {directory}", flush=True)
-    return execute(directory, resume=False)
+    return execute(
+        directory, resume=False, through_train_count=args.through_train_count,
+    )
 
 
 if __name__ == "__main__":

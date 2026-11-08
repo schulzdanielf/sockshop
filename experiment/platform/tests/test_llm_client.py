@@ -372,6 +372,8 @@ def test_call_llm_tool_messages_sends_tools_and_returns_tool_calls(monkeypatch, 
         tools,
         tool_choice="auto",
         parallel_tool_calls=False,
+        temperature=0.1,
+        seed=20261107,
         url="http://localhost:8001/v1/chat/completions",
         api_style="openai",
         chat_template_kwargs={"enable_thinking": False},
@@ -383,6 +385,8 @@ def test_call_llm_tool_messages_sends_tools_and_returns_tool_calls(monkeypatch, 
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert captured["payload"]["tool_choice"] == "auto"
     assert captured["payload"]["parallel_tool_calls"] is False
+    assert captured["payload"]["temperature"] == 0.1
+    assert captured["payload"]["seed"] == 20261107
     if response_format is None:
         assert "response_format" not in captured["payload"]
     else:

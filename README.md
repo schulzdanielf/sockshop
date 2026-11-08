@@ -16,6 +16,7 @@ Este repositório evolui o Sock Shop como base experimental para estudos de obse
  
  Referências úteis:
  
+- [docs/fluxo-atual-campanha-treino-rag.md](./docs/fluxo-atual-campanha-treino-rag.md): visão visual da campanha train-only e dos gates de qualidade
  - [internal-docs/design.md](./internal-docs/design.md)
  - [internal-docs/testing.md](./internal-docs/testing.md)
  - [deploy/kubernetes/manifests-monitoring/README.md](./deploy/kubernetes/manifests-monitoring/README.md)

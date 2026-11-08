@@ -46,6 +46,59 @@ def test_remote_stop_refuses_changed_container_before_any_signal(monkeypatch):
     assert kube.call_count == 1
 
 
+def test_orphaned_remote_load_is_stopped_by_exact_marker_identity(monkeypatch):
+    plugin = LocustLoadPlugin()
+    monkeypatch.setattr(plugin, "_kube_json", Mock(side_effect=[
+        {"items": [{
+            "metadata": {"name": "locust-1", "uid": "uid-1"},
+            "status": {"containerStatuses": [{
+                "name": "locust", "ready": True, "containerID": "container-1",
+                "imageID": "image-1",
+            }]},
+        }]},
+        {
+            "identity_exists": True,
+            "log_exists": True,
+            "record": {
+                "remote_pid": 42, "start_ticks": "100",
+                "log_path": "/tmp/controlled-load-run-1.log",
+            },
+        },
+    ]))
+    control = Mock(side_effect=[
+        {"state": "running", "stopped": False},
+        {"state": "completed", "stopped": True},
+    ])
+    monkeypatch.setattr(plugin, "_remote_control", control)
+    stopped = Mock(return_value={"stopped": True})
+    monkeypatch.setattr(plugin, "stop_load", stopped)
+
+    result = plugin.stop_orphaned_remote_load({"run_id": "run-1"}, "run-1")
+
+    assert result["found"] is True and result["stopped"] is True
+    assert result["remote_pid"] == 42
+    stopped.assert_called_once()
+    assert stopped.call_args.args[1]["start_ticks"] == "100"
+    assert control.call_args_list[0].args[1] == "status"
+    assert control.call_args_list[1].args[1] == "status"
+
+
+def test_orphaned_remote_load_refuses_log_without_identity(monkeypatch):
+    plugin = LocustLoadPlugin()
+    monkeypatch.setattr(plugin, "_kube_json", Mock(side_effect=[
+        {"items": [{
+            "metadata": {"name": "locust-1", "uid": "uid-1"},
+            "status": {"containerStatuses": [{
+                "name": "locust", "ready": True, "containerID": "container-1",
+            }]},
+        }]},
+        {"identity_exists": False, "log_exists": True},
+    ]))
+
+    with pytest.raises(RuntimeError, match="log without an identity"):
+        plugin.stop_orphaned_remote_load({"run_id": "run-1"}, "run-1")
+
+
 def test_remote_helpers_stop_the_specific_spawned_process_and_preserve_log(tmp_path):
     start = subprocess.run([
         sys.executable, "-c", _REMOTE_START, str(tmp_path / "load"),

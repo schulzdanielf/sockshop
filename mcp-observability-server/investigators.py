@@ -33,6 +33,8 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
+from http_metrics import golden_http_query
+
 # ── Pod-name → service-name normalisation ───────────────────────────────
 # Strip the last two hyphen-delimited segments when they look like a
 # k8s ReplicaSet+Pod hash suffix (5-10 lowercase alnum chars). Mirrors
@@ -806,17 +808,7 @@ def check_http_error_rate_top(
     instrumentation are covered. The series is grouped by destination workload,
     which maps directly to the service receiving the HTTP request.
     """
-    query = (
-        '100 * ('
-        'sum by (destination_workload) (rate(istio_requests_total{'
-        'destination_workload_namespace="sock-shop",destination_workload!="unknown",'
-        'response_code=~"5.."}[1m])) '
-        'or on(destination_workload) 0 * sum by (destination_workload) '
-        '(rate(istio_requests_total{destination_workload_namespace="sock-shop",'
-        'destination_workload!="unknown"}[1m]))'
-        ') / clamp_min(sum by (destination_workload) (rate(istio_requests_total{'
-        'destination_workload_namespace="sock-shop",destination_workload!="unknown"}[1m])), 0.0001)'
-    )
+    query = golden_http_query("error_rate")
     return _service_level_series_top(
         prometheus,
         query=query,
@@ -843,13 +835,7 @@ def check_request_latency_top(
     This is the main high-level HTTP-path symptom a small RCA agent should look
     at before diving into raw traces or logs.
     """
-    query = (
-        'histogram_quantile(0.95, '
-        'sum(rate(istio_request_duration_milliseconds_bucket{'
-        'destination_workload_namespace="sock-shop",destination_workload!="unknown"}'
-        '[1m])) by (le, destination_workload)'
-        ') / 1000'
-    )
+    query = golden_http_query("latency_p95")
     return _service_level_series_top(
         prometheus,
         query=query,
@@ -865,34 +851,8 @@ def check_request_latency_top(
 
 def _golden_metric_query(metric: str, namespace: str) -> str:
     escaped_namespace = namespace.replace("\\", "\\\\").replace('"', '\\"')
-    if metric == "request_rate":
-        return (
-            "sum by (destination_workload) (rate(istio_requests_total{"
-            f'destination_workload_namespace="{escaped_namespace}",'
-            'destination_workload!="unknown"}[1m]))'
-        )
-    if metric == "error_rate":
-        return (
-            "100 * ("
-            "sum by (destination_workload) (rate(istio_requests_total{"
-            f'destination_workload_namespace="{escaped_namespace}",'
-            'destination_workload!="unknown",response_code=~"5.."}[1m])) '
-            "or on(destination_workload) 0 * sum by (destination_workload) "
-            "(rate(istio_requests_total{"
-            f'destination_workload_namespace="{escaped_namespace}",'
-            'destination_workload!="unknown"}[1m]))'
-            ") / clamp_min(sum by (destination_workload) (rate(istio_requests_total{"
-            f'destination_workload_namespace="{escaped_namespace}",'
-            'destination_workload!="unknown"}[1m])), 0.0001)'
-        )
-    if metric == "latency_p95":
-        return (
-            "histogram_quantile(0.95, sum(rate("
-            "istio_request_duration_milliseconds_bucket{"
-            f'destination_workload_namespace="{escaped_namespace}",'
-            'destination_workload!="unknown"}[1m])) '
-            "by (le, destination_workload)) / 1000"
-        )
+    if metric in {"request_rate", "error_rate", "latency_p95"}:
+        return golden_http_query(metric, namespace)
     if metric == "cpu_saturation_pct":
         return (
             "100 * sum by (pod) (rate(container_cpu_usage_seconds_total"

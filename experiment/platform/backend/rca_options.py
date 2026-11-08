@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _FAULT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,79}$")
+MAX_ADDITIONAL_MCP_CHECKS = 4
 
 
 def validate_possible_fault_types(value: Any) -> list[str]:
@@ -26,6 +27,16 @@ class RCABenchmarkOptions(BaseModel):
 
     possible_fault_types: list[str] = Field(default_factory=list, max_length=20)
     require_best_guess: bool = False
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    temperature: float | None = Field(
+        default=None, ge=0, le=2, allow_inf_nan=False
+    )
+    seed: int | None = Field(default=None, ge=0, le=4_294_967_295)
+    max_additional_checks: int = Field(
+        default=MAX_ADDITIONAL_MCP_CHECKS,
+        ge=0,
+        le=MAX_ADDITIONAL_MCP_CHECKS,
+    )
 
     @field_validator("possible_fault_types")
     @classmethod

@@ -1,6 +1,8 @@
 import csv
 import fcntl
+import hashlib
 import json
+import hashlib
 import urllib.error
 from pathlib import Path
 from unittest.mock import Mock
@@ -9,6 +11,7 @@ import pytest
 import yaml
 
 from experiment.eval.memory_hog import controlled_campaign as campaign
+from experiment.eval.memory_hog import revalidate_cpu_mean80
 
 require_environment = campaign.require_environment
 
@@ -31,6 +34,26 @@ def test_matrix_is_seeded_application_only_and_avoids_consecutive_service(level,
         assert {cell["replica_idx"] for cell in plan} == set(range(5))
 
 
+def test_train_only_plan_is_exactly_35_train_cells_with_cpu_first():
+    plan = campaign.build_plan("train-only", 42)
+
+    assert len(plan) == 35
+    assert all(cell["phase"] == "train" for cell in plan)
+    assert {cell["service"] for cell in plan} == set(campaign.SERVICES)
+    assert {cell["chaos_type"] for cell in plan} == set(campaign.FAULTS)
+    assert {
+        (cell["service"], cell["chaos_type"]) for cell in plan
+    } == {
+        (service, fault)
+        for service in campaign.SERVICES
+        for fault in campaign.FAULTS
+    }
+    assert {cell["chaos_type"] for cell in plan[:5]} == set(campaign.FAULTS)
+    assert plan[0]["chaos_type"] == "cpu-hog"
+    assert all(a["service"] != b["service"] for a, b in zip(plan, plan[1:]))
+    assert plan == campaign.build_plan("train-only", 42)
+
+
 def test_large_repeats_each_combination_five_times():
     plan = campaign.build_plan("large")
     for service in campaign.SERVICES:
@@ -45,6 +68,713 @@ def test_dry_run_never_touches_cluster_or_writes(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "35 planned runs" in output
     assert "single_event; post_observation>=120s" in output
+
+
+def test_train_only_dry_run_never_touches_cluster_or_writes(monkeypatch, capsys):
+    monkeypatch.setattr(campaign, "execute", lambda *a, **kw: pytest.fail("execution in dry run"))
+    monkeypatch.setattr(campaign.Path, "mkdir", lambda *a, **kw: pytest.fail("mkdir in dry run"))
+
+    assert campaign.main(["--level", "train-only"]) == 0
+
+    output = capsys.readouterr().out
+    assert "35 planned runs" in output
+    assert "35 train / 0 test" in output
+    assert "Plan only: no files written" in output
+
+
+def test_train_only_execution_requires_an_explicit_tranche(capsys):
+    with pytest.raises(SystemExit) as exc:
+        campaign.main(["--level", "train-only", "--run"])
+
+    assert exc.value.code == 2
+    assert "--through-train-count" in capsys.readouterr().err
+
+
+def test_train_only_config_has_no_test_cells_and_pins_protocol(tmp_path):
+    source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
+
+    result = campaign.build_config(source, tmp_path, "train-only", 42, {})
+
+    assert result["test_experiments"] == []
+    assert result["train_experiments"] == campaign.build_plan("train-only", 42)
+    assert result["train_only_campaign"] == {
+        "version": campaign.TRAIN_ONLY_PLAN_VERSION,
+        "tranches": [1, 5, 10, 20, 35],
+        "automatic_advance": False,
+        "test_split_included": False,
+    }
+    campaign.validate_train_only_plan(result, campaign.campaign_cells(result))
+
+
+def test_rag_campaign_uses_four_shared_followup_checks_and_model_budget(tmp_path):
+    source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
+
+    result = campaign.build_config(source, tmp_path, "rag", 42, {})
+
+    knowledge = result["knowledge_campaign"]
+    assert knowledge["max_rounds"] == 4
+    assert knowledge["max_model_calls"] == 30
+    assert knowledge["max_total_tokens"] == 200000
+
+
+def test_train_only_cli_persists_exact_plan_and_selected_tranche(monkeypatch, tmp_path):
+    source_dir = Path(__file__).parents[1]
+    source = yaml.safe_load((source_dir / "config.yaml").read_text())
+    calibration = yaml.safe_load((source_dir / "cpu-calibration.yaml").read_text())
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(source), encoding="utf-8")
+    (tmp_path / "cpu-calibration.yaml").write_text(
+        yaml.safe_dump(calibration), encoding="utf-8",
+    )
+    monkeypatch.setattr(campaign, "HERE", tmp_path)
+    captured = {}
+
+    def execute(directory, **kwargs):
+        captured["config"] = yaml.safe_load(
+            (directory / "config.yaml").read_text(encoding="utf-8")
+        )
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(campaign, "execute", execute)
+    assert campaign.main([
+        "--level", "train-only", "--run", "--through-train-count", "5",
+    ]) == 0
+
+    assert captured["config"]["test_experiments"] == []
+    assert len(captured["config"]["train_experiments"]) == 35
+    assert captured["kwargs"]["through_train_count"] == 5
+
+
+def test_train_only_resume_requires_explicit_tranche(monkeypatch, tmp_path, capsys):
+    source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
+    config = campaign.build_config(source, tmp_path, "train-only", 42, {})
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    monkeypatch.setattr(
+        campaign, "execute",
+        lambda *args, **kwargs: pytest.fail("resume started without a tranche"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        campaign.main(["--run", "--resume", str(tmp_path)])
+
+    assert exc.value.code == 2
+    assert "--through-train-count" in capsys.readouterr().err
+
+
+def test_safe_block_skip_cli_forwards_full_train_only_resume(monkeypatch, tmp_path):
+    source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
+    cfg = campaign.build_config(source, tmp_path, "train-only", 42, {})
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(
+        campaign, "execute",
+        lambda directory, **kwargs: captured.update(kwargs) or 0,
+    )
+
+    assert campaign.main([
+        "--run",
+        "--resume", str(tmp_path),
+        "--through-train-count", "35",
+        "--continue-after-technical-failure",
+        "--continue-after-safe-blocked-cell",
+    ]) == 0
+
+    assert captured["continue_after_safe_blocked_cell"] is True
+    assert captured["continue_after_technical_failure"] is True
+
+
+def test_train_only_resume_records_pause_and_never_resubmits_terminal_cells(
+    monkeypatch, tmp_path,
+):
+    source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
+    cfg = campaign.build_config(source, tmp_path, "train-only", 42, {})
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    (tmp_path / "plan.json").write_text(
+        json.dumps(campaign.campaign_cells(cfg)), encoding="utf-8",
+    )
+    (tmp_path / ".campaign.lock").touch()
+    history = {
+        "status": "complete",
+        "mode": "dual_write",
+        "source": "historical_mcp",
+        "telemetry": {
+            family: {"status": "complete"}
+            for family in ("metrics", "logs", "traces")
+        },
+        "source_counts": {"metrics": 2, "logs": 1, "traces": 1},
+    }
+    gates = {
+        "submitted": True,
+        "intervention_confirmed_on_target": True,
+        "mechanism_observed": {"passed": True},
+        "recovery": {"passed": True},
+        "cleanup": {"passed": True},
+        "load_stopped": {"stopped": True},
+    }
+    for cell in cfg["train_experiments"][:1]:
+        campaign.append_ledger(tmp_path / "ledger.jsonl", {
+            **cell,
+            "status": "completed",
+            "run_id": "run-" + cell["cell_id"],
+            "gates": gates,
+            "historical_validation": history,
+        })
+
+    class API:
+        base_url = "http://127.0.0.1:8010"
+
+        def get(self, path):
+            assert path == "/api/runs"
+            return []
+
+        def post(self, *args, **kwargs):
+            pytest.fail("terminal training cells must never be resubmitted")
+
+    monkeypatch.setattr(campaign.runner, "ApiClient", lambda *a, **kw: API())
+    monkeypatch.setattr(campaign, "_get_strategy_info", lambda **kw: {
+        "strategy_version": campaign.STRATEGY_VERSION,
+        "prompt_version": campaign.PROMPT_VERSION,
+    })
+    monkeypatch.setattr(campaign, "require_controlled_backend", lambda *_: None)
+    monkeypatch.setattr(campaign, "require_scrape_metadata_tool", lambda *_: None)
+
+    assert campaign.execute(
+        tmp_path, resume=True, through_train_count=1,
+    ) == 0
+    progress = json.loads((tmp_path / "train_only_progress.json").read_text())
+    assert progress["approved_through_cell_count"] == 1
+    assert progress["prefix_gates_passed"] is True
+    assert progress["next_tranche"] == 5
+
+    for cell in cfg["train_experiments"][1:5]:
+        campaign.append_ledger(tmp_path / "ledger.jsonl", {
+            **cell,
+            "status": "completed",
+            "run_id": "run-" + cell["cell_id"],
+            "gates": gates,
+            "historical_validation": history,
+        })
+    assert campaign.execute(
+        tmp_path, resume=True, through_train_count=5,
+    ) == 0
+    progress = json.loads((tmp_path / "train_only_progress.json").read_text())
+    assert progress["approved_through_cell_count"] == 5
+    assert progress["prefix_gates_passed"] is True
+    assert progress["next_tranche"] == 10
+
+
+def test_train_only_resume_blocks_next_cell_after_failed_prior_gate(
+    monkeypatch, tmp_path,
+):
+    source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
+    cfg = campaign.build_config(source, tmp_path, "train-only", 42, {})
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    (tmp_path / "plan.json").write_text(
+        json.dumps(campaign.campaign_cells(cfg)), encoding="utf-8",
+    )
+    (tmp_path / ".campaign.lock").touch()
+    first = cfg["train_experiments"][0]
+    campaign.append_ledger(tmp_path / "ledger.jsonl", {
+        **first,
+        "status": "blocked",
+        "run_id": "blocked-" + first["cell_id"],
+        "gates": {"submitted": False},
+    })
+
+    class API:
+        base_url = "http://127.0.0.1:8010"
+
+        def get(self, path):
+            assert path == "/api/runs"
+            return []
+
+        def post(self, *args, **kwargs):
+            pytest.fail("a later train cell must not start after a blocked gate")
+
+    monkeypatch.setattr(campaign.runner, "ApiClient", lambda *a, **kw: API())
+    monkeypatch.setattr(campaign, "_get_strategy_info", lambda **kw: {
+        "strategy_version": campaign.STRATEGY_VERSION,
+        "prompt_version": campaign.PROMPT_VERSION,
+    })
+    monkeypatch.setattr(campaign, "require_controlled_backend", lambda *_: None)
+    monkeypatch.setattr(campaign, "require_scrape_metadata_tool", lambda *_: None)
+
+    with pytest.raises(RuntimeError, match="prior cell .* is not fully validated"):
+        campaign.execute(tmp_path, resume=True, through_train_count=5)
+
+
+def test_train_only_gate_requires_confirmed_effect_recovery_cleanup_and_history():
+    entry = {
+        "status": "completed",
+        "gates": {
+            "submitted": True,
+            "intervention_confirmed_on_target": True,
+            "mechanism_observed": {"passed": True},
+            "recovery": {"passed": True},
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+        "historical_validation": {
+            "status": "complete",
+            "mode": "dual_write",
+            "source": "historical_mcp",
+            "telemetry": {
+                family: {"status": "complete"}
+                for family in ("metrics", "logs", "traces")
+            },
+            "source_counts": {"metrics": 2, "logs": 1, "traces": 1},
+        },
+    }
+
+    assert campaign.train_cell_gate_passed(entry)
+    entry["gates"]["mechanism_observed"]["passed"] = False
+    assert not campaign.train_cell_gate_passed(entry)
+
+
+@pytest.mark.parametrize(
+    "mean_fraction,expected", [(.85, True), (.8, True), (.799, False)],
+)
+def test_cpu_mean80_amendment_revalidates_legacy_target_gate(mean_fraction, expected):
+    cell = {
+        "cell_id": "payment-cpu-hog-r0",
+        "service": "payment",
+        "chaos_type": "cpu-hog",
+        "phase": "train",
+    }
+    entry = {
+        "status": "completed",
+        "run_id": "run-cpu-mean80",
+        "attempt": 1,
+        "gates": {
+            "submitted": True,
+            "intervention_confirmed_on_target": False,
+            "mechanism_observed": {
+                "passed": False,
+                "metric": "cpu_cores",
+                "baseline": {"status": "ok"},
+                "intervention": {"status": "ok"},
+                "intervention_mean_quota_fraction": mean_fraction,
+                "target_attainment": {
+                    "passed": False,
+                    "observed_mean_fraction": mean_fraction,
+                    "observed_seconds": 25,
+                },
+            },
+            "recovery": {"passed": True},
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+        "historical_validation": {
+            "status": "complete",
+            "mode": "dual_write",
+            "source": "historical_mcp",
+            "telemetry": {
+                family: {"status": "complete"}
+                for family in ("metrics", "logs", "traces")
+            },
+            "source_counts": {"metrics": 840, "logs": 20, "traces": 1},
+        },
+    }
+    amendment = {
+        "version": campaign.CPU_MEAN80_AMENDMENT_VERSION,
+        "minimum_quota_fraction": .8,
+    }
+    assessment = campaign.cpu_mean80_revalidation_record(
+        cell, entry, amendment,
+    )
+    assert assessment is not None
+    entry["cpu_mean80_revalidation"] = assessment
+    assert assessment["diagnostic_seconds_above_legacy_threshold"] == 25
+    assert assessment["eligible_for_training"] is expected
+    assert campaign.train_cell_gate_passed(entry) is expected
+
+
+def test_cpu_mean80_amendment_does_not_override_recovery_gate():
+    cell = {
+        "cell_id": "payment-cpu-hog-r0",
+        "service": "payment",
+        "chaos_type": "cpu-hog",
+        "phase": "train",
+    }
+    entry = {
+        "status": "completed",
+        "run_id": "run-cpu-unsafe",
+        "gates": {
+            "submitted": True,
+            "intervention_confirmed_on_target": False,
+            "mechanism_observed": {
+                "passed": False,
+                "metric": "cpu_cores",
+                "baseline": {"status": "ok"},
+                "intervention": {"status": "ok"},
+                "intervention_mean_quota_fraction": .85,
+            },
+            "recovery": {"passed": False},
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+        "historical_validation": {
+            "status": "complete",
+            "mode": "dual_write",
+            "source": "historical_mcp",
+            "telemetry": {
+                family: {"status": "complete"}
+                for family in ("metrics", "logs", "traces")
+            },
+            "source_counts": {"metrics": 840, "logs": 20, "traces": 1},
+        },
+    }
+    assessment = campaign.cpu_mean80_revalidation_record(
+        cell, entry, {
+            "version": campaign.CPU_MEAN80_AMENDMENT_VERSION,
+            "minimum_quota_fraction": .8,
+        },
+    )
+    assert assessment is not None
+    entry["cpu_mean80_revalidation"] = assessment
+    assert assessment["mean_passed"] is True
+    assert assessment["eligible_for_training"] is False
+    assert not campaign.train_cell_gate_passed(entry)
+
+
+def test_cpu_mean80_revalidation_appends_idempotent_sidecar_without_editing_ledger(
+    tmp_path, monkeypatch,
+):
+    campaign_id = "controlled-20261103T234452388707Z"
+    cell = {
+        "cell_id": "payment-cpu-hog-r0",
+        "service": "payment",
+        "chaos_type": "cpu-hog",
+        "phase": "train",
+    }
+    entry = {
+        "cell_id": cell["cell_id"],
+        "status": "completed",
+        "run_id": "run-cpu-mean80",
+        "attempt": 1,
+        "gates": {
+            "submitted": True,
+            "intervention_confirmed_on_target": False,
+            "mechanism_observed": {
+                "passed": False,
+                "metric": "cpu_cores",
+                "baseline": {"status": "ok"},
+                "intervention": {"status": "ok"},
+                "intervention_mean_quota_fraction": .85,
+            },
+            "recovery": {"passed": True},
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+        "historical_validation": {
+            "status": "complete",
+            "mode": "dual_write",
+            "source": "historical_mcp",
+            "telemetry": {
+                family: {"status": "complete"}
+                for family in ("metrics", "logs", "traces")
+            },
+            "source_counts": {"metrics": 840, "logs": 20, "traces": 1},
+        },
+    }
+    ledger_path = tmp_path / "ledger.jsonl"
+    original_ledger = json.dumps(entry) + "\n"
+    ledger_path.write_text(original_ledger, encoding="utf-8")
+    (tmp_path / ".campaign.lock").write_text("", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"experiment_campaign_id": campaign_id}),
+        encoding="utf-8",
+    )
+    amendment = {
+        "version": campaign.CPU_MEAN80_AMENDMENT_VERSION,
+        "campaign_id": campaign_id,
+        "minimum_quota_fraction": .8,
+    }
+    monkeypatch.setattr(campaign, "campaign_cells", lambda config: [cell])
+    monkeypatch.setattr(
+        campaign, "load_cpu_mean80_amendment", lambda: amendment,
+    )
+
+    first = revalidate_cpu_mean80.revalidate_campaign(tmp_path)
+    second = revalidate_cpu_mean80.revalidate_campaign(tmp_path)
+
+    sidecar = tmp_path / campaign.CPU_MEAN80_REVALIDATION_FILE
+    records = campaign.read_ledger(sidecar)
+    assert first["assessed"] == second["assessed"] == 1
+    assert first["new_records"] == 1
+    assert second["new_records"] == 0
+    assert len(records) == 1
+    assert records[0]["assessment"]["eligible_for_training"] is True
+    assert records[0]["source_ledger_sha256"] == hashlib.sha256(
+        original_ledger.encode()
+    ).hexdigest()
+    assert ledger_path.read_text(encoding="utf-8") == original_ledger
+
+
+def test_cpu_mean80_revalidation_refuses_active_campaign(tmp_path):
+    lock_path = tmp_path / ".campaign.lock"
+    lock_path.write_text("", encoding="utf-8")
+    with lock_path.open(encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="campaign is active"):
+            revalidate_cpu_mean80.revalidate_campaign(tmp_path)
+
+
+def test_technical_gate_failure_is_continuable_only_with_measured_evidence_and_safety_gates():
+    entry = {
+        "status": "completed",
+        "gates": {
+            "submitted": True,
+            "intervention_confirmed_on_target": False,
+            "mechanism_observed": {
+                "passed": False,
+                "baseline": {"status": "ok"},
+                "intervention": {"status": "ok"},
+            },
+            "recovery": {"passed": True},
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+        "historical_validation": {
+            "status": "complete",
+            "mode": "dual_write",
+            "source": "historical_mcp",
+            "telemetry": {
+                family: {"status": "complete"}
+                for family in ("metrics", "logs", "traces")
+            },
+            "source_counts": {"metrics": 2, "logs": 1, "traces": 1},
+        },
+    }
+
+    assert not campaign.train_cell_gate_passed(entry)
+    assert campaign.train_cell_technical_failure_continuable(entry)
+
+    for status in ("blocked", "aborted", "failed", "stopped"):
+        assert not campaign.train_cell_technical_failure_continuable({
+            **entry, "status": status,
+        })
+    for gate, key, value in (
+        ("recovery", "passed", False),
+        ("cleanup", "passed", False),
+        ("load_stopped", "stopped", False),
+    ):
+        unsafe = json.loads(json.dumps(entry))
+        unsafe["gates"][gate][key] = value
+        assert not campaign.train_cell_technical_failure_continuable(unsafe)
+    invalid_history = json.loads(json.dumps(entry))
+    invalid_history["historical_validation"]["status"] = "incomplete"
+    assert not campaign.train_cell_technical_failure_continuable(invalid_history)
+    missing_measurement = json.loads(json.dumps(entry))
+    missing_measurement["gates"]["mechanism_observed"]["baseline"]["status"] = "no_data"
+    assert not campaign.train_cell_technical_failure_continuable(missing_measurement)
+
+
+def test_train_only_continuation_excludes_failed_run_and_preserves_saved_config(
+    monkeypatch, tmp_path, capsys,
+):
+    source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
+    saved_calibrations = {
+        service: {
+            "cpu": {
+                "cores": 2,
+                "load": 100,
+                "target_quota_fraction": 1.0,
+                "target_tolerance_fraction": .05,
+                "calibration_status": "candidate",
+                "rationale": "original saved profile",
+            },
+        }
+        for service in campaign.SERVICES
+    }
+    cfg = campaign.build_config(
+        source, tmp_path, "train-only", 42, saved_calibrations,
+    )
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    (tmp_path / "plan.json").write_text(
+        json.dumps(campaign.campaign_cells(cfg)), encoding="utf-8",
+    )
+    (tmp_path / ".campaign.lock").touch()
+    history = {
+        "status": "complete",
+        "mode": "dual_write",
+        "source": "historical_mcp",
+        "telemetry": {
+            family: {"status": "complete"}
+            for family in ("metrics", "logs", "traces")
+        },
+        "source_counts": {"metrics": 2, "logs": 1, "traces": 1},
+    }
+    gates = {
+        "submitted": True,
+        "intervention_confirmed_on_target": True,
+        "mechanism_observed": {
+            "passed": True,
+            "metric": "cpu_cores",
+            "baseline": {"status": "ok"},
+            "intervention": {"status": "ok"},
+            "intervention_mean_quota_fraction": .85,
+        },
+        "recovery": {"passed": True},
+        "cleanup": {"passed": True},
+        "load_stopped": {"stopped": True},
+    }
+    failed_gates = json.loads(json.dumps(gates))
+    failed_gates["intervention_confirmed_on_target"] = False
+    failed_gates["mechanism_observed"] = {
+        "passed": False,
+        "baseline": {"status": "ok"},
+        "intervention": {"status": "ok"},
+    }
+    cpu_failed_gates = json.loads(json.dumps(failed_gates))
+    cpu_failed_gates["mechanism_observed"].update({
+        "metric": "cpu_cores",
+        "intervention_mean_quota_fraction": .85,
+    })
+    technical_failure_index = next(
+        index for index, cell in enumerate(cfg["train_experiments"])
+        if index not in (0, 1) and cell["chaos_type"] != "cpu-hog"
+    )
+    for index, cell in enumerate(cfg["train_experiments"]):
+        if index == 1:
+            for attempt in (1, 2):
+                campaign.append_ledger(tmp_path / "ledger.jsonl", {
+                    **cell,
+                    "status": "blocked",
+                    "attempt": attempt,
+                    "run_id": f"blocked-{attempt}-{cell['cell_id']}",
+                    "reason": "load did not stabilize after minimum 60s warmup",
+                    "gates": {
+                        "submitted": False,
+                        "intervention_confirmed_on_target": None,
+                        "cleanup": {"passed": True},
+                        "load_stopped": {"stopped": True},
+                        "application_stability": {
+                            "healthy": True,
+                            "unhealthy_services": [],
+                            "unhealthy_nodes": [],
+                        },
+                    },
+                })
+            continue
+        campaign.append_ledger(tmp_path / "ledger.jsonl", {
+            **cell,
+            "status": "completed",
+            "run_id": "run-" + cell["cell_id"],
+            "gates": (
+                cpu_failed_gates if index == 0
+                else failed_gates if index == technical_failure_index
+                else gates
+            ),
+            "historical_validation": history,
+        })
+
+    cpu_amendment = {
+        "version": campaign.CPU_MEAN80_AMENDMENT_VERSION,
+        "campaign_id": cfg["experiment_campaign_id"],
+        "minimum_quota_fraction": .8,
+    }
+    monkeypatch.setattr(
+        campaign, "load_cpu_mean80_amendment", lambda: cpu_amendment,
+    )
+    cpu_cell = cfg["train_experiments"][0]
+    cpu_entry = next(
+        entry for entry in campaign.read_ledger(tmp_path / "ledger.jsonl")
+        if entry["cell_id"] == cpu_cell["cell_id"]
+    )
+    assessment = campaign.cpu_mean80_revalidation_record(
+        cpu_cell, cpu_entry, cpu_amendment,
+    )
+    assert assessment is not None and assessment["eligible_for_training"] is True
+    campaign.record_cpu_mean80_revalidation(
+        tmp_path, cpu_entry, assessment, cfg["experiment_campaign_id"],
+    )
+
+    class API:
+        base_url = "http://127.0.0.1:8010"
+
+        def get(self, path):
+            assert path == "/api/runs"
+            return []
+
+        def post(self, *args, **kwargs):
+            pytest.fail("terminal training cells must never be resubmitted")
+
+    monkeypatch.setattr(campaign.runner, "ApiClient", lambda *a, **kw: API())
+    monkeypatch.setattr(campaign, "_get_strategy_info", lambda **kw: {
+        "strategy_version": campaign.STRATEGY_VERSION,
+        "prompt_version": campaign.PROMPT_VERSION,
+    })
+    monkeypatch.setattr(campaign, "require_controlled_backend", lambda *_: None)
+    monkeypatch.setattr(campaign, "require_scrape_metadata_tool", lambda *_: None)
+
+    assert campaign.execute(
+        tmp_path,
+        resume=True,
+        through_train_count=35,
+        continue_after_technical_failure=True,
+        continue_after_safe_blocked_cell=True,
+        cpu_calibration_path=campaign.HERE / "cpu-calibration.yaml",
+    ) == 0
+
+    progress = json.loads((tmp_path / "train_only_progress.json").read_text())
+    assert progress["collection_complete"] is True
+    assert progress["all_gates_passed"] is False
+    assert progress["completed_and_gated_count"] == 33
+    assert progress["excluded_technical_failure_count"] == 1
+    assert progress["excluded_clean_pre_intervention_block_count"] == 1
+    assert progress["not_started_count"] == 0
+    assert sum(cell["eligible_for_training"] for cell in progress["cells"]) == 33
+    assert progress["cells"][0]["cpu_mean80_revalidation"]["eligible_for_training"] is True
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    assert (
+        saved["controlled_campaign"]["calibrations"]["payment"]["cpu"]
+        ["target_quota_fraction"]
+        == 1.0
+    )
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "campaign_events.jsonl").read_text().splitlines()
+    ]
+    assert any(event["event"] == "technical_failure_continuation_authorized" for event in events)
+    assert any(event["event"] == "clean_pre_intervention_block_skip_authorized" for event in events)
+    skipped = next(
+        event for event in events
+        if event["event"] == "clean_pre_intervention_block_skipped"
+    )
+    assert skipped["attempt"] == 2
+    assert skipped["eligible_for_training"] is False
+    excluded = [
+        event for event in events
+        if event["event"] == "technical_failure_excluded_from_training"
+    ]
+    assert len(excluded) == 1
+    assert excluded[0]["eligible_for_training"] is False
+    assert "Train-only collection complete with 1 technical failure" in capsys.readouterr().out
+
+
+def test_incomplete_train_run_records_one_readback_without_waiting(tmp_path):
+    api = Mock()
+    api.get.return_value = {"status": "pending", "run_id": "run-aborted"}
+    entry = {
+        "status": "aborted",
+        "run_id": "run-aborted",
+        "gates": {"submitted": True},
+    }
+
+    with pytest.raises(RuntimeError, match="did not pass historical"):
+        campaign.ensure_train_history_validation(
+            tmp_path, {}, {"cell_id": "payment-cpu-hog-r0"}, entry, api,
+            wait_for_completion=False,
+        )
+
+    api.get.assert_called_once_with(
+        "/api/runs/run-aborted/history/validation"
+    )
+    saved = json.loads(
+        (tmp_path / "history_validation/payment-cpu-hog-r0.json").read_text()
+    )
+    assert saved["status"] == "pending"
 
 
 def test_missing_calibration_path_fails_with_argument_error_before_creating_campaign(capsys):
@@ -251,6 +981,24 @@ def recovered_entry(cell_id="orders-container-kill-r0"):
     }
 
 
+def late_operational_entry():
+    entry = recovered_entry()
+    entry["gates"]["operational_recovery"].update(
+        passed=False,
+        stable_seconds=21.4,
+        target={"container_id": "container-1", "restart_count": 1},
+    )
+    entry["gates"]["late_operational_recovery"] = {
+        "passed": True,
+        "policy_version": 1,
+        "stable_seconds": 120,
+        "required_stable_seconds": 120,
+        "source": "same_load_same_baseline_unchanged_recovery_thresholds",
+        "target": {"container_id": "container-1", "restart_count": 1},
+    }
+    return entry
+
+
 def late_recovery_entry():
     entry = recovered_entry("orders-container-kill-r1")
     entry["run_id"] = "run-065ac29ef2ca"
@@ -277,8 +1025,474 @@ def test_continuation_requires_all_safety_gates(tmp_path, gate):
     cfg = config(tmp_path)
     entry = recovered_entry()
     assert campaign.operationally_recovered(cfg, entry)
+    assert campaign.train_cell_failure_continuation_authorized(cfg, entry)
     entry["gates"][gate] = {}
     assert not campaign.operationally_recovered(cfg, entry)
+    assert not campaign.train_cell_failure_continuation_authorized(cfg, entry)
+
+
+def test_train_continuation_requires_operational_stability_and_keeps_run_excluded(tmp_path):
+    cfg = config(tmp_path)
+    entry = recovered_entry()
+
+    assert campaign.train_cell_failure_continuation_authorized(cfg, entry)
+    assert not campaign.train_cell_gate_passed(entry)
+
+    entry["gates"]["operational_recovery"].update(
+        passed=False, stable_seconds=21.4,
+    )
+    assert not campaign.train_cell_failure_continuation_authorized(cfg, entry)
+    assert not campaign.train_cell_gate_passed(entry)
+
+
+def test_late_operational_recovery_allows_only_skipping_the_aborted_cell(tmp_path):
+    cfg = config(tmp_path)
+    entry = late_operational_entry()
+
+    assert cfg["controlled_campaign"]["resilience"]["late_operational_timeout_seconds"] == 600
+    assert cfg["controlled_campaign"]["time_budget"]["stages"]["late_operational_recovery"] == 600
+    assert campaign.operationally_recovered(cfg, entry)
+    assert campaign.train_cell_failure_continuation_authorized(cfg, entry)
+    assert not campaign.train_cell_gate_passed(entry)
+
+    entry["gates"]["late_operational_recovery"]["target"]["restart_count"] = 2
+    assert not campaign.operationally_recovered(cfg, entry)
+
+    entry = late_operational_entry()
+    cfg["controlled_campaign"]["resilience"]["late_operational_timeout_seconds"] = 0
+    assert not campaign.operationally_recovered(cfg, entry)
+
+
+def test_separate_late_check_requires_confirmed_load_cleanup(tmp_path):
+    cfg = config(tmp_path)
+    entry = late_operational_entry()
+    gate = entry["gates"]["late_operational_recovery"]
+    gate.update(
+        late_check_id="late-check-1",
+        late_check_cleanup_passed=False,
+        late_check_load_stopped=True,
+    )
+    assert not campaign.operationally_recovered(cfg, entry)
+
+    gate["late_check_cleanup_passed"] = True
+    assert campaign.operationally_recovered(cfg, entry)
+
+
+def test_passive_recovery_amendment_is_scoped_and_idempotent(tmp_path):
+    cfg = config(tmp_path)
+    cfg["experiment_campaign_id"] = "controlled-20261103T234452388707Z"
+
+    assert campaign.apply_passive_recovery_extension_amendment(tmp_path, cfg)
+    assert cfg["controlled_campaign"]["resilience"]["late_operational_timeout_seconds"] == 600
+    assert cfg["platform"]["run_timeout_seconds"] == (
+        cfg["controlled_campaign"]["time_budget"]["poll_seconds"]
+    )
+    assert campaign.apply_passive_recovery_extension_amendment(tmp_path, cfg)
+    events = campaign.read_ledger(tmp_path / "campaign_events.jsonl")
+    assert len(events) == 1
+    assert events[0]["event"] == "passive_recovery_extension_amendment_applied"
+    assert events[0]["scope"] == "future_runs_only"
+    assert events[0]["automatic_restart"] is False
+
+    other = config(tmp_path)
+    assert not campaign.apply_passive_recovery_extension_amendment(tmp_path, other)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["fresh", "interrupted", "resource_telemetry_failure", "latency_stability_failure"],
+)
+def test_late_recovery_check_is_scoped_and_append_only(monkeypatch, tmp_path, scenario):
+    cfg = config(tmp_path)
+    cfg["experiment_campaign_id"] = "controlled-20261103T234452388707Z"
+    cfg["load_profile"] = {
+        "command": "kubectl -n loadtest exec deploy/locust-web -- locust",
+        "locust_file": "/mnt/locust/locustfile.py",
+        "host": "http://front-end.sock-shop.svc.cluster.local",
+        "users": 30,
+        "spawn_rate": 5,
+        "grace_seconds": 30,
+    }
+    original_here = campaign.HERE
+    repo = tmp_path / "repo"
+    memory_hog = repo / "experiment" / "eval" / "memory_hog"
+    memory_hog.mkdir(parents=True)
+    monkeypatch.setattr(campaign, "HERE", memory_hog)
+    (memory_hog / campaign.LATE_RECOVERY_CHECK_FILE).write_text(
+        (original_here / campaign.LATE_RECOVERY_CHECK_FILE).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    target = {
+        "cell_id": "orders-container-kill-r0",
+        "run_id": "run-503646080ca5",
+    }
+    run_dir = repo / "experiment" / "platform" / "data" / "object_store" / target["run_id"]
+    run_dir.mkdir(parents=True)
+    baseline_values = {
+        "traffic": 5.0,
+        "cpu_cores": .1,
+        "memory_bytes": 400 * 2**20,
+        "errors_percent": 0.0,
+        "latency_ms": 305.0,
+    }
+    source_report = {
+        "status": "aborted",
+        "observations": [{
+            "phase": "baseline",
+            "summary": {
+                name: {
+                    "status": "ok",
+                    "samples": 12,
+                    "mean": value,
+                    "p95": value,
+                }
+                for name, value in baseline_values.items()
+            },
+        }],
+    }
+    (run_dir / "controlled_report.json").write_text(
+        json.dumps(source_report) + "\n", encoding="utf-8",
+    )
+    (run_dir / "effective_spec.json").write_text(
+        json.dumps({"load_profile": {**cfg["load_profile"], "extra_args": []}}),
+        encoding="utf-8",
+    )
+    source_hash = hashlib.sha256(
+        (run_dir / "controlled_report.json").read_bytes()
+    ).hexdigest()
+    directory = tmp_path / "campaign"
+    directory.mkdir()
+    (directory / "plan.json").write_text(json.dumps([{
+        "cell_id": target["cell_id"], "service": "orders", "chaos_type": "container-kill",
+    }]), encoding="utf-8")
+    entry = {"cell_id": target["cell_id"], "run_id": target["run_id"], "status": "aborted"}
+    ledger = [entry]
+    monkeypatch.setattr(campaign, "require_environment", Mock())
+    late_directory = directory / "late_recoveries" / target["run_id"]
+    if scenario != "fresh":
+        late_directory.mkdir(parents=True)
+        (late_directory / "report.json").write_text(json.dumps({
+            "run_id": "late-recovery-interrupted",
+            "source_run_id": target["run_id"],
+            "source_report_sha256": source_hash,
+            "status": "late_recovery_check",
+            "started_at": "started",
+            "pre_load_health": {"healthy": True},
+            "gates": {},
+            "load_handle": {},
+        }), encoding="utf-8")
+        monkeypatch.setattr(
+            campaign, "cleanup_interrupted_late_recovery_load",
+            Mock(return_value={"found": False, "stopped": True}),
+        )
+    if scenario == "resource_telemetry_failure":
+        attempt_two = late_directory / "attempt-2"
+        attempt_two.mkdir()
+        previous_report_path = attempt_two / "report.json"
+        previous_report = {
+            "run_id": "late-recovery-attempt-2",
+            "source_run_id": target["run_id"],
+            "source_report_sha256": source_hash,
+            "ended_at": "complete",
+            "passed": False,
+            "late_operational_recovery_passed": False,
+            "pre_load_health": {"healthy": True},
+            "load_handle": {"controlled_remote": True},
+            "load_stopped": {"stopped": True},
+            "container_kill_event": {
+                "container_id_after_restart": "container-1",
+                "restart_count_after_signal": 1,
+            },
+            "gates": {"late_operational_recovery": {
+                "passed": False,
+                "stable_seconds": 0,
+                "required_stable_seconds": 120,
+                "health": {"healthy": True},
+                "target": {
+                    "container_id": "container-1",
+                    "restart_count": 1,
+                    "ready": True,
+                    "running": True,
+                },
+                "metric_checks": {
+                    "traffic": {"passed": True},
+                    "cpu_cores": {
+                        "passed": False,
+                        "reason": "missing_or_insufficient_samples",
+                        "observed_status": "no_data",
+                        "sample_count": 0,
+                        "minimum_samples": 4,
+                    },
+                    "memory_bytes": {
+                        "passed": False,
+                        "reason": "missing_or_insufficient_samples",
+                        "observed_status": "no_data",
+                        "sample_count": 0,
+                        "minimum_samples": 4,
+                    },
+                    "errors_percent": {"passed": True},
+                    "latency_ms": {"passed": True},
+                },
+            }},
+        }
+        previous_report_path.write_text(json.dumps(previous_report), encoding="utf-8")
+        entry["gates"] = {"late_operational_recovery": {
+            "passed": False,
+            "late_check_cleanup_passed": True,
+            "late_check_load_stopped": True,
+            "late_check_report_path": str(previous_report_path),
+            "late_check_report_sha256": hashlib.sha256(
+                previous_report_path.read_bytes()
+            ).hexdigest(),
+        }}
+    if scenario == "latency_stability_failure":
+        attempt_two = late_directory / "attempt-2"
+        attempt_two.mkdir()
+        (attempt_two / "report.json").write_text(json.dumps({
+            "run_id": "late-recovery-attempt-2",
+            "source_run_id": target["run_id"],
+            "source_report_sha256": source_hash,
+            "ended_at": "complete",
+            "passed": False,
+            "load_stopped": {"stopped": True},
+        }), encoding="utf-8")
+        attempt_three = late_directory / "attempt-3"
+        attempt_three.mkdir()
+        previous_report_path = attempt_three / "report.json"
+        def recovery_summary(latency_p95):
+            return {
+                "traffic": {"status": "ok", "samples": 10, "mean": 5.0, "p95": 5.0},
+                "cpu_cores": {"status": "ok", "samples": 10, "mean": .1, "p95": .1},
+                "memory_bytes": {
+                    "status": "ok",
+                    "samples": 10,
+                    "mean": 400 * 2**20,
+                    "p95": 400 * 2**20,
+                },
+                "errors_percent": {"status": "ok", "samples": 10, "mean": 0.0, "p95": 0.0},
+                "latency_ms": {
+                    "status": "ok",
+                    "samples": 10,
+                    "mean": latency_p95,
+                    "p95": latency_p95,
+                },
+            }
+
+        previous_report = {
+            "run_id": "late-recovery-attempt-3",
+            "source_run_id": target["run_id"],
+            "source_report_sha256": source_hash,
+            "started_at": "started",
+            "ended_at": "complete",
+            "passed": False,
+            "late_operational_recovery_passed": False,
+            "late_recovery_policy": {
+                "attempt": 3,
+                "resource_measurement_source": "cgroup-v2",
+            },
+            "pre_load_health": {"healthy": True},
+            "load_handle": {"controlled_remote": True},
+            "load_stopped": {"stopped": True},
+            "container_kill_event": {
+                "container_id_after_restart": "container-1",
+                "restart_count_after_signal": 1,
+            },
+            "telemetry": {"cgroup_v2": {
+                "source": "kubectl_exec_inside_application_container",
+                "scope": "exact application container; sidecars excluded",
+                "container_id_after_restart": "container-1",
+                "sample_count": 138,
+            }},
+            "observations": [
+                {"phase": "recovery_check", "end": "2026-11-05T01:03:00+00:00",
+                 "summary": recovery_summary(400.0)},
+                {"phase": "recovery_check", "end": "2026-11-05T01:03:30+00:00",
+                 "summary": recovery_summary(366.5)},
+                {"phase": "recovery_check", "end": "2026-11-05T01:04:00+00:00",
+                 "summary": recovery_summary(350.0)},
+                {"phase": "recovery_check", "end": "2026-11-05T01:04:30+00:00",
+                 "summary": recovery_summary(350.0)},
+                {"phase": "recovery_check", "end": "2026-11-05T01:05:30+00:00",
+                 "summary": recovery_summary(350.0)},
+            ],
+            "gates": {"late_operational_recovery": {
+                "passed": False,
+                "stable_seconds": 100.59434776099806,
+                "required_stable_seconds": 120,
+                "health": {"healthy": True},
+                "target": {
+                    "container_id": "container-1",
+                    "restart_count": 1,
+                    "ready": True,
+                    "running": True,
+                },
+                "metric_checks": {
+                    "traffic": {"passed": True, "threshold": 4.0, "observed": 5.0},
+                    "cpu_cores": {"passed": True, "threshold": .15, "observed": .1},
+                    "memory_bytes": {
+                        "passed": True,
+                        "threshold": 400 * 2**20 * 1.2,
+                        "observed": 400 * 2**20,
+                    },
+                    "errors_percent": {"passed": True, "threshold": 1.0, "observed": 0.0},
+                    "latency_ms": {
+                        "passed": True,
+                        "threshold": 366.0,
+                        "observed": 312.5,
+                    },
+                },
+            }},
+        }
+        previous_report_path.write_text(json.dumps(previous_report), encoding="utf-8")
+        cfg["controlled_campaign"]["resilience"]["late_operational_timeout_seconds"] = 600
+        entry["reason"] = "recovery not confirmed; campaign must stop before next service"
+        entry["gates"] = {
+            "submitted": True,
+            "intervention_confirmed_on_target": True,
+            "mechanism_observed": {"passed": True},
+            "recovery": {"passed": False},
+            "operational_recovery": {
+                "passed": False,
+                "policy_version": 1,
+                "source": "same_load_same_baseline_unchanged_recovery_thresholds",
+                "target": {"container_id": "container-1", "restart_count": 1},
+            },
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+            "late_operational_recovery": {
+                "passed": False,
+                "late_check_attempt": 3,
+                "late_check_cleanup_passed": True,
+                "late_check_load_stopped": True,
+                "late_check_report_path": str(previous_report_path),
+                "late_check_report_sha256": hashlib.sha256(
+                    previous_report_path.read_bytes()
+                ).hexdigest(),
+            },
+        }
+    from experiment.eval.memory_hog import load_check
+
+    def fake_late_check(
+        source_run_id,
+        source_report_path,
+        spec_path,
+        check_directory,
+        *,
+        attempt_number,
+        latency_p95_limit_override_ms=None,
+    ):
+        policy = {
+            "attempt": attempt_number,
+            "latency_p95_limit_override_ms": latency_p95_limit_override_ms,
+            "thresholds_unchanged": latency_p95_limit_override_ms is None,
+        }
+        if latency_p95_limit_override_ms is not None:
+            policy["amendment_version"] = campaign.LATE_RECOVERY_CHECK_VERSION
+        report = {
+            "run_id": f"late-recovery-test-{attempt_number}",
+            "source_run_id": source_run_id,
+            "source_report_sha256": source_hash,
+            "ended_at": "complete",
+            "passed": True,
+            "late_recovery_policy": policy,
+            "load_handle": {"provider": "locust"},
+            "load_stopped": {"stopped": True},
+            "gates": {"late_operational_recovery": {
+                "passed": True,
+                "policy_version": 1,
+                "stable_seconds": 120,
+                "source": (
+                    "same_load_same_baseline_user_authorized_latency_p95_limit_override"
+                    if latency_p95_limit_override_ms is not None
+                    else "same_load_same_baseline_unchanged_recovery_thresholds"
+                ),
+                "latency_p95_limit_override_ms": latency_p95_limit_override_ms,
+                "target": {"container_id": "container-1", "restart_count": 1},
+            }},
+        }
+        check_directory.mkdir(parents=True)
+        (check_directory / "report.json").write_text(json.dumps(report), encoding="utf-8")
+        return report
+
+    late_check = Mock(side_effect=fake_late_check)
+    monkeypatch.setattr(load_check, "run_late_operational_recovery_check", late_check)
+    updated = campaign.apply_late_operational_recovery_check(directory, cfg, ledger)
+
+    assert len(ledger) == 1
+    if scenario in {"resource_telemetry_failure", "latency_stability_failure"}:
+        assert ledger[0]["gates"]["late_operational_recovery"]["passed"] is False
+    else:
+        assert "late_operational_recovery" not in ledger[0].get("gates", {})
+    assert len(updated) == 2
+    latest = updated[-1]
+    assert latest["status"] == "aborted"
+    assert latest["gates"]["late_operational_recovery"]["passed"] is True
+    assert latest["gates"]["late_operational_recovery"]["late_check_cleanup_passed"] is True
+    assert late_check.call_count == 1
+    expected_attempt = {
+        "fresh": 1,
+        "interrupted": 2,
+        "resource_telemetry_failure": 3,
+        "latency_stability_failure": 4,
+    }[scenario]
+    expected_directory = (
+        late_directory if scenario == "fresh" else late_directory / f"attempt-{expected_attempt}"
+    )
+    assert late_check.call_args.args[3] == expected_directory
+    assert late_check.call_args.kwargs["attempt_number"] == expected_attempt
+    expected_limit = 370.0 if scenario == "latency_stability_failure" else None
+    assert late_check.call_args.kwargs.get("latency_p95_limit_override_ms") == expected_limit
+    assert campaign.apply_late_operational_recovery_check(directory, cfg, updated) == updated
+    assert late_check.call_count == 1
+    events = campaign.read_ledger(directory / "campaign_events.jsonl")
+    if scenario == "interrupted":
+        assert events[0]["event"] == "late_recovery_interrupted_attempt_cleanup_verified"
+        assert events[1]["event"] == "late_operational_recovery_check_completed"
+    elif scenario == "resource_telemetry_failure":
+        assert events[0]["event"] == "late_recovery_cgroup_sampler_retry_authorized"
+        assert events[0]["attempt_number"] == 3
+        assert events[0]["other_thresholds_unchanged"] is True
+        assert events[1]["event"] == "late_operational_recovery_check_completed"
+    elif scenario == "latency_stability_failure":
+        assert events[0]["event"] == "late_recovery_latency_amendment_applied"
+        assert events[0]["latency_p95_limit_override_ms"] == 370.0
+        assert events[1]["event"] == "late_recovery_latency_threshold_retry_authorized"
+        assert events[1]["attempt_number"] == 4
+        assert events[1]["other_thresholds_unchanged"] is True
+        assert events[2]["event"] == "late_operational_recovery_check_completed"
+        assert campaign.operationally_recovered(cfg, latest)
+    else:
+        assert events[0]["event"] == "late_operational_recovery_check_completed"
+    assert events[-1]["original_status_preserved"] == "aborted"
+
+
+def test_train_continuation_accepts_only_explicit_late_recovery_amendment(tmp_path):
+    entry = late_recovery_entry()
+
+    assert campaign.late_recovery_authorized(config(tmp_path), entry)
+    assert campaign.train_cell_failure_continuation_authorized(
+        config(tmp_path), entry,
+    )
+    assert not campaign.train_cell_gate_passed(entry)
+
+
+def test_train_only_prior_gate_continuation_requires_explicit_flag_and_recovery(
+    tmp_path,
+):
+    cfg = config(tmp_path)
+    entry = late_operational_entry()
+
+    assert not campaign.train_only_prior_cell_continuation_authorized(
+        cfg, entry, continue_after_technical_failure=False,
+    )
+    assert campaign.train_only_prior_cell_continuation_authorized(
+        cfg, entry, continue_after_technical_failure=True,
+    )
+
+    entry["gates"]["load_stopped"]["stopped"] = False
+    assert not campaign.train_only_prior_cell_continuation_authorized(
+        cfg, entry, continue_after_technical_failure=True,
+    )
 
 
 def test_legacy_campaign_cannot_gain_automatic_abort_clearance(tmp_path):
@@ -426,6 +1640,95 @@ def test_automatic_pre_intervention_retry_requires_clean_unsubmitted_block(tmp_p
     )
     legacy["controlled_campaign"]["resilience"].pop("pre_intervention_retry")
     assert not campaign.automatic_pre_intervention_retry_authorized(legacy, blocked)
+
+
+def test_train_failure_continuation_allows_only_the_preregistered_clean_block_retry(
+    tmp_path,
+):
+    cfg = config(tmp_path)
+    blocked = {
+        "cell_id": "front-end-network-latency-r0",
+        "run_id": "run-blocked",
+        "status": "blocked",
+        "attempt": 1,
+        "gates": {
+            "submitted": False,
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+    }
+
+    assert campaign.train_cell_failure_continuation_authorized(cfg, blocked)
+    assert not campaign.train_cell_failure_continuation_authorized(
+        cfg, {**blocked, "attempt": 2},
+    )
+    assert not campaign.train_cell_failure_continuation_authorized(
+        cfg, {
+            **blocked,
+            "gates": {
+                **blocked["gates"],
+                "submitted": True,
+            },
+        },
+    )
+    assert not campaign.train_cell_failure_continuation_authorized(
+        cfg, {
+            **blocked,
+            "gates": {
+                **blocked["gates"],
+                "load_stopped": {"stopped": False},
+            },
+        },
+    )
+
+
+def test_safe_block_skip_requires_exhausted_retry_and_healthy_safe_state(tmp_path):
+    cfg = config(tmp_path)
+    blocked = {
+        "cell_id": "front-end-network-latency-r0",
+        "run_id": "run-blocked",
+        "status": "blocked",
+        "attempt": 2,
+        "gates": {
+            "submitted": False,
+            "intervention_confirmed_on_target": None,
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+            "application_stability": {
+                "healthy": True,
+                "unhealthy_services": [],
+                "unhealthy_nodes": [],
+            },
+        },
+    }
+
+    assert campaign.clean_pre_intervention_block_skip_authorized(cfg, blocked)
+    assert campaign.train_cell_failure_continuation_authorized(
+        cfg, blocked, allow_clean_pre_intervention_skip=True,
+    )
+    assert not campaign.train_cell_failure_continuation_authorized(cfg, blocked)
+    assert not campaign.clean_pre_intervention_block_skip_authorized(
+        cfg, {**blocked, "attempt": 1},
+    )
+
+    unsafe_variants = [
+        {"submitted": True},
+        {"cleanup": {"passed": False}},
+        {"load_stopped": {"stopped": False}},
+        {"application_stability": {"healthy": False}},
+        {
+            "application_stability": {
+                "healthy": True,
+                "unhealthy_services": ["front-end"],
+                "unhealthy_nodes": [],
+            },
+        },
+    ]
+    for changed_gate in unsafe_variants:
+        gates = {**blocked["gates"], **changed_gate}
+        assert not campaign.clean_pre_intervention_block_skip_authorized(
+            cfg, {**blocked, "gates": gates},
+        )
 
 
 def test_rag_accepts_only_policy_bound_automatic_pre_intervention_retry(tmp_path):
@@ -1166,15 +2469,16 @@ def test_invalid_level_rejected():
         campaign.build_plan("unknown")
 
 
-def test_cpu_candidate_yaml_covers_all_services_and_targets_full_quota():
+def test_cpu_candidate_yaml_covers_all_services_with_minimum_quota_gate():
     values = yaml.safe_load((campaign.HERE / "cpu-calibration.yaml").read_text())
     assert set(values) - {"policy"} == set(campaign.SERVICES)
     for service in campaign.SERVICES:
         profile = values[service]["cpu"]
-        assert profile["cores"] == 1
+        assert profile["cores"] == 2
         assert profile["load"] == 100
-        assert profile["target_quota_fraction"] == 1.0
-        assert profile["target_tolerance_fraction"] == .05
+        assert profile["minimum_quota_fraction"] == .80
+        assert "target_quota_fraction" not in profile
+        assert "target_tolerance_fraction" not in profile
         assert profile["calibration_status"] == "candidate"
         assert profile["rationale"]
 
@@ -1390,6 +2694,11 @@ def test_default_cli_loads_candidate_for_entire_medium_plan(monkeypatch, tmp_pat
     assert captured["load_profile"]["spawn_rate"] == 5
     assert captured["controlled_campaign"]["recovery_timeout_seconds"] == 300
     assert captured["controlled_campaign"]["resilience"]["stable_seconds"] == 120
+    assert captured["controlled_campaign"]["resilience"]["late_operational_timeout_seconds"] == 600
+    assert captured["controlled_campaign"]["time_budget"]["stages"]["late_operational_recovery"] == 600
+    assert captured["platform"]["run_timeout_seconds"] == (
+        captured["controlled_campaign"]["time_budget"]["poll_seconds"]
+    )
     assert captured["controlled_campaign"]["resilience"]["pre_intervention_retry"] == {
         "version": campaign.PRE_INTERVENTION_RETRY_VERSION,
         "max_attempts": 2,

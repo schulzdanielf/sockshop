@@ -61,6 +61,8 @@ data:
         service_graphs:
           dimensions:
             - db.system
+            - service.namespace
+            - k8s.namespace.name
           peer_attributes:
             - db.system
             - net.peer.name
@@ -70,6 +72,13 @@ data:
           dimensions:
             - db.system
             - db.operation
+            - service.namespace
+            - k8s.namespace.name
+            - http.method
+            - http.request.method
+            - http.status_code
+            - http.response.status_code
+            - http.route
 
     query_frontend:
       search:

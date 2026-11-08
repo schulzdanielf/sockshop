@@ -113,11 +113,15 @@ the official Grafana MCP Docker service is available in read-only SSE mode on
 `127.0.0.1:18081`. It uses `GRAFANA_URL` and
 `GRAFANA_SERVICE_ACCOUNT_TOKEN` from the repository `.env`.
 
-Model-driven Telemetry Chat composes the official Grafana MCP with the existing
-observability MCP; run RCA continues to use only the existing server on
-`127.0.0.1:18080`. `.vscode/mcp.json` is a separate `stdio` configuration for
-VS Code clients; the platform uses its own SSE container. The manual steps below
-are useful when you want each process in its own terminal.
+Model-driven Telemetry Chat uses the historical MCP configured for the selected
+run, with the official Grafana MCP available for its additional read-only tools.
+The platform Make targets ensure the historical MCP port-forward on
+`127.0.0.1:18082`; when starting Uvicorn directly, run
+`make ensure-history-mcp-forward` first. The live observability MCP on
+`127.0.0.1:18080` remains available for collecting telemetry during new runs.
+`.vscode/mcp.json` is a separate `stdio` configuration for VS Code clients; the
+platform uses its own SSE containers. The manual steps below are useful when
+you want each process in its own terminal.
 
 1. Start the Qwen3.5 model server:
 
@@ -131,19 +135,25 @@ prefix and are read-only. The server starts the pinned MCP image over stdio;
 `make model-serve` loads the Grafana credentials from the repository `.env`
 without adding them to the MCP config file.
 
-2. Forward the observability MCP server used by run-scoped telemetry chat:
+2. Forward the historical MCP used by run-scoped telemetry chat and RCA:
+
+```bash
+kubectl port-forward --address 127.0.0.1 -n monitoring-history svc/history-observability-mcp 18082:8000
+```
+
+3. Forward the live observability MCP used to collect data during new runs:
 
 ```bash
 kubectl port-forward --address 127.0.0.1 -n mcp-server svc/mcp-observability 18080:8000
 ```
 
-3. Forward the OTLP receiver used for model-call metrics:
+4. Forward the OTLP receiver used for model-call metrics:
 
 ```bash
 kubectl port-forward --address 127.0.0.1 -n monitoring svc/otel-collector 4318:4318
 ```
 
-4. Start the Qwen3.5 OpenAI-compatible telemetry proxy:
+5. Start the Qwen3.5 OpenAI-compatible telemetry proxy:
 
 ```bash
 OTEL_SERVICE_NAME=llm-qwen35 \

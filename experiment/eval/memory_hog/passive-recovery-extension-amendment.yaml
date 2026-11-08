@@ -1,0 +1,11 @@
+version: controlled-passive-recovery-extension-v1
+campaign_id: controlled-20261103T234452388707Z
+user_authorized: true
+scope: future_runs_only
+operational_timeout_seconds: 600
+late_operational_timeout_seconds: 600
+stable_seconds: 120
+thresholds_unchanged: true
+automatic_restart: false
+aborted_run_status_preserved: true
+skip_only_after_recovery_and_cleanup: true

@@ -1,10 +1,54 @@
 # Plano de evolução da RAG e campanha única de treino com 35 experimentos
 
 **Data:** 03/11/2026.  
-**Estado:** plano para revisão; nenhuma implementação, injeção ou nova avaliação autorizada por este documento.  
+**Estado:** 1/35 células executada. `run-c877219ec395` terminou com recuperação, limpeza e read-back aprovados, mas falhou a calibração do mecanismo CPU; permanece excluída do treino e 34 células seguem não executadas.
 **Modelo generativo obrigatório:** Qwen 3.5, com identidade, artefato e configuração fixados.  
 **Decisão confirmada pelo usuário:** uma campanha de treino, um perfil de carga, iniciado e parado por experimento, com nova baseline. Não manter carga contínua atravessando os 35 casos.  
-**Princípio de avanço:** executar uma etapa, registrar a validação, revisar o gate e somente então autorizar a próxima.
+**Princípio de avanço:** após autorização explícita posterior, uma falha técnica medida em run `completed` pode ser excluída e a coleta continuar, desde que recuperação, limpeza, parada da carga e read-back histórico passem. Falhas de segurança, estado operacional não concluído, recuperação/limpeza incompleta ou telemetria inválida continuam em fail-stop.
+
+### Emenda de continuação autorizada (04/11/2026)
+
+- O usuário autorizou continuar as células restantes mesmo que ocorram falhas técnicas, sem reclassificar falhas como sucesso nem incluir runs reprovados no corpus.
+- A retomada usa exclusivamente o modo train-only completo (`--through-train-count 35`) e `--continue-after-technical-failure`; um run só pode ser ultrapassado se estiver `completed`, tiver evidência medida de baseline e intervenção, read-back histórico completo e gates de recuperação, limpeza e parada da carga aprovados.
+- Estados `blocked`, `aborted`, `failed` ou `stopped`, ausência de medição, read-back inválido/incompleto e falhas de recuperação/limpeza continuam interrompendo a campanha antes de qualquer célula seguinte, exceto por uma única repetição pré-registrada de bloqueio limpo antes da injeção, sem submissão, com limpeza e parada da carga aprovadas. Um segundo bloqueio interrompe a campanha.
+- Emenda autorizada em 04/11/2026 para a retomada atual: após esgotar as duas tentativas pré-injeção, um bloqueio pode ser marcado como inelegível e pulado somente se não houve submissão/intervenção, limpeza e parada da carga passaram, a aplicação está saudável e um novo preflight passa. O ledger conserva o estado `blocked`; a célula não entra no treino. Falhas de segurança, recuperação, limpeza, estado ambíguo ou preflight continuam como hard stop. A autorização e o skip ficam registrados append-only em `campaign_events.jsonl`; o pré-registro original e `config.yaml` não são reescritos.
+- Para as novas execuções, aplicar como overlay a calibração candidata com piso CPU inclusivo de 80% por pelo menos 60 s. O `config.yaml`, o relatório e o resultado do primeiro run permanecem imutáveis; o overlay e a autorização são registrados append-only em `campaign_events.jsonl`.
+- O relatório de progresso deve distinguir coleta concluída de gates integralmente aprovados, informar o número de falhas técnicas excluídas e marcar cada célula reprovada como inelegível para treino.
+
+### Emenda posterior autorizada: validação CPU por média
+
+- Para os casos `cpu-hog` já concluídos e os próximos casos desta campanha, o gate CPU usa a média aritmética de `cpu_cores / quota_viva` na janela `fault`, com piso inclusivo de 80%, sem teto e sem duração sustentada mínima. A duração acima do limiar permanece registrada apenas como diagnóstico.
+- A emenda não relaxa submissão, medição válida no container-alvo, recuperação, limpeza, parada da carga ou read-back histórico completo; todos continuam obrigatórios para elegibilidade de treino.
+- Runs já concluídos são reavaliados sem reinjeção. O resultado append-only fica em `cpu_mean80_revalidation.jsonl`; os gates originais no ledger, o pré-registro e as configurações já submetidas permanecem preservados.
+- Alterações de regra no disco não modificam um processo que já carregou a versão anterior do código. A decisão final desse run deve ser anexada após a conclusão, usando a evidência persistida e os mesmos gates não-CPU.
+
+### Emenda de continuação após recuperação operacional tardia
+
+- Em retomadas train-only com `--continue-after-technical-failure`, um run que permaneça `aborted` somente libera a próxima célula quando `operational_recovery.passed` satisfaz a política persistida (mesma carga/baseline/thresholds, estabilidade contínua de 120 s), além de intervenção e mecanismo confirmados, limpeza, parada da carga, telemetria e read-back histórico aprovados.
+- O run tardio permanece `aborted` e inelegível para treino; a continuação não o converte em sucesso nem repete a injeção. Se a recuperação operacional falhar ou não acumular a estabilidade exigida, a campanha mantém o hard stop.
+- A emenda não aumenta o prazo operacional de 600 s nem reduz thresholds ou estabilidade. Runs anteriores sem recuperação operacional comprovada não são liberados retroativamente.
+
+### Parada de `orders-container-kill-r0` (04/11/2026)
+
+- `run-503646080ca5` permaneceu `aborted` porque a janela de recuperação experimental não passou. Na checagem registrada, CPU P95 foi 0,3324 core ante limite calculado de 0,1338 core, e latência P95 foi 391,7 ms ante limite de 366 ms. O tráfego, erros e memória não eram os critérios que falharam nessa checagem.
+- A recuperação operacional permaneceu em observação por até 600 s; no fim o container estava `ready`/`running`, mas havia somente 21,4 s estáveis dos 120 s exigidos (`operational_recovery.passed=false`). Limpeza e parada da carga passaram. Portanto, não era uma falha apenas de elegibilidade técnica e o supervisor corretamente não iniciou outra injeção.
+- A resposta da Skill RCA para esse ID foi inconclusiva e inconsistente com os artefatos controlados (`primary_service=user`, `fault_type=null`, enquanto o run registrado é `orders`/`container-kill`); não é usada como evidência causal. A causa de qualquer degradação subjacente continua sem confirmação.
+
+### Registro operacional (03/11/2026)
+
+- A primeira tentativa, `run-524da40286de` (`payment-cpu-hog-r0`), foi bloqueada antes da submissão porque o Prometheus histórico ainda não tinha amostra do pod atual. `gates.submitted=false`; nenhuma falha foi injetada.
+- O dual-write foi habilitado para a campanha `controlled-20261103T234452388707Z`. A consulta via MCP histórico passou a retornar uma série do pod de `payment`; a amostra tinha 24,3 s, abaixo do limite de frescor de 45 s. O preflight pós-ativação passou 29/29 verificações.
+- A verificação ao vivo do Locust após o bloqueio encontrou zero usuários e nenhum processo headless. Essa evidência foi acrescentada ao ledger append-only; o guard de retry passou sem alteração.
+- A repetição explícita preservou a tentativa original e criou `run-c877219ec395`. A baseline terminou às 23:56:02 UTC e a submissão ocorreu às 23:56:05 UTC. O workflow Litmus terminou `Pass`, mas isso não satisfez o gate de mecanismo no container-alvo.
+- O workflow observado confirmou `TARGET_CONTAINER=payment`, `CPU_CORES=2`, `CPU_LOAD=100` e 180 s; a configuração candidata foi aplicada, não revertida para um worker. O container tinha quota de 0,1 core. Prometheus mediu média de 0,08342 core (83,4%); amostras diretas do cgroup v2 corroboraram 0,08490 core (84,9%). O gate exigia pelo menos 95% por 60 s; a amostragem registrou 20,8 s nessa faixa. Portanto `target_attainment.passed=false` e `intervention_confirmed_on_target=false`, embora o aumento médio tenha sido mensurável.
+- Emenda pós-hoc autorizada: para reavaliar este run, usar piso inclusivo de 80% da quota por 60 s, descartando os primeiros 30 s e permitindo gaps de até 20 s; a média também deve ser >=80%. A série original teve média de 83,42%, mas sustentou >=80% por apenas 54,99 s. O run continua reprovado; o relatório original, a configuração submetida e o pré-registro não foram sobrescritos. A emenda foi acrescentada ao log append-only da campanha, sem reinjeção.
+- Limitação de reprodutibilidade: a série bruta citada no recálculo anterior não está disponível neste checkout, nos arquivos persistidos da sessão nem em `/tmp`. O relatório original confirma a média, mas não contém as amostras necessárias para reproduzir os 54,99 s. A conclusão de duração foi preservada como resultado do recálculo anterior; antes de nova adjudicação, é necessário arquivar a série bruta ou refazer a consulta histórica somente leitura.
+- Reconsulta histórica somente leitura (04/11/2026): o seletor Prometheus do container `payment` retornou zero séries para a janela de intervenção. Uma consulta agregada por pod retornou 23 amostras, média de 85,62% da quota e 135 s acima de 80% após o descarte inicial; porém, não identifica o container-alvo e difere da série original (39 amostras, média de 83,42%). Esse agregado não satisfaz o gate por container. Portanto, o run **não foi aprovado**; os 54,99 s anteriores também não foram reproduzidos pela consulta histórica. Consultas e respostas completas estão no artefato de rechecagem.
+- Os contadores cgroup de throttling subiram durante a intervenção (2,31 s/s e 8,37 períodos/s, contra 0,022 e 0,268 na baseline). Isso corrobora demanda e throttling sob a quota apertada; os artefatos não isolam por que a média ficou abaixo do alvo. O impacto mostrou aumento de latência, sem aumento de erros.
+- O run recuperou e limpou; o read-back histórico via MCP passou com 840 métricas, 20 logs e 1 trace. A verificação pós-run confirmou preflight 29/29, `headless_processes=[]` e `web_user_count=0`.
+- A campanha parou antes da segunda célula, como exige o fail-stop. A emenda só reclassifica o run existente; não autoriza repetir a célula nem iniciar outra. `cpu-calibration.yaml` registra o piso candidato para uma execução futura, sem alterar os parâmetros arquivados do run submetido.
+- A decisão posterior de continuação não aprova novamente `run-c877219ec395`: seu gate CPU permanece reprovado e a célula não é elegível para treinamento. A emenda permite somente coletar as demais células sob os hard stops descritos acima.
+- O pré-registro permanece imutável. Eventos e evidências posteriores ao registro ficam no `ledger.jsonl` e em `campaign_events.jsonl` da campanha.
 
 ## 1. Objetivos e limites
 
@@ -161,7 +205,9 @@ Esta leitura identifica hipóteses de falha da estratégia. Não confirma retros
 
 As hipóteses são propostas. Não estão validadas pelo relatório atual.
 
-## 5. Fases de engenharia e validação, sem executar agora
+## 5. Fases de engenharia e validação
+
+> **Execução iniciada em 2026-11-03, limitada à preparação F0–F2.** Os 113 arquivos da avaliação anterior foram selados por hash; o alias Qwen 3.5 passou no health check, mas o checkpoint/quantização/template/contexto ainda não foram verificados. O MCP histórico descobriu 34 ferramentas, incluindo as três famílias obrigatórias; nenhuma consulta de dados de run foi feita. O modo train-only versionado e as travas de tranche/retomada passaram testes focados. Nenhuma consulta nova ao cluster, carga, injeção ou inferência foi iniciada. F1 ainda requer completar os contratos de evidência por fase e as validações restantes; F3 permanece pendente.
 
 ### F0 — Preservar, identificar e pré-registrar
 
@@ -216,6 +262,16 @@ O [supervisor atual](../../experiment/eval/memory_hog/controlled_campaign.py) cr
 7. Fixar limites de CPU/memória, topologia, imagens, tráfego e regras de rede. Não relaxar o gate para “preencher” corpus CPU.
 
 **Gate F3:** perfil/sizing congelados, quotas coerentes, leituras históricas funcionais, proteção contra vazamento, nenhuma lacuna de infraestrutura bloqueante. Falta de instrumento causal vira item de instrumentação, não conclusão do modelo.
+
+**Execução F3 — evidências read-only de 03/11/2026:**
+
+- O preflight train-only passou em **29/29** verificações; nenhuma carga ou falha foi submetida. A configuração mantém 30 usuários, `spawn_rate=5`, 1 réplica por run e coleta histórica em `dual_write`.
+- Cinco runs concluídos da campanha dual-write anterior foram consultados novamente pelo endpoint que chama o MCP histórico; **5/5** retornaram métricas, logs e traces completos. A latência end-to-end do read-back teve P50 **1,096 s** e P95 **2,403 s** (n=5); cada consulta de validação é limitada a 20 logs e 1 trace, portanto confirma disponibilidade, não cobertura integral.
+- Na janela histórica consultada, a idade das amostras scrape teve P95 **16,9 s** (902 amostras); as métricas nativas do Prometheus indicaram P95 de **95 ms** para `/api/v1/query` e `/api/v1/query_range`.
+- As consultas históricas não retornaram séries de filas/falhas dos exporters (`otelcol_exporter_*` e `prometheus_remote_storage_*`). Esse resultado é **instrumentação ausente**, não zero falhas; a validação de cada run e o fail-stop permanecem obrigatórios.
+- A retenção observada é **365 dias** em Prometheus, Loki e Tempo. PVCs declarados: Prometheus 20 GiB, Loki 10 GiB, Tempo 10 GiB e SeaweedFS 50 GiB. Uso medido: 261.174.334 B, 561.997 B, 12.288 B e 858.720.989 B, respectivamente. O `hostPath` não impõe quota por PVC; o filesystem compartilhado tinha aproximadamente **855 GB livres** (17% usado). Reavaliar se for aprovado horizonte de reanotação maior que um ano.
+- Os sete runs CPU anteriores, todos com um worker, atingiram apenas **80,6–88,1%** da quota e reprovaram o alvo de 95–105% por 60 s. A calibração candidata foi alterada para **dois workers a 100%** em cada serviço; os testes de contrato e o preflight passaram. A primeira célula CPU deve comprovar a faixa empiricamente; em caso de falha, parar sem avançar nem relaxar o gate.
+- O perfil Locust 30/5 foi usado por runs anteriores, mas estabilidade em repouso não é prova de estabilidade sob carga. A nova baseline e o gate de estabilidade antes da injeção são obrigatórios em cada run; não foi feito um ensaio adicional de carga sem falhas.
 
 ## 6. Campanha única de treino: 35 experimentos
 
@@ -440,4 +496,4 @@ Se o intervalo não discriminar benefício, concluir **“evidência insuficient
 | Avaliações online pareadas e relatório de incerteza | F8 | Alegar ganho por treino ou desenvolvimento |
 | Corpus final versionado e rotina de reanotação online | Retreino | Sobrescrever histórico ou usar fallback offline |
 
-**Primeira autorização recomendada:** F0–F2, sem injetar falhas. Revisar seus artefatos/testes; depois autorizar F3. A autorização para a primeira célula e para cada ampliação de tranche deve ser explícita.
+**Autorização de execução:** o usuário autorizou executar as 35 células train-only e, posteriormente, continuar após falhas técnicas medidas, excluindo-as do treino. A continuação não dispensa confirmação operacional, recuperação, cleanup, parada da carga ou read-back histórico; falhas nesses controles continuam em fail-stop. A inferência/avaliação com Qwen 3.5 permanece separada e bloqueada até a identidade completa do checkpoint ser verificada.

@@ -26,6 +26,7 @@ import hashlib
 import logging
 import os
 import sys
+from threading import Lock
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -73,6 +74,7 @@ _DEFAULT_ENDPOINT = "http://localhost:4318"
 _SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "rca-platform")
 
 _configured = False
+_setup_lock = Lock()
 _tracer: Optional[trace.Tracer] = None
 _hist_duration = None
 _hist_tokens = None
@@ -231,35 +233,36 @@ def setup_telemetry(app=None) -> None:
     Pass the FastAPI ``app`` to also enable inbound HTTP auto-instrumentation.
     """
     global _configured, _tracer, _hist_duration, _hist_tokens, _counter_override
-    if _configured:
+    with _setup_lock:
+        if _configured:
+            if app is not None:
+                _instrument_fastapi(app)
+            return
+
+        if not _truthy(os.environ.get("OTEL_SDK_DISABLED")):
+            _install_sdk()
+
+        _tracer = trace.get_tracer("rca.platform")
+        meter = metrics.get_meter("rca.platform")
+        _hist_duration = meter.create_histogram(
+            GenAI.METRIC_OPERATION_DURATION,
+            unit="s",
+            description="GenAI client operation wall-clock duration",
+        )
+        _hist_tokens = meter.create_histogram(
+            GenAI.METRIC_TOKEN_USAGE,
+            unit="{token}",
+            description="GenAI token usage per request (input/output)",
+        )
+        _counter_override = meter.create_counter(
+            "rca.validator.override",
+            unit="{override}",
+            description="Deterministic post-processor overrides of the LLM answer",
+        )
+        _configured = True
+
         if app is not None:
             _instrument_fastapi(app)
-        return
-    _configured = True
-
-    if not _truthy(os.environ.get("OTEL_SDK_DISABLED")):
-        _install_sdk()
-
-    _tracer = trace.get_tracer("rca.platform")
-    meter = metrics.get_meter("rca.platform")
-    _hist_duration = meter.create_histogram(
-        GenAI.METRIC_OPERATION_DURATION,
-        unit="s",
-        description="GenAI client operation wall-clock duration",
-    )
-    _hist_tokens = meter.create_histogram(
-        GenAI.METRIC_TOKEN_USAGE,
-        unit="{token}",
-        description="GenAI token usage per request (input/output)",
-    )
-    _counter_override = meter.create_counter(
-        "rca.validator.override",
-        unit="{override}",
-        description="Deterministic post-processor overrides of the LLM answer",
-    )
-
-    if app is not None:
-        _instrument_fastapi(app)
 
 
 def _install_sdk() -> None:

@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from exceptiongroup import ExceptionGroup
 from fastapi.testclient import TestClient
 
 from experiment.platform.backend import api
@@ -130,6 +131,7 @@ def test_api_uses_pinned_run_config_and_preserves_attempts(platform, monkeypatch
         json={
             "possible_fault_types": ["container-kill", "cpu-hog"],
             "require_best_guess": True,
+            "max_additional_checks": 2,
         },
     ).json()
     second = client.post("/api/runs/run-test/skill-rca").json()
@@ -141,8 +143,10 @@ def test_api_uses_pinned_run_config_and_preserves_attempts(platform, monkeypatch
     assert calls[0]["namespace"] == "sock-shop"
     assert calls[0]["possible_fault_types"] == ["container-kill", "cpu-hog"]
     assert calls[0]["require_best_guess"] is True
+    assert calls[0]["max_additional_checks"] == 2
     assert calls[1]["possible_fault_types"] == []
     assert calls[1]["require_best_guess"] is False
+    assert calls[1]["max_additional_checks"] == 4
     assert mcp_endpoints == [
         (api.DEFAULT_HISTORICAL_MCP_SSE_URL, 30),
         (api.DEFAULT_HISTORICAL_MCP_SSE_URL, 30),
@@ -355,6 +359,93 @@ def test_dual_write_history_validation_reads_back_from_historical_mcp(platform, 
     }
 
 
+def _configure_telemetry_chat_history(platform, monkeypatch):
+    client, storage, _ = platform
+    get_experiment = storage.get_experiment
+
+    def historical_experiment(experiment_id, version=None):
+        experiment = get_experiment(experiment_id, version)
+        experiment.spec["observability"] = {
+            "metrics": {
+                "mcp_sse_url": "http://live-mcp/sse",
+                "timeout_seconds": 10,
+            },
+            "traces": {"timeout_seconds": 20},
+        }
+        experiment.spec["historical_observability"] = {
+            "mcp_sse_url": "http://history-mcp/sse",
+            "timeout_seconds": 45,
+        }
+        return experiment
+
+    class FakeMCPClient:
+        def __init__(self, sse_url, timeout_seconds):
+            self.sse_url = sse_url
+            self.timeout_seconds = timeout_seconds
+
+    phases = {
+        "baseline": {"start": "baseline-start", "end": "baseline-end"},
+        "fault": {"start": "fault-start", "end": "fault-end"},
+    }
+    monkeypatch.setattr(storage, "get_experiment", historical_experiment)
+    monkeypatch.setattr(api, "MCPToolClient", FakeMCPClient)
+    monkeypatch.setattr(
+        api,
+        "_build_observation_window",
+        lambda **kwargs: {
+            "window": {"start": "run-start", "end": "run-end"},
+            "phases": phases,
+        },
+    )
+    monkeypatch.setenv("GRAFANA_MCP_SSE_URL", "")
+    return client
+
+
+def test_telemetry_chat_uses_the_run_historical_mcp(platform, monkeypatch):
+    client = _configure_telemetry_chat_history(platform, monkeypatch)
+    requested = {}
+
+    def answer_query(_query, *, mcp_client, **_kwargs):
+        requested["url"] = mcp_client.sse_url
+        requested["timeout"] = mcp_client.timeout_seconds
+        return "Resposta histórica"
+
+    monkeypatch.setattr(api, "answer_query_mcp", answer_query)
+
+    response = client.post(
+        "/api/runs/run-test/telemetry-chat",
+        json={"query": "Como estavam os sinais no run?"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "Resposta histórica"
+    assert requested == {"url": "http://history-mcp/sse", "timeout": 45}
+
+
+def test_telemetry_chat_surfaces_taskgroup_subexception(platform, monkeypatch):
+    client = _configure_telemetry_chat_history(platform, monkeypatch)
+    monkeypatch.setattr(
+        api,
+        "answer_query_mcp",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ExceptionGroup(
+                "unhandled errors in a TaskGroup",
+                [ConnectionError("historical MCP port-forward is unreachable")],
+            )
+        ),
+    )
+
+    response = client.post(
+        "/api/runs/run-test/telemetry-chat",
+        json={"query": "Como estavam os sinais no run?"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "ConnectionError: historical MCP port-forward is unreachable"
+    )
+
+
 def test_api_persists_failed_attempt_and_returns_error(platform, monkeypatch):
     client, storage, run = platform
     monkeypatch.setattr(api, "answer_skill_rca", lambda **kwargs: result("error"))
@@ -388,6 +479,140 @@ def test_knowledge_api_enforces_pinned_split_and_rejects_injected_labels(platfor
         json={**body, "labels": {"service": "orders"}}, headers=headers,
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "retriever_version",
+    ["opensearch-hybrid-rrf-v4", "opensearch-bm25-metric-gated-rrf-v6"],
+)
+def test_external_test_corpus_evaluation_is_scoped_and_checks_run_overlap(
+    platform, monkeypatch, retriever_version
+):
+    from contextlib import nullcontext
+    from dataclasses import replace
+
+    client, storage, run = platform
+    spec = storage.get_experiment("test", 1).spec
+    spec["knowledge_campaign"] = {
+        "corpus_id": "previous-corpus",
+        "split": "test",
+    }
+    version = storage.create_experiment("test", spec)
+    external_run = replace(
+        run,
+        run_id="run-external",
+        experiment_version=version.version,
+    )
+    storage.create_run(external_run)
+    calls = []
+
+    class Store:
+        def __init__(self, *_):
+            pass
+
+        def load_exploratory_base(self, **_kwargs):
+            return {
+                "sha256": "a" * 64,
+                "training_run_ids": ["run-train"],
+            }
+
+        def locked(self):
+            return nullcontext()
+
+    monkeypatch.setattr(api, "KnowledgeStore", Store)
+    monkeypatch.setattr(
+        api,
+        "investigate_knowledge",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "status": "inconclusive",
+            "evidence": [],
+        },
+    )
+    body = {
+        "corpus_id": "v4-corpus",
+        "mode": "exploratory_control",
+        "external_test_evaluation_id": "test-base-v4-eval1",
+        "external_test_base_sha256": "a" * 64,
+    }
+    headers = {"X-User-Role": "admin"}
+
+    response = client.post(
+        "/api/runs/run-external/skill-rag",
+        json=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert (
+        response.json()["external_test_evaluation_id"]
+        == body["external_test_evaluation_id"]
+    )
+    assert (
+        response.json()["external_test_base_sha256"]
+        == body["external_test_base_sha256"]
+    )
+    assert len(calls) == 1
+
+    rag_body = {
+        **body,
+        "mode": "exploratory_rag",
+        "retrieval_backend": "opensearch",
+        "opensearch_base_sha256": "a" * 64,
+        "opensearch_source_skill_sha256": "b" * 64,
+        "opensearch_source_model": api.QWEN35_MODEL_ID,
+        "opensearch_current_model": api.QWEN35_MODEL_ID,
+        "retriever_version": retriever_version,
+    }
+    rag_response = client.post(
+        "/api/runs/run-external/skill-rag",
+        json=rag_body,
+        headers=headers,
+    )
+    assert rag_response.status_code == 200, rag_response.text
+    assert calls[-1]["options"].mode == "exploratory_rag"
+    assert calls[-1]["options"].retriever_version == retriever_version
+    assert calls[-1]["labels"] is None
+    assert len(calls) == 2
+
+    class OverlappingStore(Store):
+        def load_exploratory_base(self, **_kwargs):
+            return {
+                "sha256": "a" * 64,
+                "training_run_ids": ["run-overlap"],
+            }
+
+    monkeypatch.setattr(api, "KnowledgeStore", OverlappingStore)
+    overlapping = replace(external_run, run_id="run-overlap")
+    storage.create_run(overlapping)
+    overlap_spec = dict(spec)
+    overlap_spec["knowledge_campaign"] = {
+        "corpus_id": "previous-corpus",
+        "split": "test",
+    }
+    overlap_version = storage.create_experiment("overlap", overlap_spec)
+    overlapping.experiment_id = "overlap"
+    overlapping.experiment_version = overlap_version.version
+    storage.update_run(overlapping)
+    overlap_response = client.post(
+        "/api/runs/run-overlap/skill-rag",
+        json={**body, "external_test_evaluation_id": "test-base-v4-eval2"},
+        headers=headers,
+    )
+
+    assert overlap_response.status_code == 409
+    assert "training set" in overlap_response.json()["detail"]
+    assert len(calls) == 2
+
+
+def test_rag_strategy_exposes_v6_for_new_procedural_evaluations(platform):
+    client = platform[0]
+    response = client.get("/api/skill-rag/strategy")
+    assert response.status_code == 200
+    strategy = response.json()
+    assert strategy["recommended_procedural_retriever"] == api.OPENSEARCH_RETRIEVER_V6
+    assert api.OPENSEARCH_RETRIEVER_V5 in strategy["procedural_opensearch_retrievers"]
+    assert strategy["recommended_evaluation_min_score"] == 0
 
 
 def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, monkeypatch):

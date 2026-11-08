@@ -1,13 +1,58 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event
 from unittest.mock import MagicMock, Mock, patch
+
+import yaml
 
 from experiment.platform.backend.analysis.istio_edges import collect_istio_edges
 from experiment.platform.backend.api import _select_telemetry_windows
 from experiment.platform.backend.models import TelemetryChatRequest
+from experiment.platform.backend.observability import otel as otel_module
 from experiment.platform.backend.plugins.litmus_plugin import LitmusChaosPlugin
 from experiment.platform.backend.plugins.mcp_traces_plugin import MCPTempoTracesPlugin
 from experiment.platform.backend.plugins import mcp_client as mcp_client_module
+from experiment.platform.backend.rca_knowledge import prepare_check
+from experiment.platform.backend.rca_skill import SkillAdditionalCheck
+from experiment.platform.backend.analysis.istio_edges import resolve_istio_destination
+from experiment.platform.tools.configure_http_access_logs import with_http_log_provider
+
+
+def test_setup_telemetry_waits_for_concurrent_initialization(monkeypatch):
+    monkeypatch.setattr(otel_module, "_configured", False)
+    monkeypatch.setattr(otel_module, "_tracer", None)
+    monkeypatch.setattr(otel_module, "_hist_duration", None)
+    monkeypatch.setattr(otel_module, "_hist_tokens", None)
+    monkeypatch.setattr(otel_module, "_counter_override", None)
+    monkeypatch.setenv("OTEL_SDK_DISABLED", "false")
+    install_started = Event()
+    allow_install_to_finish = Event()
+    install = Mock(
+        side_effect=lambda: (
+            install_started.set(),
+            allow_install_to_finish.wait(timeout=5),
+        )
+    )
+    tracer = object()
+    meter = Mock()
+    monkeypatch.setattr(otel_module, "_install_sdk", install)
+    monkeypatch.setattr(otel_module.trace, "get_tracer", Mock(return_value=tracer))
+    monkeypatch.setattr(otel_module.metrics, "get_meter", Mock(return_value=meter))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(otel_module.setup_telemetry)
+        assert install_started.wait(timeout=5)
+        second = pool.submit(otel_module.setup_telemetry)
+        assert not second.done()
+        allow_install_to_finish.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+
+    install.assert_called_once_with()
+    assert otel_module._tracer is tracer
+    assert otel_module._configured is True
 
 
 def test_telemetry_chat_defaults_to_fault_and_selects_baseline_separately():
@@ -46,6 +91,66 @@ def test_istio_collection_reports_unknown_source_series():
         "unknown": 1,
         "total": 2,
     }
+
+
+def test_http_fault_identity_query_keeps_unknown_workloads_and_proxy_flags():
+    windows = {
+        phase: {"start": "2026-11-04T10:00:00Z", "end": "2026-11-04T10:01:00Z"}
+        for phase in ("baseline", "fault", "post")
+    }
+    check = SkillAdditionalCheck(
+        kind="http", service="shipping", phase="fault", hypothesis="HTTP",
+        expected_support="Proxy abort", expected_refutation="Sem erro",
+    )
+    _, arguments, _, _ = prepare_check(
+        check, "sock-shop", windows, {"shipping"}, [],
+        {"prometheus_range_query": {"inputSchema": {}}},
+    )
+    query = arguments["query"]
+    assert 'destination_workload="unknown"' in query
+    assert 'destination_service_name="shipping"' in query
+    assert "response_flags" in query
+    assert "destination_service" in query
+    assert 'reporter="destination"' not in query
+
+
+def test_http_proxy_identity_requires_namespace_verified_fqdn():
+    labels = {
+        "destination_workload": "unknown",
+        "destination_service_name": "shipping",
+        "destination_service": "shipping.sock-shop.svc.cluster.local",
+    }
+    assert resolve_istio_destination(labels, "sock-shop") == "shipping"
+    assert resolve_istio_destination(
+        {**labels, "destination_service": "shipping.other.svc.cluster.local"}, "sock-shop"
+    ) is None
+    assert labels["destination_workload"] == "unknown"
+
+
+def test_http_log_provider_preserves_other_mesh_settings():
+    mesh = {"defaultProviders": {"metrics": ["prometheus"]},
+            "extensionProviders": [{"name": "other", "envoyFileAccessLog": {"path": "/tmp/other"}}]}
+    updated = with_http_log_provider(mesh)
+    assert updated["defaultProviders"] == mesh["defaultProviders"]
+    assert updated["extensionProviders"][0] == mesh["extensionProviders"][0]
+    assert with_http_log_provider(updated) == updated
+    assert len(mesh["extensionProviders"]) == 1
+    fields = updated["extensionProviders"][1]["envoyFileAccessLog"]["logFormat"]["labels"]
+    assert "response_flags" in fields and "response_code_details" in fields
+    assert "path" not in fields and "authorization" not in fields
+
+
+def test_http_access_parser_is_scoped_to_envoy_provider():
+    root = Path(__file__).resolve().parents[3]
+    manifest = yaml.safe_load(
+        (root / "deploy/kubernetes/manifests-monitoring/27-otel-collector-configmap.yaml").read_text()
+    )
+    config = yaml.safe_load(manifest["data"]["config.yaml"])
+    parser = next(operator for operator in config["receivers"]["filelog"]["operators"]
+                  if operator.get("id") == "http_access_json")
+    assert parser["parse_to"] == "attributes.http_access"
+    assert "log_source" in parser["if"] and "istio_http_access" in parser["if"]
+    assert parser["on_error"] == "send"
 
 
 def test_empty_tempo_search_is_explicit():

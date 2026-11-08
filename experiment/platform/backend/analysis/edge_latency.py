@@ -8,6 +8,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from .istio_edges import istio_expression
+
 EDGE_LATENCY_QUERY_SPECS = (
     {
         "metric_name": "edge_latency_istio_mean_ms",
@@ -48,20 +50,20 @@ def build_edge_latency_queries(
     known_services: list[str],
 ) -> list[dict[str, str]]:
     """Build fixed-window PromQL for source- and server-side edge latency."""
-    namespace_selector = json.dumps(namespace)
     service_selector = json.dumps(_prometheus_regex(known_services))
-    istio_labels = (
-        f"destination_workload_namespace={namespace_selector},"
-        f"destination_workload=~{service_selector},"
-        'source_workload!="unknown",reporter="source"'
-    )
     istio_sum = (
         "sum by (source_workload, destination_workload) "
-        f"(rate(istio_request_duration_milliseconds_sum{{{istio_labels}}}[1m]))"
+        "(" + istio_expression(
+            "istio_request_duration_milliseconds_sum", namespace, reporter="source",
+            lookback="1m", normalize_destination=True,
+        ) + ")"
     )
     istio_count = (
         "sum by (source_workload, destination_workload) "
-        f"(rate(istio_request_duration_milliseconds_count{{{istio_labels}}}[1m]))"
+        "(" + istio_expression(
+            "istio_request_duration_milliseconds_count", namespace, reporter="source",
+            lookback="1m", normalize_destination=True,
+        ) + ")"
     )
     service_graph_labels = f"server=~{service_selector}"
     service_graph_client = (

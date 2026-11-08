@@ -6,6 +6,8 @@ import math
 import re
 from typing import Any
 
+from .istio_edges import resolve_istio_destination
+
 
 def termination_query(namespace: str, services: list[str]) -> str:
     pods = "|".join(
@@ -193,7 +195,8 @@ def phase_series_summary(
     *,
     purpose: str,
     unit: str,
-    service: str,
+    service: str | None,
+    namespace: str = "sock-shop",
 ) -> dict[str, Any]:
     if raw.get("status") != "success" or not isinstance(raw.get("data"), dict):
         return {"status": "tool_error", "error": raw.get("error") or "Invalid Prometheus response"}
@@ -213,10 +216,26 @@ def phase_series_summary(
                 return {"status": "tool_error", "error": "Non-finite Prometheus sample"}
             values = [v for t, v in points if start <= t <= end]
             if values:
+                identity = {}
+                if purpose == "http_status_rates":
+                    resolved = resolve_istio_destination(item["metric"], namespace)
+                    if resolved is None or (service is not None and resolved != service):
+                        return {
+                            "status": "tool_error",
+                            "error": "HTTP destination identity does not match requested service",
+                        }
+                    identity = {
+                        "resolved_destination_service": resolved,
+                        "destination_identity_source": (
+                            "service_fqdn" if item["metric"].get("destination_workload") == "unknown"
+                            else "workload"
+                        ),
+                    }
                 rows.append({
-                    "labels": item["metric"], "service": service,
+                    "labels": item["metric"], "service": identity.get("resolved_destination_service", service),
                     "sample_count": len(values), "mean": sum(values) / len(values),
                     "min": min(values), "max": max(values),
+                    **identity,
                 })
         summaries[phase] = {
             "status": "ok" if rows else "no_data",

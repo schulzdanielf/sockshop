@@ -22,8 +22,11 @@ from experiment.platform.backend.rca_knowledge import (
     digest,
     write_once,
 )
+
 from .controlled_campaign import (
-    campaign_cells, read_ledger, validate_rag_reviewed_retry_protocol,
+    campaign_cells,
+    read_ledger,
+    validate_rag_reviewed_retry_protocol,
 )
 
 METHODS = ("original", "control", "rag")
@@ -80,8 +83,7 @@ def reconcile_exploratory_test_runs(
 def options_for(config: dict[str, Any], mode: str) -> dict[str, Any]:
     knowledge = config["knowledge_campaign"]
     opensearch = (
-        mode == "exploratory_rag"
-        and knowledge.get("retrieval_backend") == "opensearch"
+        mode == "exploratory_rag" and knowledge.get("retrieval_backend") == "opensearch"
     )
     options = {
         key: value
@@ -93,9 +95,7 @@ def options_for(config: dict[str, Any], mode: str) -> dict[str, Any]:
                 knowledge.get("opensearch_base_sha256") if opensearch else None
             ),
             "opensearch_source_skill_sha256": (
-                knowledge.get("opensearch_source_skill_sha256")
-                if opensearch
-                else None
+                knowledge.get("opensearch_source_skill_sha256") if opensearch else None
             ),
             "allow_legacy_skill_hash": (
                 bool(knowledge.get("allow_legacy_skill_hash")) if opensearch else False
@@ -119,11 +119,13 @@ def options_for(config: dict[str, Any], mode: str) -> dict[str, Any]:
                 if opensearch
                 else "hybrid-rrf-bm25-v1"
             ),
-            "require_best_guess": bool(
-                knowledge.get("exploratory", False)
-            ),
+            "require_best_guess": bool(knowledge.get("exploratory", False)),
             "include_unvalidated_experimental": bool(
                 knowledge.get("include_unvalidated_experimental", False)
+                and mode == "exploratory_rag"
+            ),
+            "include_unvalidated_procedural_experimental": bool(
+                knowledge.get("include_unvalidated_procedural_experimental", False)
                 and mode == "exploratory_rag"
             ),
             "possible_fault_types": sorted(
@@ -136,6 +138,8 @@ def options_for(config: dict[str, Any], mode: str) -> dict[str, Any]:
             "exploratory",
             "parent_campaign_id",
             "opensearch_current_skill_sha256",
+            "diagnostic_methods",
+            "diagnostic_scope",
         }
     }
     if mode in {"exploratory_control", "exploratory_rag"}:
@@ -325,6 +329,7 @@ def validate_historical_diagnostic(
     history = config.get("historical_observability") or {}
     if not history.get("required"):
         return
+    knowledge = config["knowledge_campaign"]
     if response.get("observability_source") != "history":
         raise ValueError(f"{method} diagnostic did not use historical observability")
     if method == "original" and history.get("mode") != "dual_write":
@@ -346,19 +351,39 @@ def validate_historical_diagnostic(
             f"{families}"
         )
     if method != "exploratory_rag":
+        if method == "exploratory_control" and (
+            knowledge.get("external_test_evaluation_id") is not None
+        ) and (
+            response.get("external_test_evaluation_id")
+            != knowledge["external_test_evaluation_id"]
+            or response.get("external_test_base_sha256")
+            != knowledge.get("external_test_base_sha256")
+        ):
+            raise ValueError(
+                f"{method} diagnostic did not use the pinned external test base"
+            )
         return
 
+    if knowledge.get("external_test_evaluation_id") is not None and (
+        response.get("external_test_evaluation_id")
+        != knowledge["external_test_evaluation_id"]
+        or response.get("external_test_base_sha256")
+        != knowledge.get("external_test_base_sha256")
+    ):
+        raise ValueError(
+            "exploratory_rag diagnostic did not use the pinned external test base"
+        )
     try:
         incident = IncidentA.model_validate(response.get("a"))
     except (TypeError, ValueError) as exc:
         raise ValueError("RAG diagnostic did not create a valid incident A") from exc
     if incident.text_version != "incident-a-v2" or not incident.metric_facts:
         raise ValueError("RAG incident A is missing versioned metric facts")
-    knowledge = config["knowledge_campaign"]
     retrieval = response.get("retrieval") or {}
     if (
         retrieval.get("backend") != "opensearch"
-        or retrieval.get("retriever_version") != OPENSEARCH_RETRIEVER_VERSION
+        or retrieval.get("retriever_version")
+        != knowledge.get("retriever_version", OPENSEARCH_RETRIEVER_VERSION)
         or response.get("base_sha256")
         != knowledge.get("opensearch_base_sha256")
     ):
@@ -406,12 +431,25 @@ def process_cell(
         },
     )
     run_id = entry["run_id"]
-    methods = ("annotate",) if cell["phase"] == "train" else METHODS
     exploratory = bool(config["knowledge_campaign"].get("exploratory"))
-    history_validation = None
-    history_path = (
-        directory / "history_validation" / f"{cell['cell_id']}.json"
+    requested_methods = config["knowledge_campaign"].get(
+        "diagnostic_methods",
+        EXPLORATORY_METHODS if exploratory else METHODS,
     )
+    if (
+        not isinstance(requested_methods, (list, tuple))
+        or not requested_methods
+        or any(not isinstance(method, str) for method in requested_methods)
+        or len(requested_methods) != len(set(requested_methods))
+        or any(
+            method not in (EXPLORATORY_METHODS if exploratory else METHODS)
+            for method in requested_methods
+        )
+    ):
+        raise ValueError("invalid test diagnostic method selection")
+    methods = ("annotate",) if cell["phase"] == "train" else tuple(requested_methods)
+    history_validation = None
+    history_path = directory / "history_validation" / f"{cell['cell_id']}.json"
     if cell["phase"] == "test":
         if history_path.exists():
             saved_history = json.loads(history_path.read_text(encoding="utf-8"))
@@ -429,9 +467,10 @@ def process_cell(
             history_validation = wait_for_history_archive(config, run_id, api)
     # Rotate query order, not the injection order or the train/test assignment.
     if cell["phase"] == "test":
-        method_order = EXPLORATORY_METHODS if exploratory else METHODS
-        index = config["test_experiments"].index(cell) % len(method_order)
-        methods = method_order[index:] + method_order[:index]
+        if len(methods) > 1:
+            method_order = tuple(methods)
+            index = config["test_experiments"].index(cell) % len(method_order)
+            methods = method_order[index:] + method_order[:index]
     for method in methods:
         path = result_path(directory, cell, method)
         retry_metadata = None
@@ -467,6 +506,10 @@ def process_cell(
             body = {
                 "possible_fault_types": body["possible_fault_types"],
                 "require_best_guess": body["require_best_guess"],
+                "max_additional_checks": config["knowledge_campaign"]["max_rounds"],
+                "model": body.get("model"),
+                "temperature": body.get("temperature"),
+                "seed": body.get("seed"),
             }
         started = time.monotonic()
         try:

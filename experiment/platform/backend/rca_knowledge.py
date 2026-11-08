@@ -16,12 +16,13 @@ from datetime import datetime
 from typing import Any, Callable, Literal, get_args
 
 import numpy as np
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 
 from .analysis.embeddings import get_embedding_provider
 from .analysis.retrieval import cosine_similarity, rank_hybrid_text
 from .analysis.llm_client import DEFAULT_LLM_MODEL
 from .analysis.system_card import load_system_card, render_system_card
+from .analysis.istio_edges import http_status_query
 from .analysis.telemetry_coverage import (
     termination_query,
     termination_summary,
@@ -32,7 +33,7 @@ from .evidence_projection import (
     EVIDENCE_FORMAT_NOTICE,
     compact_evidence_for_model,
 )
-from .rca_options import RCABenchmarkOptions
+from .rca_options import MAX_ADDITIONAL_MCP_CHECKS, RCABenchmarkOptions
 from .rca_skill import (
     Diagnosis,
     StrictModel,
@@ -58,7 +59,16 @@ VERSION = "skill-rag-ab-v1"
 EXPLORATORY_RETRIEVER_VERSION = "hybrid-rrf-bm25-v1"
 OPENSEARCH_RETRIEVER_V1 = "opensearch-hybrid-rrf-v1"
 OPENSEARCH_RETRIEVER_VERSION = "opensearch-hybrid-rrf-v2"
+OPENSEARCH_RETRIEVER_V3 = "opensearch-hybrid-rrf-v3"
+OPENSEARCH_RETRIEVER_V4 = "opensearch-hybrid-rrf-v4"
+OPENSEARCH_RETRIEVER_V5 = "opensearch-bm25-field-idf-v5"
+OPENSEARCH_RETRIEVER_V6 = "opensearch-bm25-metric-gated-rrf-v6"
+QWEN35_MODEL_ID = "qwen3.5-9b-grafana"
+TRAINING_B_SCHEMA_VERSION = "qwen35-evidence-guided-b-v1"
+TRAINING_B_PROCEDURAL_SCHEMA_VERSION = "qwen35-procedural-b-v1"
 EXPLORATORY_HISTORY_DOCUMENT_CHAR_LIMIT = 8000
+TRAINING_HISTORY_DOCUMENT_CHAR_LIMIT = 24000
+BLIND_LIVE_REVIEW_STATUS = "blind_live_review_adjudicated"
 IDENTIFIER = r"^[A-Za-z0-9_-]{1,100}$"
 LEGACY_A_TEXT_VERSION = "incident-a-v1"
 A_TEXT_VERSION = "incident-a-v2"
@@ -66,10 +76,17 @@ A_TEXT_VERSION = "incident-a-v2"
 
 class KnowledgeOptions(RCABenchmarkOptions):
     corpus_id: str = Field(pattern=IDENTIFIER)
+    external_test_evaluation_id: str | None = Field(
+        default=None, pattern=IDENTIFIER
+    )
+    external_test_base_sha256: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
     mode: Literal[
         "annotate", "control", "rag", "exploratory_control", "exploratory_rag"
     ]
     include_unvalidated_experimental: bool = False
+    include_unvalidated_procedural_experimental: bool = False
     retrieval_backend: Literal["local", "opensearch"] = "local"
     opensearch_base_sha256: str | None = Field(
         default=None, pattern=r"^[a-f0-9]{64}$"
@@ -90,64 +107,142 @@ class KnowledgeOptions(RCABenchmarkOptions):
         "hybrid-rrf-bm25-v1",
         "opensearch-hybrid-rrf-v1",
         "opensearch-hybrid-rrf-v2",
+        "opensearch-hybrid-rrf-v3",
+        "opensearch-hybrid-rrf-v4",
+        "opensearch-bm25-field-idf-v5",
+        "opensearch-bm25-metric-gated-rrf-v6",
     ] = EXPLORATORY_RETRIEVER_VERSION
     top_k: int = Field(default=3, ge=1, le=10)
     min_score: float = Field(default=0.05, ge=0, le=1, allow_inf_nan=False)
-    max_rounds: int = Field(default=2, ge=1, le=4)
-    max_model_calls: int = Field(default=12, ge=6, le=30)
+    max_rounds: int = Field(
+        default=MAX_ADDITIONAL_MCP_CHECKS,
+        ge=1,
+        le=MAX_ADDITIONAL_MCP_CHECKS,
+    )
+    max_model_calls: int = Field(default=30, ge=6, le=30)
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
-    max_total_tokens: int = Field(default=120000, ge=8000, le=500000)
+    max_total_tokens: int = Field(default=200000, ge=8000, le=500000)
     history_char_budget: int = Field(default=24000, ge=1000, le=100000)
 
     @model_validator(mode="after")
     def validate_experimental_eligibility(self) -> KnowledgeOptions:
+        external_test_evaluation = self.external_test_evaluation_id is not None
+        external_test_base = self.external_test_base_sha256 is not None
+        if external_test_evaluation != external_test_base:
+            raise ValueError(
+                "external test evaluation ID and base SHA-256 must be provided together"
+            )
+        if external_test_evaluation and self.mode not in {
+            "exploratory_control",
+            "exploratory_rag",
+        }:
+            raise ValueError(
+                "external test evaluation is limited to exploratory control and RAG"
+            )
         if self.include_unvalidated_experimental and self.mode != "exploratory_rag":
             raise ValueError(
                 "unvalidated experimental inclusion requires exploratory_rag mode"
             )
+        if self.include_unvalidated_procedural_experimental:
+            if (
+                self.mode != "exploratory_rag"
+                or self.retrieval_backend != "opensearch"
+                or self.retriever_version
+                not in {
+                    OPENSEARCH_RETRIEVER_V4,
+                    OPENSEARCH_RETRIEVER_V5,
+                    OPENSEARCH_RETRIEVER_V6,
+                }
+            ):
+                raise ValueError(
+                    "unvalidated procedural inclusion requires exploratory procedural OpenSearch RAG"
+                )
+            if not external_test_evaluation:
+                raise ValueError(
+                    "unvalidated procedural inclusion is limited to external test evaluation"
+                )
+            if self.external_test_base_sha256 != self.opensearch_base_sha256:
+                raise ValueError(
+                    "unvalidated procedural inclusion requires the external test base "
+                    "to match the OpenSearch base"
+                )
         if self.retrieval_backend == "opensearch":
             if self.mode != "exploratory_rag":
                 raise ValueError("OpenSearch retrieval requires exploratory_rag mode")
             if self.opensearch_base_sha256 is None:
                 raise ValueError("OpenSearch retrieval requires a frozen base SHA-256")
             if self.opensearch_source_skill_sha256 is None:
-                raise ValueError("OpenSearch retrieval requires a pinned source Skill hash")
+                raise ValueError(
+                    "OpenSearch retrieval requires a pinned source Skill hash"
+                )
             source_model = self.opensearch_source_model or DEFAULT_LLM_MODEL
             current_model = self.opensearch_current_model or DEFAULT_LLM_MODEL
-            if current_model != DEFAULT_LLM_MODEL:
-                raise ValueError(
-                    "pinned current model does not match the API inference model"
-                )
-            if (
-                source_model != DEFAULT_LLM_MODEL
-                and not self.allow_legacy_model_mismatch
-            ):
-                raise ValueError(
-                    "legacy model compatibility requires explicit OpenSearch RAG opt-in"
-                )
+            if self.retriever_version in {
+                OPENSEARCH_RETRIEVER_V3,
+                OPENSEARCH_RETRIEVER_V4,
+                OPENSEARCH_RETRIEVER_V5,
+                OPENSEARCH_RETRIEVER_V6,
+            }:
+                if source_model != QWEN35_MODEL_ID or current_model != QWEN35_MODEL_ID:
+                    raise ValueError(
+                        "Qwen 3.5 B corpus requires Qwen 3.5 as its pinned source and current model"
+                    )
+                if (
+                    self.retriever_version == OPENSEARCH_RETRIEVER_V3
+                    and self.include_unvalidated_experimental
+                ):
+                    raise ValueError(
+                        "Qwen 3.5 B corpus never retrieves unvalidated guides"
+                    )
+                if (
+                    self.retriever_version
+                    in {
+                        OPENSEARCH_RETRIEVER_V4,
+                        OPENSEARCH_RETRIEVER_V5,
+                        OPENSEARCH_RETRIEVER_V6,
+                    }
+                    and self.include_unvalidated_experimental
+                ):
+                    raise ValueError(
+                        "procedural B retrieval does not use the legacy experimental inclusion flag"
+                    )
+            else:
+                if current_model != DEFAULT_LLM_MODEL:
+                    raise ValueError(
+                        "pinned current model does not match the API inference model"
+                    )
+                if (
+                    source_model != DEFAULT_LLM_MODEL
+                    and not self.allow_legacy_model_mismatch
+                ):
+                    raise ValueError(
+                        "legacy model compatibility requires explicit OpenSearch RAG opt-in"
+                    )
             if self.retriever_version not in {
                 OPENSEARCH_RETRIEVER_V1,
                 OPENSEARCH_RETRIEVER_VERSION,
+                OPENSEARCH_RETRIEVER_V3,
+                OPENSEARCH_RETRIEVER_V4,
+                OPENSEARCH_RETRIEVER_V5,
+                OPENSEARCH_RETRIEVER_V6,
             }:
-                raise ValueError("OpenSearch retrieval version does not match its backend")
+                raise ValueError(
+                    "OpenSearch retrieval version does not match its backend"
+                )
         elif self.retriever_version != EXPLORATORY_RETRIEVER_VERSION:
             raise ValueError("local retrieval version does not match its backend")
         if self.allow_legacy_skill_hash and self.retrieval_backend != "opensearch":
             raise ValueError(
                 "legacy Skill compatibility is allowed only for pinned OpenSearch RAG"
             )
-        if (
-            self.allow_legacy_model_mismatch
-            and self.retrieval_backend != "opensearch"
-        ):
+        if self.allow_legacy_model_mismatch and self.retrieval_backend != "opensearch":
             raise ValueError(
                 "legacy model compatibility is allowed only for pinned OpenSearch RAG"
             )
-        if (
-            self.allow_legacy_model_mismatch
-            and self.opensearch_source_model is None
-        ):
-            raise ValueError("legacy model compatibility requires a pinned source model")
+        if self.allow_legacy_model_mismatch and self.opensearch_source_model is None:
+            raise ValueError(
+                "legacy model compatibility requires a pinned source model"
+            )
         return self
 
 
@@ -214,6 +309,8 @@ class IncidentA(IncidentNarrative):
     text_version: Literal["incident-a-v1", "incident-a-v2"] = LEGACY_A_TEXT_VERSION
     metric_facts: list[MetricFact] = Field(default_factory=list, max_length=128)
     fact_limitations: list[str] = Field(default_factory=list)
+    metric_narrative_version: Literal["facts-v1"] | None = None
+    _legacy_retrieval_text: str | None = PrivateAttr(default=None)
 
     def retrieval_text(self, *, version: str | None = None) -> str:
         # Hypotheses, labels, run IDs and evaluator metadata never enter the index.
@@ -227,6 +324,8 @@ class IncidentA(IncidentNarrative):
         )
         selected_version = version or self.text_version
         if selected_version == LEGACY_A_TEXT_VERSION:
+            if self._legacy_retrieval_text is not None:
+                return self._legacy_retrieval_text
             return "\n".join(
                 item.description
                 for group in (
@@ -368,7 +467,8 @@ def extract_metric_facts(
                     "ou janelas insuficientes para vinculo numerico"
                 )
                 continue
-            for index, row in enumerate(metric.get("top_delta") or []):
+            row_key = "top_delta" if metric.get("top_delta") else "top"
+            for index, row in enumerate(metric.get(row_key) or []):
                 if not isinstance(row, dict):
                     raise ValueError(
                         f"{identifier}/{metric_name}: malformed metric row"
@@ -378,7 +478,11 @@ def extract_metric_facts(
                         f"{identifier}/{metric_name}: servico fora do catalogo conhecido"
                     )
                     continue
-                values = [row.get("baseline"), row.get("fault")]
+                values = (
+                    [row.get("baseline"), row.get("fault")]
+                    if row_key == "top_delta"
+                    else [row.get("baseline_mean"), row.get("fault_mean")]
+                )
                 if any(
                     type(value) not in {int, float} or not math.isfinite(value)
                     for value in values
@@ -391,13 +495,13 @@ def extract_metric_facts(
                     MetricFact(
                         evidence_id=identifier,
                         source=item["source"],
-                        source_path=f"/digest/metrics/{escaped_metric}/top_delta/{index}",
+                        source_path=f"/digest/metrics/{escaped_metric}/{row_key}/{index}",
                         service=row["service"],
                         metric=metric_name,
                         unit=metric["unit"],
-                        baseline_value=float(row["baseline"]),
-                        fault_value=float(row["fault"]),
-                        delta=round(float(row["fault"]) - float(row["baseline"]), 10),
+                        baseline_value=float(values[0]),
+                        fault_value=float(values[1]),
+                        delta=round(float(values[1]) - float(values[0]), 10),
                         baseline_window=MetricWindow(
                             start=arguments["baseline_start"],
                             end=arguments["baseline_end"],
@@ -420,7 +524,7 @@ def extract_metric_facts(
                         ),
                     )
                 )
-            if not metric.get("top_delta"):
+            if not metric.get(row_key):
                 limitations.append(
                     f"{identifier}/{metric_name}: sem medias por servico"
                 )
@@ -432,14 +536,50 @@ def enrich_incident_a(
 ) -> IncidentA:
     validate_a(document, evidence, known)
     facts, limitations = extract_metric_facts(evidence, known)
-    return IncidentA.model_validate(
+    enriched = IncidentA.model_validate(
         {
             **document.model_dump(),
             "text_version": A_TEXT_VERSION,
             "metric_facts": [fact.model_dump() for fact in facts],
             "fact_limitations": limitations,
+            "metric_changes": [
+                observation.model_dump()
+                for observation in factual_metric_observations(facts)
+            ],
+            "metric_narrative_version": "facts-v1",
         }
     )
+    enriched._legacy_retrieval_text = document.retrieval_text(version=LEGACY_A_TEXT_VERSION)
+    return enriched
+
+
+def factual_metric_observations(facts: list[MetricFact]) -> list[Observation]:
+    groups: dict[str, list[MetricFact]] = {}
+    for fact in facts:
+        groups.setdefault(fact.metric, []).append(fact)
+    for group in groups.values():
+        group.sort(key=lambda fact: (-abs(fact.delta), fact.service))
+    selected = []
+    while any(groups.values()) and len(selected) < 12:
+        for group in groups.values():
+            if group and len(selected) < 12:
+                selected.append(group.pop(0))
+    return [
+        Observation(
+            description=(
+                f"Servico={fact.service}; metrica={fact.metric}; "
+                f"unidade={fact.unit}; estatistica={fact.statistic}; "
+                f"baseline={fact.baseline_value:g}; fault={fact.fault_value:g}; "
+                f"delta={fact.delta:g}; "
+                f"direcao={'aumento' if fact.delta > 0 else 'queda' if fact.delta < 0 else 'estavel'}; "
+                f"baseline_window={fact.baseline_window.start}/{fact.baseline_window.end}; "
+                f"fault_window={fact.fault_window.start}/{fact.fault_window.end}; "
+                f"source_path={fact.source_path}"
+            ),
+            evidence_ids=[fact.evidence_id],
+        )
+        for fact in selected
+    ]
 
 
 def base_a_text_version(base: dict[str, Any]) -> str:
@@ -590,6 +730,24 @@ def write_once(path: Path, value: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def procedural_metric_step_matches_target(
+    metric_step: dict[str, Any] | None,
+    fault_type: str,
+    service: str,
+) -> bool:
+    if metric_step is None or metric_step.get("service") != service:
+        return False
+    expected_families = (
+        {"metrics", "lifecycle"} if fault_type == "container-kill" else {"metrics"}
+    )
+    return (
+        metric_step.get("kind") == "observed"
+        and metric_step.get("family") in expected_families
+        and metric_step.get("phase") == "fault"
+        and bool(metric_step.get("evidence_ids"))
+    )
+
+
 class KnowledgeStore:
     def __init__(self, root: Path, corpus_id: str):
         if not re.fullmatch(IDENTIFIER, corpus_id):
@@ -697,18 +855,32 @@ class KnowledgeStore:
         if expected_skill_sha256 is None:
             expected_skill_sha256 = current_skill_hash
         current_model = DEFAULT_LLM_MODEL
+        rebuilt_qwen35 = base.get("b_rebuild_version") in {
+            TRAINING_B_SCHEMA_VERSION,
+            TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
+        }
+        procedural_qwen35 = (
+            base.get("b_rebuild_version")
+            == TRAINING_B_PROCEDURAL_SCHEMA_VERSION
+        )
         if expected_model is None:
-            expected_model = current_model
+            expected_model = QWEN35_MODEL_ID if rebuilt_qwen35 else current_model
         if not re.fullmatch(r"[a-f0-9]{64}", expected_skill_sha256):
             raise ValueError("invalid expected source Skill SHA-256")
         if not isinstance(expected_model, str) or not expected_model:
             raise ValueError("invalid expected source model")
-        if expected_model != current_model and not allow_legacy_model_mismatch:
+        if (
+            expected_model != current_model
+            and not allow_legacy_model_mismatch
+            and not rebuilt_qwen35
+        ):
             raise ValueError(
                 "exploratory base model differs from the current inference model"
             )
         if base.get("model") != expected_model:
             raise ValueError("exploratory base source model mismatch")
+        if rebuilt_qwen35 and expected_model != QWEN35_MODEL_ID:
+            raise ValueError("rebuilt B corpus must pin the Qwen 3.5 model")
         if (
             base["sha256"] != digest(payload)
             or base["version"] != VERSION
@@ -728,15 +900,244 @@ class KnowledgeStore:
             raise ValueError("malformed exploratory base")
         for pair in base["pairs"]:
             diagnosis = Diagnosis.model_validate(pair["b"]["diagnosis"])
-            labels = pair.get("labels") or {}
+            labels = pair.get("labels")
+            review_status = pair.get("review_status")
+            blind_live_reviewed = review_status == BLIND_LIVE_REVIEW_STATUS
+            if procedural_qwen35:
+                rebuilt_status = pair.get("guide_status")
+                procedural_status = pair.get("b_procedural_status")
+                gate_reasons = pair.get("b_rebuild_gate_reasons")
+                history = pair.get("retrieval_history")
+                review = pair.get("b", {}).get("procedural_review")
+                metric_step_id = pair.get("b", {}).get(
+                    "metric_confirmation_step_id"
+                )
+                if (
+                    not isinstance(labels, dict)
+                    or not isinstance(gate_reasons, list)
+                    or any(
+                        not isinstance(labels.get(field), str)
+                        or not labels[field].strip()
+                        for field in ("service", "fault_type", "causal_category")
+                    )
+                ):
+                    raise ValueError(
+                        "Qwen 3.5 procedural B corpus has malformed target metadata"
+                    )
+                evidence_ids = {
+                    item.get("id")
+                    for item in pair.get("b_collection_evidence", [])
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                }
+                evidence_ids.update(
+                    item.get("evidence_id")
+                    for item in pair.get("b_evidence_index", [])
+                    if isinstance(item, dict)
+                    and isinstance(item.get("evidence_id"), str)
+                )
+                references = set(diagnosis.supporting_evidence)
+                references.update(diagnosis.contradicting_evidence)
+                steps = pair["b"].get("investigation_steps", [])
+                references.update(
+                    evidence_id
+                    for step in steps
+                    for evidence_id in step.get("evidence_ids", [])
+                )
+                metric_step = next(
+                    (
+                        step for step in steps
+                        if step.get("step_id") == metric_step_id
+                    ),
+                    None,
+                )
+                review_passed = (
+                    isinstance(review, dict)
+                    and review.get("result") == "pass"
+                    and review.get("target_matches") is True
+                    and review.get("path_reaches_target") is True
+                    and review.get("metric_confirmation") is True
+                    and review.get("alternatives_explained") is True
+                    and not review.get("unsupported_claims")
+                    and not review.get("unsupported_evidence_references")
+                    and not review.get("scope_violations")
+                )
+                valid_rebuild = (
+                    pair.get("b_rebuild_version")
+                    == TRAINING_B_PROCEDURAL_SCHEMA_VERSION
+                    and pair.get("b", {}).get("rebuild_version")
+                    == TRAINING_B_PROCEDURAL_SCHEMA_VERSION
+                    and pair.get("causal_status") == "not_assessed"
+                    and procedural_status in {"passed", "pending"}
+                    and rebuilt_status in {
+                        "procedurally_validated", "procedural_pending"
+                    }
+                    and (procedural_status == "passed")
+                    == (rebuilt_status == "procedurally_validated")
+                    and isinstance(pair.get("b_evidence_index"), list)
+                    and isinstance(history, dict)
+                    and history.get("historical_status") == rebuilt_status
+                    and history.get("procedural_status") == procedural_status
+                    and not (references - evidence_ids)
+                    and re.fullmatch(
+                        r"[a-f0-9]{64}",
+                        str(pair.get("review_manifest_sha256") or ""),
+                    )
+                )
+                if procedural_status == "passed":
+                    valid_rebuild = valid_rebuild and (
+                        diagnosis.status == "confirmed"
+                        and diagnosis.primary_service == labels.get("service")
+                        and diagnosis.fault_type == labels.get("fault_type")
+                        and diagnosis.category == labels.get("causal_category")
+                        and not gate_reasons
+                        and review_passed
+                        and procedural_metric_step_matches_target(
+                            metric_step,
+                            labels.get("fault_type", ""),
+                            labels.get("service", ""),
+                        )
+                        and history.get("validated_outcome", {}).get("service")
+                        == labels.get("service")
+                        and history.get("validated_outcome", {}).get("fault_type")
+                        == labels.get("fault_type")
+                    )
+                else:
+                    valid_rebuild = valid_rebuild and (
+                        diagnosis.status == "inconclusive"
+                        and bool(gate_reasons)
+                        and "validated_outcome" not in history
+                    )
+                if (
+                    not valid_rebuild
+                    or not blind_live_reviewed
+                    or pair.get("source_run_id") not in base["training_run_ids"]
+                    or pair.get("pair_id") not in base["index"]
+                    or pair.get("skill_hash") != base["skill_sha256"]
+                    or not isinstance(pair.get("effect_validated"), bool)
+                    or pair.get("sha256")
+                    != digest(
+                        {key: value for key, value in pair.items() if key != "sha256"}
+                    )
+                ):
+                    raise ValueError(
+                        "Qwen 3.5 procedural B corpus contains an invalid guide"
+                    )
+                continue
+            if rebuilt_qwen35:
+                rebuilt_status = pair.get("guide_status")
+                gate_reasons = pair.get("b_rebuild_gate_reasons")
+                if not isinstance(labels, dict) or not isinstance(gate_reasons, list):
+                    raise ValueError("Qwen 3.5 B corpus has malformed private validation data")
+                if any(
+                    not isinstance(labels.get(field), str) or not labels[field].strip()
+                    for field in ("service", "fault_type", "causal_category")
+                ):
+                    raise ValueError("Qwen 3.5 B corpus has malformed target labels")
+                evidence_ids = {
+                    item.get("id")
+                    for item in pair.get("evidence", [])
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                }
+                evidence_ids.update(
+                    item.get("evidence_id")
+                    for item in pair.get("b_evidence_index", [])
+                    if isinstance(item, dict)
+                    and isinstance(item.get("evidence_id"), str)
+                )
+                references = set(diagnosis.supporting_evidence)
+                references.update(diagnosis.contradicting_evidence)
+                references.update(
+                    evidence_id
+                    for step in pair["b"].get("investigation_steps", [])
+                    for evidence_id in step.get("evidence_ids", [])
+                )
+                history = pair.get("retrieval_history")
+                valid_rebuild = (
+                    pair.get("b_rebuild_version") == TRAINING_B_SCHEMA_VERSION
+                    and rebuilt_status
+                    in {
+                        "validated_success",
+                        "insufficient_evidence",
+                        "effect_unvalidated",
+                    }
+                    and pair.get("causal_status")
+                    == (
+                        "supported"
+                        if rebuilt_status == "validated_success"
+                        else "inconclusive"
+                    )
+                    and pair.get("b", {}).get("rebuild_version")
+                    == TRAINING_B_SCHEMA_VERSION
+                    and (
+                        not gate_reasons
+                        if rebuilt_status == "validated_success"
+                        else bool(gate_reasons)
+                    )
+                    and isinstance(pair.get("b_evidence_index"), list)
+                    and isinstance(history, dict)
+                    and history.get("historical_status") == rebuilt_status
+                    and not (references - evidence_ids)
+                    and isinstance(pair.get("b", {}).get("factual_review"), dict)
+                    and isinstance(pair.get("b", {}).get("blind_replay"), dict)
+                    and re.fullmatch(
+                        r"[a-f0-9]{64}",
+                        str(pair.get("review_manifest_sha256") or ""),
+                    )
+                )
+                if rebuilt_status == "validated_success":
+                    valid_rebuild = valid_rebuild and (
+                        pair.get("effect_validated") is True
+                        and diagnosis.status == "confirmed"
+                        and diagnosis.primary_service == labels.get("service")
+                        and diagnosis.fault_type == labels.get("fault_type")
+                        and diagnosis.category == labels.get("causal_category")
+                        and not pair.get("b_rebuild_gate_reasons")
+                        and pair["b"].get("factual_review", {}).get("result") == "pass"
+                        and pair["b"].get("factual_review", {}).get("target_matches")
+                        is True
+                        and pair["b"].get("blind_replay", {}).get("status")
+                        == "confirmed"
+                        and pair["b"].get("blind_replay", {}).get("primary_service")
+                        == labels.get("service")
+                        and pair["b"].get("blind_replay", {}).get("fault_type")
+                        == labels.get("fault_type")
+                        and pair["b"].get("blind_replay", {}).get("category")
+                        == labels.get("causal_category")
+                    )
+                else:
+                    valid_rebuild = valid_rebuild and (
+                        diagnosis.status == "inconclusive"
+                        and bool(pair.get("b_rebuild_gate_reasons"))
+                        and "validated_outcome" not in history
+                        and (
+                            pair.get("effect_validated") is False
+                            if rebuilt_status == "effect_unvalidated"
+                            else pair.get("effect_validated") is True
+                        )
+                    )
+                if (
+                    not valid_rebuild
+                    or not blind_live_reviewed
+                    or pair.get("source_run_id") not in base["training_run_ids"]
+                    or pair.get("pair_id") not in base["index"]
+                    or pair.get("skill_hash") != base["skill_sha256"]
+                    or pair.get("sha256")
+                    != digest(
+                        {key: value for key, value in pair.items() if key != "sha256"}
+                    )
+                ):
+                    raise ValueError("Qwen 3.5 B corpus contains an invalid rebuilt guide")
+                continue
             if (
                 pair.get("guide_status") != "pending"
                 or pair.get("causal_status") != "inconclusive"
-                or pair.get("review_status")
+                or review_status
                 not in {
                     "assistant_reviewed_boundary_only",
                     "assistant_label_consistency_audited",
+                    BLIND_LIVE_REVIEW_STATUS,
                 }
+                or not isinstance(labels, dict)
                 or not isinstance(pair.get("effect_validated"), bool)
                 or pair.get("source_run_id") not in base["training_run_ids"]
                 or pair.get("pair_id") not in base["index"]
@@ -746,9 +1147,28 @@ class KnowledgeStore:
                     {key: value for key, value in pair.items() if key != "sha256"}
                 )
                 or diagnosis.status != "inconclusive"
-                or diagnosis.primary_service != labels.get("service")
-                or diagnosis.fault_type != labels.get("fault_type")
-                or diagnosis.category != labels.get("causal_category")
+                or (
+                    blind_live_reviewed
+                    and (
+                        not re.fullmatch(
+                            r"[a-f0-9]{64}",
+                            str(pair.get("review_manifest_sha256") or ""),
+                        )
+                        or any(
+                            not isinstance(labels.get(field), str)
+                            or not labels[field].strip()
+                            for field in ("service", "fault_type", "causal_category")
+                        )
+                    )
+                )
+                or (
+                    not blind_live_reviewed
+                    and (
+                        diagnosis.primary_service != labels.get("service")
+                        or diagnosis.fault_type != labels.get("fault_type")
+                        or diagnosis.category != labels.get("causal_category")
+                    )
+                )
             ):
                 raise ValueError(
                     "exploratory base contains a promoted or unindexed pair"
@@ -1015,6 +1435,32 @@ def compact_exploratory_history(
     pair: dict[str, Any], *, include_executed_checks: bool = False
 ) -> dict[str, Any]:
     """Expose only tentative observations and checks, never historical labels."""
+    if pair.get("b_rebuild_version") in {
+        TRAINING_B_SCHEMA_VERSION,
+        TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
+    }:
+        history = pair.get("retrieval_history")
+        if not isinstance(history, dict):
+            raise ValueError("rebuilt historical guidance is missing its projection")
+        if history.get("pair_id") != pair.get("pair_id"):
+            raise ValueError("rebuilt historical guidance has a mismatched pair ID")
+        if history.get("historical_status") != pair.get("guide_status"):
+            raise ValueError("rebuilt historical guidance status differs from its pair")
+        if (
+            pair.get("b_rebuild_version")
+            == TRAINING_B_PROCEDURAL_SCHEMA_VERSION
+            and (
+                history.get("procedural_status")
+                != pair.get("b_procedural_status")
+                or pair.get("causal_status") != "not_assessed"
+            )
+        ):
+            raise ValueError("procedural guidance status differs from its pair")
+        if {"labels", "diagnosis", "source_run_id"} & set(history):
+            raise ValueError("rebuilt historical guidance contains private labels")
+        if len(canonical(history)) > TRAINING_HISTORY_DOCUMENT_CHAR_LIMIT:
+            raise ValueError("rebuilt historical guidance exceeds its character limit")
+        return history
     observations = []
     for field in (
         "service_relations",
@@ -1140,7 +1586,32 @@ def compact_exploratory_history(
     return compacted
 
 
-def exploratory_guidance_notice(include_unvalidated: bool) -> str:
+def exploratory_guidance_notice(
+    include_unvalidated: bool,
+    *,
+    procedural_guidance: bool = False,
+    include_unvalidated_procedural: bool = False,
+) -> str:
+    if procedural_guidance:
+        notice = (
+            "Os guias recuperados sao procedimentos de incidentes historicos, "
+            "nao respostas para o incidente atual. Compare os sintomas atuais de A "
+            "com cada guia; use ate tres como hipoteses alternativas, reexecute as "
+            "consultas nas metricas atuais e explique por que manteve ou descartou "
+            "cada caminho. Use a metrica discriminante no servico candidato. "
+            "Resultados, IDs, timestamps e rótulos historicos nao sao evidencia "
+            "do incidente atual. Se nenhum guia se ajustar, continue a investigacao "
+            "sem forcar uma das opcoes. A validacao do procedimento e a validacao "
+            "do efeito experimental sao estados separados."
+        )
+        if include_unvalidated_procedural:
+            return (
+                notice
+                + " Alguns guias podem estar com status procedural_pending; eles "
+                "nao passaram pela validacao procedural e devem ser tratados "
+                "somente como hipoteses exploratorias."
+            )
+        return notice
     notice = (
         "Trilha exploratoria: exemplos historicos sao hipotese, nao evidencia "
         "atual nem causa confirmada. Nao copie diagnosticos ou rotulos historicos; "
@@ -1216,6 +1687,10 @@ def validate_a(
         facts, limitations = extract_metric_facts(evidence, known)
         if document.metric_facts != facts or document.fact_limitations != limitations:
             raise ValueError("A metric facts differ from their source evidence")
+        if document.metric_narrative_version == "facts-v1" and (
+            document.metric_changes != factual_metric_observations(facts)
+        ):
+            raise ValueError("A metric narrative differs from its structured facts")
 
 
 def constrain_fault_type_schema(
@@ -1325,6 +1800,9 @@ class ModelSession:
     def __init__(self, llm: Callable[..., dict[str, Any]], options: KnowledgeOptions):
         self.llm = llm
         self.options = options
+        self.model = (
+            options.opensearch_current_model or options.model or DEFAULT_LLM_MODEL
+        )
         self.started = time.monotonic()
         self.attempts: list[dict[str, Any]] = []
         self.tokens = 0
@@ -1355,6 +1833,11 @@ class ModelSession:
         attempt: dict[str, Any] = {"status": "started", "stage": stage}
         self.attempts.append(attempt)
         try:
+            kwargs.setdefault("model", self.model)
+            if self.options.temperature is not None:
+                kwargs.setdefault("temperature", self.options.temperature)
+            if self.options.seed is not None:
+                kwargs.setdefault("seed", self.options.seed)
             response = self.llm(messages, tools, **kwargs)
         except TOOL_ERRORS as exc:
             attempt.update(status="error", error=str(exc))
@@ -1468,7 +1951,7 @@ def prepare_check(
     if check.kind == "logs":
         name = "loki_range_query"
         arguments = {
-            "query": f'{{namespace="{namespace}",container="{check.service}",'
+            "query": f'{{namespace="{namespace}",container=~"{check.service}|istio-proxy",'
             f'pod=~"^{check.service}(-[a-z0-9]+)*$"}}',
             "start": window["start"],
             "end": window["end"],
@@ -1526,13 +2009,7 @@ def prepare_check(
                 "}[1m]))"
             )
         elif check.kind == "http":
-            query = (
-                "sum by(source_workload,destination_workload,response_code,reporter)"
-                "(rate(istio_requests_total{"
-                f"destination_workload_namespace={namespace_selector},"
-                f'destination_workload={workload_selector},reporter="destination"'
-                "}[1m]))"
-            )
+            query = http_status_query(namespace, check.service)
         else:
             selector = (
                 f"destination_workload_namespace={namespace_selector},"
@@ -1672,7 +2149,8 @@ def execute_check(
         }
         purpose, unit = purposes[check.kind]
         result = phase_series_summary(
-            raw, windows, purpose=purpose, unit=unit, service=check.service
+            raw, windows, purpose=purpose, unit=unit, service=check.service,
+            namespace=namespace,
         )
     else:
         result = raw
@@ -1822,6 +2300,7 @@ def investigate(
                 namespace=namespace,
                 window_metadata=window_metadata,
                 possible_fault_types=options.possible_fault_types,
+                require_best_guess=options.require_best_guess,
                 evidence_source=evidence_source,
                 llm=session.invoke,
             )
@@ -1894,6 +2373,7 @@ def investigate(
             additional_checks=[],
         )
         opensearch_metadata = None
+        opensearch_search_metadata = None
         if (
             base
             and options.mode == "exploratory_rag"
@@ -1928,14 +2408,27 @@ def investigate(
                 )
                 retrieved = index.search(
                     query_text,
-                    get_embedding_provider().embed(query_text),
+                    (
+                        None
+                        if options.retriever_version
+                        in {OPENSEARCH_RETRIEVER_V5, OPENSEARCH_RETRIEVER_V6}
+                        else get_embedding_provider().embed(query_text)
+                    ),
                     source_run_id=run_id,
                     top_k=options.top_k,
                     include_unvalidated_experimental=(
                         options.include_unvalidated_experimental
                     ),
+                    include_unvalidated_procedural_experimental=(
+                        options.include_unvalidated_procedural_experimental
+                    ),
                     min_score=options.min_score,
+                    query_fields=a.retrieval_fields(),
+                    query_incident=a,
+                    corpus_pairs=base["pairs"],
                 )
+                if options.retriever_version == OPENSEARCH_RETRIEVER_V6:
+                    opensearch_search_metadata = index.search_metadata
             except OpenSearchError as exc:
                 raise ValueError(f"OpenSearch retrieval failed: {exc}") from exc
         else:
@@ -1954,10 +2447,19 @@ def investigate(
                 if base and options.mode in {"rag", "exploratory_rag"}
                 else []
             )
+        procedural_corpus = bool(
+            base
+            and base.get("b_rebuild_version")
+            == TRAINING_B_PROCEDURAL_SCHEMA_VERSION
+        )
         validated_history_candidates = (
-            sum(bool(pair["effect_validated"]) for pair in base["pairs"])
-            if exploratory and base
-            else 0
+            sum(pair.get("b_procedural_status") == "passed" for pair in base["pairs"])
+            if procedural_corpus
+            else (
+                sum(bool(pair["effect_validated"]) for pair in base["pairs"])
+                if exploratory and base
+                else 0
+            )
         )
         unvalidated_history_candidates = (
             len(base["pairs"]) - validated_history_candidates
@@ -1966,7 +2468,10 @@ def investigate(
         )
         history_candidates = validated_history_candidates + (
             unvalidated_history_candidates
-            if options.include_unvalidated_experimental
+            if (
+                options.include_unvalidated_experimental
+                or options.include_unvalidated_procedural_experimental
+            )
             else 0
         )
         history_for_model = (
@@ -2000,7 +2505,13 @@ def investigate(
                 "top_k": options.top_k,
                 "min_score": options.min_score,
                 "min_score_semantics": (
-                    "normalized reciprocal-rank-fusion floor"
+                    "normalized gated RRF floor when active; normalized BM25 floor otherwise"
+                    if options.retriever_version == OPENSEARCH_RETRIEVER_V6
+                    and opensearch_metadata
+                    else "normalized BM25 maximum-score floor"
+                    if options.retriever_version == OPENSEARCH_RETRIEVER_V5
+                    and opensearch_metadata
+                    else "normalized reciprocal-rank-fusion floor"
                     if opensearch_metadata
                     else "dense cosine floor; lexical matches also qualify"
                     if exploratory
@@ -2020,6 +2531,11 @@ def investigate(
                     else EXPLORATORY_RETRIEVER_VERSION if exploratory else VERSION
                 ),
                 "index": opensearch_metadata,
+                **(
+                    {"strategy_details": opensearch_search_metadata}
+                    if opensearch_search_metadata is not None
+                    else {}
+                ),
                 "local_corpus_sha256": base["sha256"] if base else None,
                 "skill_compatibility": {
                     "source_skill_sha256": source_skill_sha256,
@@ -2029,9 +2545,14 @@ def investigate(
                 },
                 "model_compatibility": {
                     "source_model": base["model"] if base else DEFAULT_LLM_MODEL,
-                    "current_model": DEFAULT_LLM_MODEL,
+                    "current_model": (
+                        options.opensearch_current_model or DEFAULT_LLM_MODEL
+                    ),
                     "models_match": (
-                        base["model"] == DEFAULT_LLM_MODEL if base else True
+                        base["model"]
+                        == (options.opensearch_current_model or DEFAULT_LLM_MODEL)
+                        if base
+                        else True
                     ),
                     "legacy_model_mismatch_allowed": (
                         options.allow_legacy_model_mismatch
@@ -2119,9 +2640,20 @@ def investigate(
                 "Escolha executable_checks; GC/threads nao sao medidos por cpu/memory. "
                 "Se houve rejeicao, escolha uma alternativa viavel ou pare.",
             }
+            if procedural_corpus:
+                context["instruction"] += (
+                    " Trate os ate tres guias B recuperados como caminhos candidatos: "
+                    "compare-os com A atual, consulte metricas atuais para discriminar "
+                    "as hipoteses e explique por que manter ou descartar cada caminho. "
+                    "Nao force uma opcao se nenhuma se ajustar."
+                )
             if exploratory:
                 context["historical_guidance_notice"] = exploratory_guidance_notice(
-                    options.include_unvalidated_experimental
+                    options.include_unvalidated_experimental,
+                    procedural_guidance=procedural_corpus,
+                    include_unvalidated_procedural=(
+                        options.include_unvalidated_procedural_experimental
+                    ),
                 )
             if labels:
                 context["training_annotation_labels"] = labels
@@ -2257,9 +2789,19 @@ def investigate(
                 else ""
             ),
         }
+        if procedural_corpus:
+            final_context["instruction"] += (
+                " Os guias B recuperados sao opcoes de investigacao, nao respostas: "
+                "explique quais consultas atuais sustentam ou descartam cada caminho, "
+                "com foco nas metricas discriminantes do servico candidato."
+            )
         if exploratory:
             final_context["historical_guidance_notice"] = exploratory_guidance_notice(
-                options.include_unvalidated_experimental
+                options.include_unvalidated_experimental,
+                procedural_guidance=procedural_corpus,
+                include_unvalidated_procedural=(
+                    options.include_unvalidated_procedural_experimental
+                ),
             )
 
         def validate_generated_fault_type(value: dict[str, Any]) -> None:

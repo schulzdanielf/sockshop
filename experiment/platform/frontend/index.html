@@ -140,8 +140,18 @@
               <option value="">Carregando corpora…</option>
             </select>
           </label>
-          <label>Filtrar pares
-            <input id="knowledgePairFilter" type="search" autocomplete="off" placeholder="Run de origem, par ou serviço" disabled />
+          <label>Pesquisar pares
+            <input id="knowledgePairFilter" type="search" autocomplete="off" placeholder="Run de origem, par, serviço ou falha" disabled />
+          </label>
+          <label>Serviço
+            <select id="knowledgeServiceFilter" disabled>
+              <option value="">Todos os serviços</option>
+            </select>
+          </label>
+          <label>Falha
+            <select id="knowledgeFaultFilter" disabled>
+              <option value="">Todas as falhas</option>
+            </select>
           </label>
           <label>Par A/B
             <select id="knowledgePairSelect" disabled>

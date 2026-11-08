@@ -82,6 +82,150 @@ def test_single_load_rehearsal_never_injects_and_always_cleans_up(monkeypatch, t
         assert report["passed"] is False
 
 
+def test_late_recovery_check_rejects_ineligible_source_before_load(tmp_path):
+    source_report = tmp_path / "source-report.json"
+    effective_spec = tmp_path / "effective-spec.json"
+    source_report.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    effective_spec.write_text(json.dumps({
+        "controlled_campaign": {"fault": "container-kill", "service": "orders"},
+    }), encoding="utf-8")
+    output = tmp_path / "late-recovery"
+
+    with pytest.raises(ValueError, match="not eligible"):
+        load_check.run_late_operational_recovery_check(
+            "run-source",
+            source_report,
+            effective_spec,
+            output,
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("attempt_number", "latency_override"),
+    [(3, None), (4, 370.0)],
+)
+def test_late_recovery_check_starts_exact_container_cgroup_sampler_before_load(
+    monkeypatch, tmp_path, attempt_number, latency_override,
+):
+    source_target = {
+        "pod": "orders-123",
+        "uid": "pod-uid",
+        "container": "orders",
+        "container_id": "container-old",
+        "restart_count": 0,
+    }
+    source_event = {
+        "restart_observed": True,
+        "container_id_after_restart": "container-new",
+        "restart_count_after_signal": 1,
+        "target": {
+            "pod_uid": "pod-uid",
+            "container_id": "container-old",
+            "restart_count": 0,
+        },
+    }
+    source_report = tmp_path / "source-report.json"
+    source_report.write_text(json.dumps({
+        "status": "aborted",
+        "fault": "container-kill",
+        "service": "orders",
+        "target_before": source_target,
+        "container_kill_event": source_event,
+        "gates": {
+            "recovery": {"passed": False},
+            "operational_recovery": {
+                "passed": False,
+                "target": {"container_id": "container-new", "restart_count": 1},
+            },
+            "mechanism_observed": {"passed": True},
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+        "observations": [{
+            "phase": "baseline",
+            "summary": {
+                key: {"status": "ok"}
+                for key in ("traffic", "cpu_cores", "memory_bytes", "errors_percent", "latency_ms")
+            },
+        }],
+    }), encoding="utf-8")
+    effective_spec = tmp_path / "effective-spec.json"
+    effective_spec.write_text(json.dumps({
+        "controlled_campaign": {
+            "fault": "container-kill",
+            "service": "orders",
+            "resilience": {"operational_timeout_seconds": 600, "stable_seconds": 120},
+        },
+        "load_profile": {
+            "command": "kubectl exec deploy/locust-web -- locust",
+            "locust_file": "/mnt/locust/locustfile.py",
+            "host": "http://front-end",
+            "users": 30,
+            "spawn_rate": 5,
+        },
+        "observability": {"metrics": {}},
+    }), encoding="utf-8")
+
+    events = []
+    engine = Mock()
+    engine._runtime_handles = {}
+    engine._stop_flags = {}
+    engine.load.start_load.side_effect = lambda *args: (
+        events.append("load") or {"controlled_remote": True}
+    )
+    engine.load.stop_load.return_value = {"stopped": True}
+    engine.load.collect_summary.return_value = {}
+    run = Mock()
+    run.target = {}
+    run.baseline = {}
+    run.report = {"gates": {"late_operational_recovery": {"passed": True}}}
+    run.application_container_status.return_value = {
+        "container_id": "container-new",
+        "restart_count": 1,
+        "ready": True,
+        "running": True,
+    }
+    run.health.return_value = {"healthy": True}
+    run.start_cgroup_sampling.side_effect = lambda: events.append("cgroup")
+    run.operational_recovery.return_value = True
+    monkeypatch.setattr(load_check, "OrchestratorEngine", Mock(return_value=engine))
+    monkeypatch.setattr(load_check, "SqliteStorage", Mock())
+    monkeypatch.setattr(load_check, "ControlledRun", Mock(return_value=run))
+
+    report = load_check.run_late_operational_recovery_check(
+        "run-source",
+        source_report,
+        effective_spec,
+        tmp_path / "late-recovery",
+        attempt_number=attempt_number,
+        latency_p95_limit_override_ms=latency_override,
+    )
+
+    assert events == ["cgroup", "load"]
+    run.start_cgroup_sampling.assert_called_once()
+    assert report["late_recovery_policy"]["attempt"] == attempt_number
+    assert report["late_recovery_policy"]["resource_measurement_source"] == "cgroup-v2"
+    assert report["late_recovery_policy"]["resource_sampling_started_before_load"] is True
+    assert report["late_recovery_policy"]["latency_p95_limit_override_ms"] == latency_override
+    if latency_override is None:
+        run.operational_recovery.assert_called_once_with(
+            gate_name="late_operational_recovery", timeout_seconds=600,
+        )
+    else:
+        assert report["late_recovery_policy"]["amendment_version"] == (
+            "controlled-late-operational-recovery-check-v3"
+        )
+        run.operational_recovery.assert_called_once_with(
+            gate_name="late_operational_recovery",
+            timeout_seconds=600,
+            latency_p95_limit_override_ms=370.0,
+        )
+    assert report["passed"] is True
+    engine.chaos.inject.assert_not_called()
+
+
 @pytest.mark.parametrize("args", [
     ["--load-check", "--run"], ["--load-check", "--preflight"],
     ["--load-check", "--resume", "campaign"],

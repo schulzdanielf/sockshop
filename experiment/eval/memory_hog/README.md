@@ -1,5 +1,85 @@
 # Memory-hog evaluation harness
 
+## Quantitative retrieval for new procedural evaluations
+
+New test-base evaluations compare the original Skill with RAG using the Qwen 3.5
+procedural corpus and select `opensearch-bm25-metric-gated-rrf-v6`. Both
+diagnostic methods use the same model, temperature `0.1` and seed `20261107`.
+The retriever uses the same
+`incident-a-v2` records and schema-4 OpenSearch index as v4/v5: **no A/B rewrite
+or reindex is required**. Previously prepared configurations remain pinned.
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --prepare --api-base http://127.0.0.1:8010
+```
+
+Preparation does not run inference or inject chaos. Use
+`--retriever-version opensearch-bm25-field-idf-v5` or
+`--retriever-version opensearch-hybrid-rrf-v4` for an explicit older comparison.
+Before executing a new RCA evaluation, complete fresh historical MCP collection
+with `--precollect <evaluation-directory>`; `--run <evaluation-directory>`
+retains the existing online collection gates. Do not reuse old diagnostic
+responses as a new evaluation.
+
+New test-base evaluations pin model generation to temperature `0.1` and seed
+`20261107`. Both values are saved in the evaluation config/report and sent with
+each model call. This improves repeatability for identical prompts, model and
+runtime; it does not guarantee byte-identical output across different runtimes,
+hardware, or changing online evidence.
+
+V6 compares positive metric deltas by service/metric/unit/statistic, with
+corpus-only median scales, threshold 10, numeric weight 0.75 and RRF constant 10.
+Below the threshold it preserves BM25 v5. Scores are normalized to [0, 1]:
+RRF divided by its theoretical maximum when active, BM25 divided by the largest
+BM25 score otherwise. New v6 evaluation configurations use `min_score=0`, matching
+the exploratory benchmark; API callers may explicitly choose another floor.
+The response records route activation, strength, parameter values and both
+ranking components under retrieval diagnostics.
+
+Both routes apply the procedural eligibility gate and source-run exclusion
+before fusion. Pending guides remain limited to explicit external experimental
+evaluation; they are not promoted. No test label, B diagnosis or extra checks
+enter the numeric features. This is an **experimental evaluation default**,
+not evidence of independent generalization or a change to local/legacy corpora.
+Restart an already-running API after updating the backend; its
+`/api/skill-rag/strategy` capability advertises v6 and the recommended evaluation
+floor.
+
+## Experimental quantitative retrieval benchmark
+
+`metric_profile_benchmark` compares BM25 v5 with corpus-normalized metric
+profiles and gated reciprocal-rank fusion. It reads frozen training/test A
+records and queries an **existing** OpenSearch v5-compatible index; it does not
+create an index, change eligibility, inject chaos or run a new RCA.
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.metric_profile_benchmark \
+  --evaluation experiment/eval/memory_hog/out/knowledge_evaluation/test-base-v4-20261106T222721823606Z \
+  --output experiment/eval/memory_hog/out/knowledge_evaluation/test-base-v4-20261106T222721823606Z/metric_profile_retrieval_benchmark.json
+```
+
+The runner validates the frozen corpus checksum, excludes the query source run
+and rejects overlapping training/test metric windows. Scales use only corpus A.
+It freezes rankings before consulting exact service/fault relevance labels,
+filters both ranking routes before fusion for the eligible pool, and reports
+coverage separately from Hit@k, per-service/per-fault scores, gains/losses,
+metric-channel ablations and implementation/query hashes. It also runs the
+integrated v6 retriever and fails explicitly if any complete ranking differs
+from the selected experimental reference, before applying relevance labels.
+
+The selected experimental route (`metric-profile-gated-rrf-v1`) activates when
+the largest positive delta is at least 10 corpus median absolute deltas,
+uses positive-delta cosine rankings, and fuses 75% numeric / 25% BM25 with
+RRF constant 10. Otherwise it retains BM25. These are exploratory, post-hoc
+parameters, not a validated production default. Missing facts are zero-filled
+only for similarity; partial coverage is not treated as evidence of absence.
+Results use full rankings and `min_score=0`; context packing and RCA accuracy
+are outside this benchmark. A **new RCA evaluation** still requires fresh
+historical MCP collection.
+
+See [quantitative retrieval results and limitations](../../../research/diario/2026-11-07-relatorio-melhoria-recuperacao-rag.md#segunda-revisao-recuperacao-quantitativa-condicionada).
+
 ## Online Skill RCA RAG A/B: 70 runs, 35 train / 35 test
 
 This is a new controlled profile, separate from the retrospective knowledge
@@ -59,6 +139,10 @@ limitations; dense retrieval and RRF remain in place. Its history projection
 also carries bounded results for executed historical checks, linked to evidence
 IDs and explicitly marked as historical, never evidence for the current run.
 This does not reconstruct missing telemetry or modify an existing corpus/index.
+For v2 callers that provide structured A fields, lexical matching queries each
+field family separately with at most 24 terms per field. This bounds Boolean
+clauses while retaining lexical coverage across A; dense retrieval still uses
+the full retrieval text.
 
 Build the v2 index explicitly from the installed frozen base before preparing
 an OpenSearch test campaign:
@@ -71,6 +155,180 @@ python -m experiment.eval.memory_hog.opensearch_experiments \
 The command verifies the base checksum, creates a separate v2 index, and prints
 the index metadata. Reuse the base's SHA-256 for test-only preparation; the v1
 index remains untouched.
+
+### Rebuild procedural training B with Qwen 3.5
+
+The reconstruction preserves the frozen v2 training cohort as the source of A,
+target labels and run windows. Protocol `training-b-rebuild-v4` gives Qwen 3.5
+the target service and fault type from the beginning, then requires it to build
+an evidence-supported investigation from A to that target. The procedure must
+consult available MCP metrics for the labeled service, explain why dependent
+services or similar fault types are not the origin, and distinguish observed
+facts from unavailable data. This is supervised guide authoring, not a held-out
+accuracy estimate.
+
+#### Factual A and RAG-assisted correction
+
+With `--audit-rag-base`, A is rebuilt from a **new online MCP collection**, not
+from a previous diagnosis. Its metric narrative is a deterministic projection
+of service, metric, unit, baseline/fault means, direction and source pointer.
+Historical MCP `top` means and platform `top_delta` means are both supported.
+Marked factual narratives reject edits that change those observations; old
+unmarked corpora remain readable. Other free-text claims still require review.
+CPU/memory checks additionally compare baseline/fault/post for both resources.
+
+The optional auditor retrieves up to three eligible procedures using retriever
+v6 from a frozen, training-only reference. It excludes the same run and repeated
+incident descriptions and never learns from guides approved during that build.
+Historical procedures are hypotheses, never current evidence. Private training
+labels remain outside the auditor prompt; supervised authoring and the final
+factual review still check the expected destination.
+
+The auditor can approve, correct, request new executable MCP checks, or leave
+the case pending. Up to two correction rounds are followed by fresh factual
+reviews and a final audit. Approval cannot bypass deterministic gates: the
+target metric, factual review, causal chain, independent evidence families and
+any required supported restart reason must pass. Metrics derived from spans
+alone do not independently corroborate traces. Missing data, contradictions,
+exhausted budgets and tool/contract errors do not promote a guide.
+
+Limits per audited case:
+
+- Coverage: nine fresh queries (Prometheus, Loki and Tempo in each of
+  baseline/fault/post); then two triage queries.
+- Investigation: three model planning rounds, at most four MCP checks each.
+  Forced target checks add at most six queries for CPU/memory or three for
+  other faults, skipping checks already executed.
+- Audit: at most three decisions, two corrections and two follow-up reviews;
+  at most four new MCP checks per correction round (eight total). This cycle
+  has a hard ceiling of **21 model attempts**, including JSON retries, and
+  **450,000 estimated reserved tokens** (input characters/4, rounded up, plus
+  maximum output for every attempted call). Budget exhaustion is an error,
+  not another retry or an approval.
+- Maximum logical MCP queries: 37 for CPU/memory, 34 for other faults.
+  Each query has at most two transport attempts. Initial planner, author and
+  review have up to three JSON attempts each, outside the additional audit
+  budget. Model evidence is projected under 72,000 characters; up to 24,000
+  characters of historical guidance are supplied. Omission counts and full
+  raw responses are persisted.
+
+Use distinct output/corpus directories; the reference corpus cannot be
+overwritten. A five-case pilot never freezes or indexes a corpus:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.training_b_rebuild \
+  --pilot-five \
+  --audit-rag-base experiment/platform/data/object_store/.rca_knowledge/rag-rebuild-qwen35-procedural-metrics-20261106/exploratory_base.json \
+  --output-dir experiment/eval/memory_hog/out/knowledge_rebuild/<new-campaign> \
+  --corpus-dir experiment/platform/data/object_store/.rca_knowledge/<new-corpus>
+```
+
+To investigate only the 13 pending guides of that reference, replace
+`--pilot-five` with `--pending-only` (optionally `--limit 1`). This writes a
+`pending_reaudit.json` report and per-case artifacts but **does not publish a
+partial corpus** or count the remaining 19 guides as newly collected. A full
+32-case build uses the same paths and audit reference after a
+provenance-matched, reviewed pilot; renewing A recomputes its retrieval vectors.
+
+To measure benefit, compare factual-A-only and factual-A-plus-auditor training
+on the same cohort. For the control, add `--factual-a-only` to the same
+reference/selection command and use separate output/corpus directories.
+It retains fresh factual A, resource comparisons and causal gates, but disables
+the RAG auditor; its provenance cannot be reused as an audited pilot.
+Then evaluate the resulting frozen corpora on the held-out
+test base with fresh online MCP evidence and equal Skill/RAG budgets. Report
+eligibility by service/fault, retrieval Hit@3, joint diagnosis accuracy and
+joint accuracy conditional on Hit@3. A training pilot is not evidence of
+improved held-out accuracy; new independent runs are required where the
+existing windows cannot discriminate the annotated fault.
+
+The current frozen source contains 32 pairs and all have `split=train`; there
+are no `split=test` pairs in that source. Start with one deterministically
+selected case for each fault type. This five-case pilot is for human review and
+does not create or publish an OpenSearch index:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.training_b_rebuild --pilot-five
+```
+
+The historical MCP must already be reachable at `HISTORICAL_MCP_SSE_URL`
+(default `http://127.0.0.1:18082/sse`), or at the explicit
+`--historical-mcp-url` loopback endpoint. The command never restores port-forwards,
+restarts workloads or injects faults. An unreachable backend stops the build;
+it is not converted into `no_data` or a diagnosis. Historical queries are
+read-only, and persist their arguments, responses, timestamps and SHA-256
+references. Invalid summaries, including non-finite Prometheus samples, remain
+explicitly marked as unusable evidence rather than aborting the whole case or
+being converted to `no_data`.
+
+The guide procedure records ordered observed steps, executed tool/evidence IDs,
+hypotheses, verification and interpretation. To keep retrieval history bounded,
+the guide projection does not duplicate query arguments; complete arguments,
+responses, timestamps and digests remain in the per-case investigation
+artifacts. The host derives step links from the ordered list. A procedural
+review checks that the route reaches the labeled service and fault, includes a
+metric confirmation in the target service, and explains plausible
+dependent-service or similar-fault alternatives. The final diagnosis fields
+are constrained to the supervised labels, which remain separate from
+telemetry; the guide must not disclose or cite those private labels as a reason.
+Every evidence ID used in the diagnosis,
+hypotheses or alternatives must also appear in an observed step, including the
+initial golden-signal evidence used to describe A. The target metric is queried
+in both baseline and fault windows so the guide can compare the change. For each
+alternative service discussed, at least one relevant available fault-window
+check must be observed; a range query covering multiple windows is classified
+from its returned phase summaries in both evidence projection and validation,
+so its fault data is not mislabeled as baseline data. Redundant checks need not
+all be repeated. Unlinked
+secondary citations are removed only when observed support remains, and the
+removal is recorded in the model-attempt artifact. A confirmed diagnosis cannot
+lose its last support reference. A missing or
+nondiscriminating target metric is recorded as a limitation and cannot count as
+successful confirmation. CPU and memory comparisons use actual numeric
+baseline/fault samples even when a query's `found` flag is false, but never
+promote `no_data` to evidence. For `container-kill`,
+the target service's restart row is used when available; an interval that only
+overlaps the fault window retains timing uncertainty, and an unknown termination
+reason is not replaced with an invented mechanism.
+
+Per-case outputs are partitioned by producer SHA-256 so changed code cannot
+reuse older results or overwrite earlier attempts. By default, the full cohort
+requires a successful pilot with one procedurally validated case per fault type
+and matching source/model/endpoint provenance. After explicitly reviewing an
+incomplete pilot, an operator may continue with
+`--continue-after-incomplete-pilot`; the exact five-case cohort and provenance
+are still checked, and pending or failed guides remain ineligible. Review pilot
+examples before starting the full run; the full run creates a new frozen corpus
+and, only when explicitly requested with `--index`, publishes eligible
+procedures to a new v4 index. Procedural eligibility is independent of
+`effect_validated`: that field is retained as provenance but is not a v4
+publication filter. Only pairs with
+`guide_status=procedurally_validated` and `b_procedural_status=passed` are
+retrieved. If a full-run case fails to produce a guide, the pipeline records
+`full_rebuild_incomplete.json` and does not freeze a corpus or publish an index.
+
+The new corpus ID is `rag-rebuild-qwen35-procedural-20261106`. To prepare a test-only
+campaign from this base, use its SHA-256 printed by the rebuild report:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.exploratory_rag_campaign \
+  --prepare-test-only \
+  --source-campaign experiment/eval/memory_hog/out/exploratory_campaigns/<source-campaign> \
+  --reuse-corpus-id rag-rebuild-qwen35-procedural-20261106 \
+  --opensearch-base-sha256 <base-sha256> \
+  --full-test-only
+```
+
+The prepared configuration pins retriever v4 and Qwen 3.5; it does not start
+test runs. V4 retrieves only procedures that passed the procedural review.
+Keep the prior v1/v2/v3 corpora and indexes available for comparison.
+
+For corpora adjudicated from independent blind reviews and a fresh live MCP
+collection, pairs use `review_status=blind_live_review_adjudicated` and pin the
+review-manifest SHA-256. Their ground-truth labels remain separate from the
+historical model diagnosis; label agreement is not required for this status.
+The history projection still omits both labels and diagnosis, and keeps every
+guide inconclusive.
 
 Frozen bases declare `a_text_version`; bases without it retain the byte-identical
 v1 search representation. Queries use the base's version, and mixed-version
@@ -197,6 +455,43 @@ for retrieval as weak analogies, pass
 not validate those effects or guarantee a pair appears in the top-k results;
 the option and unvalidated-pair count are recorded in the new manifest. It does
 not change standard RAG eligibility or archived campaign results.
+
+#### RAG-only evaluation on the held-out test base
+
+To evaluate the v6 retriever on the existing completed test runs without
+injecting new faults, prepare and run the evaluator:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --prepare-and-run \
+  --api-base http://127.0.0.1:8010 \
+  --mcp-sse-url http://127.0.0.1:18082/sse
+```
+
+It first queries Prometheus, Loki, and Tempo online through the historical MCP
+for baseline, fault, and post windows of all 32 cases. Loki and Tempo queries
+are namespace-wide and do not filter on the injected service or fault labels.
+Inference is blocked until all 288 precollection queries finish without
+backend errors; `no_data` remains visible as a coverage limitation. The run
+executes only `exploratory_rag` with the v6 retriever, persisting its response
+before reading test labels for scoring. It reports retrieval and diagnosis
+separately, with breakdowns by service and fault, per-run results, MCP coverage,
+mean request/diagnostic time, token use, and budgets. Historical results for the
+original Skill, exploratory control, and v4 RAG are shown only as non-paired
+comparators; they are not rerun in this evaluation.
+
+The test cohort was used in earlier evaluations, so this remains an exploratory,
+non-blind assessment. The full index contains 32 cards, but retrieval receives
+only the 19 procedurally validated guides by default; the 13
+`procedural_pending` guides are excluded. The report distinguishes all 32
+queries from those with an exact eligible pair, which bounds possible Hit@3.
+The Markdown report is written under `research/diario/` using the evaluation ID
+in its filename; `--report-output <path>` can override the destination.
+For a staged run, use `--prepare`, `--precollect <evaluation-dir>`, then
+`--run <evaluation-dir>`. The prepared directory is under
+`out/knowledge_evaluation/`. External use of the corpus is restricted to
+completed runs pinned to the test split, and the API rejects any run ID found
+in the frozen corpus training set.
 
 Deploy the history-only MCP service and keep its port-forward on loopback:
 
@@ -439,6 +734,73 @@ model or Skill hash invalidates compatibility with a frozen base. The legacy
 run-summary index is not used. Retrieval settings and investigation limits
 are pinned in `knowledge_campaign` in the saved configuration. CLI overrides
 apply only when creating a campaign, never during resume.
+
+### Train-only 35-cell campaign
+
+The `train-only` profile collects the seven-service by five-fault training
+matrix without starting RAG inference or a test split. Advance only to an
+explicit tranche boundary:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.controlled_campaign \
+  --level train-only --through-train-count 35 --preflight
+./.venv/bin/python -m experiment.eval.memory_hog.controlled_campaign \
+  --level train-only --through-train-count 35 --run
+```
+
+Its freshness gate queries the historical Prometheus MCP for the current pod.
+The infrastructure preflight does not prove that this historical series is
+fresh. Ensure campaign dual-write is active; if the first cell is blocked before
+submission because no recent sample is visible, enable dual-write, verify the
+current pod's sample through the historical datasource, and retry only after
+confirming cleanup and no active Locust load. Preserve the original ledger row:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.controlled_campaign \
+  --resume experiment/eval/memory_hog/out/controlled_campaign/<campaign-id> \
+  --run --retry-blocked <cell-id> --through-train-count 35
+```
+
+The retry guard must pass without weakening it; submitted or intervened
+attempts are not eligible for `--retry-blocked`.
+
+The continuation amendment for campaign
+`controlled-20261103T234452388707Z` permits continuing after a completed,
+measured technical gate failure only when recovery, cleanup, stopped load, and
+complete historical read-back all pass. Such cells remain failed and are
+excluded from training. Blocked, aborted, failed, or stopped runs, missing
+measurements, invalid historical telemetry, or any recovery/cleanup failure
+remain fail-stop conditions, except for one pre-registered retry of a clean,
+unsubmitted pre-intervention block when cleanup and stopped-load gates pass.
+A user-approved amendment now permits skipping that cell after the retry limit
+only when the block remains unsubmitted, cleanup and load-stop pass, the
+application is healthy, and a fresh environment preflight passes. The cell
+remains blocked and ineligible for training; all other hard stops remain. The
+original campaign configuration and run reports are not rewritten. Future CPU cells use the reviewed candidate profile
+with an inclusive 80% quota floor:
+
+The approved late recovery check for `orders-container-kill-r0` measures CPU
+and memory from the exact application container's cgroup-v2 counters, matching
+the original baseline source. A versioned, user-authorized amendment permits
+one final passive attempt with a 370 ms latency P95 ceiling for this check only;
+the prior ceiling was approximately 366 ms. The 600 s timeout, 120 s continuous
+stability requirement, load, baseline, and all other thresholds remain fixed.
+The run stays aborted and excluded from training; only a passing recovery and
+cleanup check can authorize skipping it and continuing. No fault is reinjected.
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.controlled_campaign \
+  --resume experiment/eval/memory_hog/out/controlled_campaign/controlled-20261103T234452388707Z \
+  --run --through-train-count 35 --continue-after-technical-failure \
+  --continue-after-safe-blocked-cell \
+  --calibration experiment/eval/memory_hog/cpu-calibration.yaml
+```
+
+The explicit continuation mode is restricted to a full train-only resume and
+records its authorization and each excluded cell append-only in
+`campaign_events.jsonl`. Progress distinguishes collection completion from
+all-gates-passed status, reports each exclusion reason, and keeps safe blocked
+cells separate from measured technical failures.
 
 Resume without duplicating injections or successful diagnostic attempts:
 
@@ -841,10 +1203,11 @@ Servicos permitidos: `front-end`, `catalogue`, `carts`, `orders`, `payment`,
 #### Resiliencia sem relaxar os gates (protocolo 4)
 
 Novas campanhas persistem `controlled_campaign.resilience` na configuracao:
-recuperacao operacional passiva por ate 600s, estabilidade por 120s, limite de
-duas recuperacoes consecutivas ou cinco no total e tres retries de consulta
-para erros transitorios (conexao, timeout e HTTP 502/503/504). Os retries usam
-o mesmo run, com backoff de 5/10/20s; nao repetem submissao nem injecao.
+duas janelas passivas de recuperacao operacional, cada uma limitada a 600s,
+estabilidade por 120s, limite de duas recuperacoes consecutivas ou cinco no
+total e tres retries de consulta para erros transitorios (conexao, timeout e
+HTTP 502/503/504). Os retries usam o mesmo run, com backoff de 5/10/20s; nao
+repetem submissao nem injecao.
 Uma falha `blocked` antes da submissao pode receber uma unica nova tentativa,
 somente se a limpeza e a parada da carga estiverem confirmadas. A politica
 `pre_intervention_retry` e gravada na configuracao antes da campanha; a nova
@@ -855,13 +1218,34 @@ retry automatico; campanhas antigas nao ganham essa autorizacao ao serem
 retomadas.
 
 Ao expirar a recuperacao experimental, o run permanece `aborted` e
-`recovery.passed=false`. A plataforma pode observar recuperacao operacional
-adicional **sob a mesma carga e usando a mesma baseline e os mesmos limites**.
-A contagem de estabilidade reinicia quando um check falha ou o intervalo entre
-checks excede 60s. Nao ha restart automatico de workloads, troca de intensidade,
-remocao de gates nem extensao ilimitada. Os dados operacionais ficam nos
-artefatos de checks e no gate `operational_recovery`; a janela experimental
-parcial termina em `experimental_recovery_expired`, sem incluir a espera extra.
+`recovery.passed=false`. A plataforma tenta recuperacao operacional passiva
+**sob a mesma carga e usando a mesma baseline e os mesmos limites** por ate
+600s. Se essa janela falhar, tenta uma segunda janela passiva, tambem limitada
+a 600s, antes de interromper. A contagem de estabilidade reinicia quando um
+check falha ou o intervalo entre checks excede 60s. Nao ha restart automatico
+de workloads, troca de intensidade, remocao de gates nem espera ilimitada.
+Os dados ficam em `operational_recovery` e `late_operational_recovery`; mesmo
+se a segunda janela passar, o run original permanece `aborted`, inelegivel e
+fora do treino. A campanha pode apenas pular essa celula apos limpeza e parada
+da carga comprovadas, e iniciar a proxima com warmup e baseline novos. A janela
+experimental termina em `experimental_recovery_expired`, sem incluir as esperas
+operacionais. O timeout do orquestrador e o prazo da carga incluem as duas
+janelas.
+
+A emenda `passive-recovery-extension-amendment.yaml` ativa a segunda janela
+somente para novas submissões da campanha `controlled-20261103T234452388707Z`;
+o config original e os runs já registrados não são reescritos. A emenda não
+reclassifica o aborto existente nem o libera sem evidência própria de
+recuperação tardia.
+
+A validação tardia de `run-503646080ca5` é autorizada separadamente por
+`late-operational-recovery-check-amendment.yaml` e só pode ser executada para
+essa célula abortada. Ela usa a carga normal, a baseline e os thresholds
+originais, sem injeção ou restart; o resultado é salvo em
+`late_recoveries/<run_id>/report.json` e anexado ao ledger sem alterar o status
+`aborted`. A campanha só pode pular essa célula se a estabilidade passar e a
+carga da validação for comprovadamente parada. Um artefato incompleto ou uma
+falha de limpeza mantém o hard stop e não inicia outro experimento.
 
 A campanha so avanca de um aborto por timeout de recuperacao se a intervencao,
 o mecanismo, a recuperacao operacional, a limpeza e a parada da carga forem
@@ -959,11 +1343,27 @@ contadores ou cobertura suficientes faltarem, a combinacao bloqueia.
 - CPU: o codigo revisado do Litmus 3.28.0 passa `CPU_CORES`/`CPU_LOAD` para
   `stress-ng --cpu N --cpu-load P`. P e duty cycle por worker, nao percentual
   da quota do container. Exige configuracao explicita por servico e mede a
-  fracao do limite real de CPU no container-alvo. O valor `target_quota_fraction`
-  e validado como atingido por pelo menos 60 s, admitindo a tolerancia
-  configurada. Baseline ja >=70% bloqueia e pede recalibracao. Consumo/quota
-  e throttling sao registrados separadamente; throttling/5xx nao sao
-  obrigatorios.
+  fracao do limite real de CPU no container-alvo. Perfis legados podem usar
+  `target_quota_fraction` com `target_tolerance_fraction`; nesse modo, tanto a
+  media quanto a serie sustentada precisam ficar na faixa configurada.
+  `minimum_quota_fraction` define um piso inclusivo para a media aritmetica da
+  janela `fault`, sem limite superior nem requisito de duracao sustentada; a
+  serie acima do piso fica como diagnostico. Os dois modos sao mutuamente
+  exclusivos. A emenda pos-hoc `cpu-mean80-amendment.yaml` documenta a aplicacao
+  do piso de 80% nesta campanha e preserva os gates restantes. Baseline ja
+  >=70% bloqueia e pede recalibracao. Consumo/quota e throttling sao registrados
+  separadamente; throttling/5xx nao sao obrigatorios.
+  Runs CPU concluidos podem ser reavaliados, sem reinjecao ou edicao do ledger,
+  com:
+
+  ```bash
+  ./.venv/bin/python -m experiment.eval.memory_hog.revalidate_cpu_mean80 \
+    --campaign-dir experiment/eval/memory_hog/out/controlled_campaign/<campaign-id>
+  ```
+
+  O resultado append-only fica em `cpu_mean80_revalidation.jsonl`; execucoes
+  em andamento nao sao alteradas: a ferramenta recusa executar enquanto o
+  supervisor mantiver o lock da campanha.
 - Memoria: `max(0, .80*limite - p95_cgroup_memory.current_baseline - .05*limite)`,
   arredondado para baixo em MiB, um worker, minimo inicial de 16 MiB.
   O sufixo `M` do parser stress-ng corresponde a 2^20 bytes; um worker evita
@@ -1244,10 +1644,11 @@ policy:
   minimum_cpu_delta_cores: 0.05
 payment:
   cpu:
-    cores: 1
-    load: 20
-    target_quota_fraction: 0.80
-    evidence: "" # vazio bloqueia; preencher com referencia da calibracao real
+    cores: 2
+    load: 100
+    minimum_quota_fraction: 0.80
+    calibration_status: candidate
+    rationale: "Piso candidato; validar a media da janela fault por servico."
 shipping:
   interface: eth0
   latency_ms: 200
@@ -1310,6 +1711,15 @@ gate da nova tentativa. As tentativas anteriores ficam preservadas, cada
 nova tentativa tem artefatos e evento de auditoria proprios, e `runs.csv`
 mostra a tentativa mais recente por celula. Outros abortos continuam exigindo
 investigacao manual.
+
+No modo train-only com `--continue-after-technical-failure`, um run `aborted`
+por recuperacao experimental tardia pode liberar a proxima celula sem
+intervencao somente se `operational_recovery.passed` satisfizer a politica
+persistida, incluindo 120 s estaveis, e os gates de intervencao, limpeza,
+parada da carga, telemetria e read-back historico forem aprovados. O run
+permanece `aborted` e inelegivel para treino. Recuperacao operacional reprovada,
+como estabilidade abaixo do limite, continua sendo hard stop; nao ha retry de
+injecao.
 
 O plano/configuracao sao persistidos antes de iniciar. A ordem e
 pseudoaleatoria com seed e evita o mesmo servico consecutivo quando possivel.

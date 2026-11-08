@@ -48,6 +48,149 @@ def test_prometheus_matrix_samples_are_canonicalized():
     assert _sample_digest(samples) == _sample_digest(list(reversed(samples)))
 
 
+def test_raw_prometheus_migration_preserves_scrape_timestamps():
+    from unittest.mock import Mock
+
+    client = Mock()
+    response = client.request.return_value
+    response.json.return_value = {
+        "status": "success", "data": {"resultType": "matrix", "result": [{
+            "metric": {"__name__": "http_server_duration_milliseconds_count",
+                       "job": "sock-shop/front-end"},
+            "values": [[100.125, "2"], [115.125, "3"]],
+        }]},
+    }
+    payload = history._prom_range(
+        client, "http://prometheus",
+        datetime.fromtimestamp(100, timezone.utc),
+        datetime.fromtimestamp(120, timezone.utc), "sock-shop",
+    )
+    calls = client.request.call_args_list
+    assert all(call.args[1].endswith("/api/v1/query") for call in calls)
+    assert any('job=~"sock\\\\-shop/' in call.kwargs["params"]["query"] for call in calls)
+    samples, _ = _prom_samples(payload)
+    assert {sample["timestamp_ms"] for sample in samples} == {100125, 115125}
+
+
+def test_metrics_dry_run_preserves_data_and_reports_only_missing_samples():
+    matrix = lambda values: {
+        "status": "success", "data": {"resultType": "matrix", "result": [{
+            "metric": {"__name__": "http_server_duration_milliseconds_count",
+                       "job": "sock-shop/front-end"}, "values": values,
+        }]},
+    }
+    with patch.object(history, "_prom_range", side_effect=[
+        matrix([[100.125, "2"], [115.125, "3"]]), matrix([[100.125, "2"]]),
+    ]), patch.object(history, "_remote_write") as write:
+        result, _ = history.migrate_metrics(
+            None, "http://live", "http://history",
+            datetime.fromtimestamp(100, timezone.utc),
+            datetime.fromtimestamp(120, timezone.utc), "sock-shop", dry_run=True,
+        )
+    assert result["missing_samples"] == 1
+    assert result["matched_source_samples"] == 1
+    assert result["written_samples"] == 0
+    write.assert_not_called()
+
+
+def test_http_raw_scope_filters_namespace_selectors_and_shares_series_labels():
+    from unittest.mock import Mock
+
+    client = Mock()
+    client.request.return_value.json.return_value = {
+        "status": "success", "data": {"resultType": "matrix", "result": [{
+            "metric": {"__name__": "istio_requests_total", "namespace": "sock-shop"},
+            "values": [[100.125, "2"], [115.125, "3"]],
+            "histograms": [[99.99, {}]],
+        }]},
+    }
+    payload = history._prom_range(
+        client, "http://prometheus", datetime.fromtimestamp(100, timezone.utc),
+        datetime.fromtimestamp(120, timezone.utc), "sock-shop", metric_family="http",
+    )
+    assert all("__name__=~" in call.kwargs["params"]["query"]
+               for call in client.request.call_args_list)
+    samples, unsupported = _prom_samples(payload)
+    assert samples[0]["labels"] is samples[1]["labels"]
+    assert unsupported == 0
+
+
+def test_target_warnings_block_writes_and_prevent_complete_dry_run():
+    matrix = {
+        "status": "success", "data": {"resultType": "matrix", "result": [{
+            "metric": {"__name__": "counter", "namespace": "sock-shop"},
+            "values": [[100.125, "2"]],
+        }]},
+    }
+    warned = {**matrix, "warnings": ["partial target data"]}
+    with patch.object(history, "_prom_range", side_effect=[matrix, warned]):
+        result, _ = history.migrate_metrics(
+            None, "http://live", "http://history",
+            datetime.fromtimestamp(100, timezone.utc),
+            datetime.fromtimestamp(120, timezone.utc), "sock-shop", dry_run=True,
+        )
+    assert result["status"] == "partial"
+    assert result["target_notices"] == {"warnings": ["partial target data"]}
+    empty_warned = {"status": "success", "warnings": ["partial target data"],
+                    "data": {"resultType": "matrix", "result": []}}
+    with patch.object(history, "_prom_range", side_effect=[matrix, empty_warned]), \
+         patch.object(history, "_remote_write") as write:
+        try:
+            history.migrate_metrics(
+                None, "http://live", "http://history",
+                datetime.fromtimestamp(100, timezone.utc),
+                datetime.fromtimestamp(120, timezone.utc), "sock-shop",
+            )
+        except ValueError as exc:
+            assert "incomplete raw response" in str(exc)
+        else:
+            raise AssertionError("Partial target responses must block writes")
+    write.assert_not_called()
+
+
+def test_metrics_migration_refuses_conflicting_values_before_writing():
+    matrix = lambda value: {
+        "status": "success", "data": {"resultType": "matrix", "result": [{
+            "metric": {"__name__": "counter", "namespace": "sock-shop"},
+            "values": [[100.125, value]],
+        }]},
+    }
+    with patch.object(history, "_prom_range", side_effect=[matrix("2"), matrix("3")]), \
+         patch.object(history, "_remote_write") as write:
+        try:
+            history.migrate_metrics(
+                None, "http://live", "http://history",
+                datetime.fromtimestamp(100, timezone.utc),
+                datetime.fromtimestamp(120, timezone.utc), "sock-shop",
+            )
+        except ValueError as exc:
+            assert "conflicting samples" in str(exc)
+        else:
+            raise AssertionError("Conflicting existing data must not be overwritten")
+    write.assert_not_called()
+
+
+def test_history_campaign_provenance_does_not_duplicate_existing_scrapes():
+    series = {"metric": {"__name__": "istio_requests_total", "namespace": "sock-shop"},
+              "values": [[100.125, "2"]]}
+    source = {"status": "success", "data": {"resultType": "matrix", "result": [series]}}
+    archived = {**series, "metric": {**series["metric"], "history_campaign": "campaign-1"}}
+    target = {"status": "success", "data": {"resultType": "matrix", "result": [archived]}}
+    with patch.object(history, "_prom_range", side_effect=[source, target]), \
+         patch.object(history, "_remote_write") as write:
+        result, _ = history.migrate_metrics(
+            None, "http://live", "http://history",
+            datetime.fromtimestamp(100, timezone.utc),
+            datetime.fromtimestamp(120, timezone.utc), "sock-shop",
+        )
+    assert result["status"] == "complete"
+    assert result["missing_samples"] == 0
+    assert result["source_sha256"] == result["matched_source_sha256"]
+    assert result["coverage_ignored_target_labels"] == ["history_campaign"]
+    assert archived["metric"]["history_campaign"] == "campaign-1"
+    write.assert_not_called()
+
+
 def test_prometheus_histograms_are_counted_as_unsupported():
     payload = {
         "status": "success",

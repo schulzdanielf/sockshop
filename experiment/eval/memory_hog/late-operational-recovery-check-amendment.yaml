@@ -1,0 +1,18 @@
+version: controlled-late-operational-recovery-check-v2
+campaign_id: controlled-20261103T234452388707Z
+user_authorized: true
+scope: single_aborted_run_only
+target_run:
+  cell_id: orders-container-kill-r0
+  run_id: run-503646080ca5
+timeout_seconds: 600
+stable_seconds: 120
+max_attempts: 3
+retry_after_cgroup_sampling_fix_only: true
+same_load: true
+same_baseline: true
+thresholds_unchanged: true
+fault_injection: false
+automatic_restart: false
+original_run_status_preserved: true
+continue_only_after_recovery_and_cleanup: true

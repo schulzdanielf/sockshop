@@ -126,3 +126,103 @@ def test_grafana_chat_rejects_model_controlled_time_and_unknown_arguments():
             ),
             max_steps=1,
         )
+
+
+def test_telemetry_chat_accepts_schema_declared_arguments_and_hosts_run_scope():
+    client = _FakeGrafanaMCPClient(
+        {
+            "name": "get_cpu_saturation_top",
+            "description": "Get top CPU saturation for a service.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "namespace": {"type": "string"},
+                    "step": {"type": "string"},
+                    "k": {"type": "integer"},
+                    "service": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                    },
+                },
+                "required": ["start", "end"],
+                "additionalProperties": False,
+            },
+        }
+    )
+    llm_calls = []
+
+    def fake_llm(messages, tools, **kwargs):
+        llm_calls.append((messages, tools, kwargs))
+        if kwargs["tool_choice"] == "required":
+            model_tool = tools[0]["function"]
+            assert model_tool["name"] == "get_cpu_saturation_top"
+            assert set(model_tool["parameters"]["properties"]) == {"service"}
+            return _tool_call("get_cpu_saturation_top", {"service": "user"})
+        assert messages[-1]["role"] == "tool"
+        return {"role": "assistant", "content": "CPU consultada para user."}
+
+    answer = agent_console.answer_query_mcp(
+        "Consulte a saturação de CPU do serviço user.",
+        mcp_client=client,
+        start="2026-11-04T10:00:00Z",
+        end="2026-11-04T10:02:00Z",
+        namespace="sock-shop",
+        llm=fake_llm,
+        max_steps=1,
+    )
+
+    assert answer == "CPU consultada para user."
+    assert client.calls[0][0:2] == (
+        "get_cpu_saturation_top",
+        {
+            "service": "user",
+            "start": "2026-11-04T10:00:00Z",
+            "end": "2026-11-04T10:02:00Z",
+            "namespace": "sock-shop",
+            "step": "15s",
+            "k": 100,
+        },
+    )
+
+
+def test_telemetry_chat_rejects_model_override_of_host_managed_scope():
+    client = _FakeGrafanaMCPClient(
+        {
+            "name": "get_cpu_saturation_top",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "namespace": {"type": "string"},
+                    "service": {"type": "string"},
+                },
+                "required": ["start", "end"],
+                "additionalProperties": False,
+            },
+        }
+    )
+
+    def fake_llm(messages, tools, **kwargs):
+        assert messages[-1]["role"] == "user"
+        assert tools[0]["function"]["name"] == "get_cpu_saturation_top"
+        assert kwargs["tool_choice"] == "required"
+        return _tool_call(
+            "get_cpu_saturation_top",
+            {"service": "user", "namespace": "other-namespace"},
+        )
+
+    with pytest.raises(
+        agent_console.LLMClientError,
+        match="invalid arguments for telemetry MCP tool",
+    ):
+        agent_console.answer_query_mcp(
+            "Consulte a saturação de CPU do serviço user.",
+            mcp_client=client,
+            start="2026-11-04T10:00:00Z",
+            end="2026-11-04T10:02:00Z",
+            namespace="sock-shop",
+            llm=fake_llm,
+            max_steps=1,
+        )

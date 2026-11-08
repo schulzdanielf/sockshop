@@ -386,6 +386,8 @@ def call_llm_tool_messages(
     tool_choice: Any = "auto",
     parallel_tool_calls: bool = False,
     max_new_tokens: int = 2048,
+    temperature: Optional[float] = None,
+    seed: Optional[int] = None,
     url: str = DEFAULT_LLM_URL,
     timeout: float = DEFAULT_LLM_TIMEOUT,
     model: str = DEFAULT_LLM_MODEL,
@@ -416,6 +418,10 @@ def call_llm_tool_messages(
         payload["chat_template_kwargs"] = chat_template_kwargs
     if response_format is not None:
         payload["response_format"] = response_format
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if seed is not None:
+        payload["seed"] = seed
     usage_data: Dict[str, Any] = {}
     started = time.perf_counter()
     with get_tracer().start_as_current_span("gen_ai.chat") as span:
@@ -424,6 +430,10 @@ def call_llm_tool_messages(
         span.set_attribute(GenAI.SYSTEM, "qwen" if "qwen" in model.lower() else provider_name)
         span.set_attribute(GenAI.REQUEST_MODEL, model)
         span.set_attribute(GenAI.REQUEST_MAX_TOKENS, int(max_new_tokens))
+        if temperature is not None:
+            span.set_attribute("rca.gen_ai.request.temperature", temperature)
+        if seed is not None:
+            span.set_attribute("rca.gen_ai.request.seed", seed)
         span.set_attribute("rca.gen_ai.request.tools_count", len(tools))
         span.set_attribute("rca.gen_ai.request.tool_choice", str(tool_choice))
         span.set_attribute(

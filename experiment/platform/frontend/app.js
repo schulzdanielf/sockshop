@@ -812,6 +812,44 @@ async function reRun(experimentId) {
 let knowledgeCorpora = [];
 let knowledgePairs = [];
 
+function knowledgeBEligibility(pair) {
+  if (typeof pair.b_eligible !== 'boolean') return 'elegibilidade de B não informada';
+  return pair.b_eligible ? 'B elegível' : 'B não elegível';
+}
+
+function renderKnowledgeLabelFilters() {
+  const serviceFilter = document.getElementById('knowledgeServiceFilter');
+  const faultFilter = document.getElementById('knowledgeFaultFilter');
+  const services = [...new Set(
+    knowledgePairs
+      .map((pair) => pair.labels?.service)
+      .filter((value) => typeof value === 'string' && value.trim())
+  )].sort((a, b) => a.localeCompare(b, 'pt-BR'));
+  const faults = [...new Set(
+    knowledgePairs
+      .map((pair) => pair.labels?.fault_type)
+      .filter((value) => typeof value === 'string' && value.trim())
+  )].sort((a, b) => a.localeCompare(b, 'pt-BR'));
+
+  [
+    [serviceFilter, services, 'Todos os serviços'],
+    [faultFilter, faults, 'Todas as falhas']
+  ].forEach(([select, values, placeholder]) => {
+    select.replaceChildren();
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = placeholder;
+    select.appendChild(option);
+    values.forEach((value) => {
+      const filterOption = document.createElement('option');
+      filterOption.value = value;
+      filterOption.textContent = value;
+      select.appendChild(filterOption);
+    });
+    select.disabled = values.length === 0;
+  });
+}
+
 function renderKnowledgePair() {
   const pairId = document.getElementById('knowledgePairSelect').value;
   const pair = knowledgePairs.find((item) => item.pair_id === pairId);
@@ -829,7 +867,7 @@ function renderKnowledgePair() {
     `Run de origem: ${pair.source_run_id}`,
     `Guia: ${pair.guide_status || 'não informado'}`,
     `Causalidade: ${pair.causal_status || 'não informada'}`,
-    `Efeito experimental validado: ${pair.effect_validated === true ? 'sim' : pair.effect_validated === false ? 'não' : 'não informado'}`,
+    `Elegibilidade para avaliação de B: ${knowledgeBEligibility(pair)}`,
     `Rótulos da avaliação: ${labels}`
   ].join(' · ');
   document.getElementById('knowledgeA').textContent = JSON.stringify(pair.a, null, 2);
@@ -839,6 +877,8 @@ function renderKnowledgePair() {
 function renderKnowledgePairs(preferredPairId = '') {
   const select = document.getElementById('knowledgePairSelect');
   const filter = document.getElementById('knowledgePairFilter').value.trim().toLowerCase();
+  const serviceFilter = document.getElementById('knowledgeServiceFilter').value;
+  const faultFilter = document.getElementById('knowledgeFaultFilter').value;
   const visiblePairs = knowledgePairs.filter((pair) => {
     const searchable = [
       pair.pair_id,
@@ -846,7 +886,9 @@ function renderKnowledgePairs(preferredPairId = '') {
       pair.labels?.service,
       pair.labels?.fault_type
     ].filter(Boolean).join(' ').toLowerCase();
-    return searchable.includes(filter);
+    return searchable.includes(filter)
+      && (!serviceFilter || pair.labels?.service === serviceFilter)
+      && (!faultFilter || pair.labels?.fault_type === faultFilter);
   });
 
   select.replaceChildren();
@@ -859,7 +901,7 @@ function renderKnowledgePairs(preferredPairId = '') {
   visiblePairs.forEach((pair) => {
     const option = document.createElement('option');
     option.value = pair.pair_id;
-    option.textContent = `${pair.source_run_id} · ${pair.effect_validated === true ? 'efeito validado' : 'efeito não validado'}`;
+    option.textContent = `${pair.source_run_id} · ${knowledgeBEligibility(pair)}`;
     select.appendChild(option);
   });
 
@@ -873,19 +915,23 @@ function renderKnowledgePairs(preferredPairId = '') {
 
 async function loadKnowledgePairs(corpusId) {
   knowledgePairs = [];
+  renderKnowledgeLabelFilters();
   renderKnowledgePairs();
   if (!corpusId) return;
 
   const result = await api(`/api/skill-rag/${encodeURIComponent(corpusId)}/pairs`);
   knowledgePairs = result.pairs || [];
-  const effectValidatedCount = knowledgePairs.filter(
-    (pair) => pair.effect_validated === true
-  ).length;
+  renderKnowledgeLabelFilters();
+  const eligibleBCount = knowledgePairs.filter((pair) => pair.b_eligible === true).length;
+  const ineligibleBCount = knowledgePairs.filter((pair) => pair.b_eligible === false).length;
+  const unreportedBCount = knowledgePairs.length - eligibleBCount - ineligibleBCount;
   document.getElementById('knowledgeCorpusMeta').textContent = [
     `Corpus ${result.corpus_id}`,
     `modo ${result.mode}`,
     `${result.pair_count} pares`,
-    `${effectValidatedCount} com efeito validado`,
+    `${eligibleBCount} B elegíveis`,
+    `${ineligibleBCount} B não elegíveis`,
+    `${unreportedBCount} sem elegibilidade informada`,
     `SHA-256 ${result.sha256}`
   ].join(' · ');
   document.getElementById('knowledgePairFilter').disabled = false;
@@ -912,7 +958,16 @@ async function loadKnowledgeCorpora() {
     knowledgeCorpora.forEach((corpus) => {
       const option = document.createElement('option');
       option.value = corpus.corpus_id;
-      option.textContent = `${corpus.corpus_id} · ${corpus.pair_count} pares · ${corpus.mode}`;
+      const evaluationId = corpus.latest_evaluation?.evaluation_id;
+      option.textContent = [
+        evaluationId,
+        corpus.corpus_id,
+        `${corpus.pair_count} pares`,
+        corpus.mode
+      ].filter(Boolean).join(' · ');
+      if (corpus.latest_evaluation?.retriever_version) {
+        option.title = `Recuperador: ${corpus.latest_evaluation.retriever_version}`;
+      }
       corpusSelect.appendChild(option);
     });
 
@@ -927,6 +982,7 @@ async function loadKnowledgeCorpora() {
     document.getElementById('knowledgeCorpusMeta').textContent = '';
     if (!selectedCorpusId) {
       knowledgePairs = [];
+      renderKnowledgeLabelFilters();
       renderKnowledgePairs();
       status.textContent = knowledgeCorpora.length
         ? 'Selecione o corpus do experimento para consultar os pares.'
@@ -951,6 +1007,12 @@ document.getElementById('knowledgeCorpusSelect').addEventListener('change', asyn
   }
 });
 document.getElementById('knowledgePairFilter').addEventListener('input', () => {
+  renderKnowledgePairs(document.getElementById('knowledgePairSelect').value);
+});
+document.getElementById('knowledgeServiceFilter').addEventListener('change', () => {
+  renderKnowledgePairs(document.getElementById('knowledgePairSelect').value);
+});
+document.getElementById('knowledgeFaultFilter').addEventListener('change', () => {
   renderKnowledgePairs(document.getElementById('knowledgePairSelect').value);
 });
 document.getElementById('knowledgePairSelect').addEventListener('change', renderKnowledgePair);

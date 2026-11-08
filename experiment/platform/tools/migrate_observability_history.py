@@ -32,6 +32,10 @@ TEMPO_SEARCH_LIMIT = 5000
 TEMPO_TRACE_WORKERS = 8
 TEMPO_INGEST_BATCH_TRACES = 50
 REMOTE_WRITE_BATCH_SERIES = 100
+HTTP_METRIC_NAMES = (
+    "istio_requests_total|istio_request_duration_milliseconds_.*|"
+    "http_(client|server)_.*|traces_(service_graph|spanmetrics)_.*"
+)
 
 
 def _iso_datetime(value: str) -> datetime:
@@ -83,26 +87,158 @@ def _prom_range(
     start: datetime,
     end: datetime,
     namespace: str,
+    *,
+    metric_family: str = "all",
 ) -> Dict[str, Any]:
+    _namespace_log_query(namespace)
+    if metric_family not in {"all", "http"}:
+        raise ValueError("metric_family must be all or http")
     namespace_value = json.dumps(namespace)
-    query = (
-        f'{{kubernetes_namespace={namespace_value}}} or '
-        f'{{namespace={namespace_value}}}'
+    metric_filter = f"__name__=~{json.dumps(HTTP_METRIC_NAMES)}," if metric_family == "http" else ""
+    selectors = [
+        f"{{{metric_filter}{label}={namespace_value}}}"
+        for label in ("kubernetes_namespace", "namespace", "service_namespace", "k8s_namespace_name")
+    ]
+    selectors.append(
+        '{__name__=~"http_(client|server)_.*",'
+        f"job=~{json.dumps(re.escape(namespace) + '/.+')}}}"
     )
-    payload = _json_request(
-        client,
-        "GET",
-        f"{base_url.rstrip('/')}/api/v1/query_range",
-        params={
-            "query": query,
-            "start": _epoch_seconds(start),
-            "end": _epoch_seconds(end),
-            "step": "15s",
-        },
+    duration_ms = math.ceil((end - start).total_seconds() * 1000) + 1
+    series_by_labels = {}
+    notices: Dict[str, List[str]] = {"warnings": [], "infos": []}
+    for selector in selectors:
+        payload = _json_request(
+            client, "GET", f"{base_url.rstrip('/')}/api/v1/query",
+            params={"query": f"{selector}[{duration_ms}ms]", "time": _epoch_seconds(end)},
+        )
+        if payload.get("status") != "success":
+            raise ValueError(f"Prometheus raw query failed: {payload.get('error', 'unknown error')}")
+        if (payload.get("data") or {}).get("resultType") != "matrix":
+            raise ValueError("Prometheus raw query did not return a matrix")
+        for key in notices:
+            notices[key].extend(payload.get(key) or [])
+        for series in payload["data"].get("result") or []:
+            series = {
+                **series,
+                "values": [
+                    point for point in series.get("values") or []
+                    if _epoch_seconds(start) <= float(point[0]) <= _epoch_seconds(end)
+                ],
+            }
+            if "histograms" in series:
+                series["histograms"] = [
+                    point for point in series["histograms"]
+                    if _epoch_seconds(start) <= float(point[0]) <= _epoch_seconds(end)
+                ]
+            key = tuple(sorted(series["metric"].items()))
+            if key in series_by_labels:
+                if series_by_labels[key] != series:
+                    raise ValueError("Prometheus returned conflicting raw series across selectors")
+                continue
+            series_by_labels[key] = series
+    return {
+        "status": "success",
+        "data": {"resultType": "matrix", "result": list(series_by_labels.values())},
+        **{key: values for key, values in notices.items() if values},
+    }
+
+
+def migrate_metrics(
+    client: httpx.Client,
+    source_url: str,
+    target_url: str,
+    start: datetime,
+    end: datetime,
+    namespace: str,
+    *,
+    dry_run: bool = False,
+    metric_family: str = "all",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    source = _prom_range(client, source_url, start, end, namespace, metric_family=metric_family)
+    source_samples, unsupported = _prom_samples(source)
+    target = _prom_range(client, target_url, start, end, namespace, metric_family=metric_family)
+    target_samples, target_unsupported = _prom_samples(target)
+
+    ignore_target_campaign = not any(
+        "history_campaign" in item["labels"] for item in source_samples
     )
-    if payload.get("status") != "success":
-        raise ValueError(f"Prometheus range query failed: {payload.get('error', 'unknown error')}")
-    return payload
+
+    def sample_key(item: Dict[str, Any], *, target: bool = False) -> tuple:
+        labels = item["labels"]
+        if target and ignore_target_campaign:
+            labels = {key: value for key, value in labels.items() if key != "history_campaign"}
+        return tuple(sorted(labels.items())), item["timestamp_ms"]
+
+    def target_sample_index(samples: List[Dict[str, Any]]) -> Dict[tuple, Dict[str, Any]]:
+        index = {}
+        for item in samples:
+            key = sample_key(item, target=True)
+            previous = index.get(key)
+            if previous is not None and previous["value"].hex() != item["value"].hex():
+                raise ValueError("Refusing metric migration: conflicting target campaign samples")
+            index[key] = item
+        return index
+
+    target_index = target_sample_index(target_samples)
+    conflicts = [
+        item for item in source_samples
+        if sample_key(item) in target_index
+        and item["value"].hex() != target_index[sample_key(item)]["value"].hex()
+    ]
+    if conflicts:
+        raise ValueError(f"Refusing metric migration: {len(conflicts)} conflicting samples")
+    missing = [item for item in source_samples if sample_key(item) not in target_index]
+    written = 0
+    if missing and not dry_run:
+        if (
+            unsupported or target_unsupported
+            or source.get("warnings") or source.get("infos")
+            or target.get("warnings") or target.get("infos")
+        ):
+            raise ValueError("Refusing metric migration from an incomplete raw response")
+        written = _remote_write(client, target_url, missing)
+        target = _prom_range(client, target_url, start, end, namespace, metric_family=metric_family)
+        target_samples, target_unsupported = _prom_samples(target)
+        target_index = target_sample_index(target_samples)
+    covered = [
+        item for item in source_samples
+        if sample_key(item) in target_index
+        and item["value"].hex() == target_index[sample_key(item)]["value"].hex()
+    ]
+    complete = (
+        len(covered) == len(source_samples)
+        and unsupported == target_unsupported == 0
+        and not source.get("warnings") and not source.get("infos")
+        and not target.get("warnings") and not target.get("infos")
+    )
+    return {
+        "status": "missing" if not source_samples and not unsupported else ("complete" if complete else "partial"),
+        "dry_run": dry_run,
+        "metric_family": metric_family,
+        "coverage_ignored_target_labels": ["history_campaign"] if ignore_target_campaign else [],
+        "source_samples": len(source_samples),
+        "target_samples": len(target_samples),
+        "matched_source_samples": len(covered),
+        "missing_samples": len(source_samples) - len(covered),
+        "written_samples": written,
+        "unsupported_histograms": unsupported,
+        "target_unsupported_histograms": target_unsupported,
+        "source_notices": {key: source[key] for key in ("warnings", "infos") if source.get(key)},
+        "target_notices": {key: target[key] for key in ("warnings", "infos") if target.get(key)},
+        "source_sha256": _sample_digest(source_samples),
+        "target_sha256": _sample_digest(target_samples),
+        "matched_source_sha256": _sample_digest(covered),
+        "source_metric_names": sorted({item["labels"]["__name__"] for item in source_samples}),
+        "target_metric_names": sorted({item["labels"]["__name__"] for item in target_samples}),
+        "missing_metric_sample_counts": dict(Counter(
+            item["labels"]["__name__"] for item in source_samples
+            if sample_key(item) not in target_index
+        )),
+        "source_timestamp_bounds_ms": (
+            [min(item["timestamp_ms"] for item in source_samples),
+             max(item["timestamp_ms"] for item in source_samples)] if source_samples else None
+        ),
+    }, source
 
 
 def _namespace_log_query(namespace: str, *, exclude_snapshots: bool = False) -> str:
@@ -125,10 +261,11 @@ def _prom_samples(payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
         if not isinstance(labels, dict) or not labels.get("__name__"):
             unsupported_histograms += len(series.get("values") or [])
             continue
+        canonical_labels = {str(name): str(label) for name, label in labels.items()}
         for timestamp, value in series.get("values") or []:
             samples.append(
                 {
-                    "labels": {str(name): str(label) for name, label in labels.items()},
+                    "labels": canonical_labels,
                     "timestamp_ms": int(round(float(timestamp) * 1000)),
                     "value": float(value),
                 }
@@ -831,55 +968,10 @@ def migrate_run(
     results: Dict[str, Any] = {}
 
     try:
-        source_metrics = _prom_range(
-            client, source_prometheus, start, end, namespace
+        results["metrics"], source_metrics = migrate_metrics(
+            client, source_prometheus, target_prometheus, start, end, namespace
         )
-        source_samples, unsupported_histograms = _prom_samples(source_metrics)
         bundle["source"]["metrics"] = source_metrics
-        target_samples, _ = _prom_samples(
-            _prom_range(client, target_prometheus, start, end, namespace)
-        )
-        source_digest = _sample_digest(source_samples)
-        target_digest = _sample_digest(target_samples)
-        if source_samples and (
-            len(source_samples) != len(target_samples)
-            or source_digest != target_digest
-        ):
-            target_index = {
-                (tuple(sorted(item["labels"].items())), item["timestamp_ms"])
-                for item in target_samples
-            }
-            missing = [
-                item
-                for item in source_samples
-                if (tuple(sorted(item["labels"].items())), item["timestamp_ms"])
-                not in target_index
-            ]
-            if missing:
-                _remote_write(client, target_prometheus, missing)
-                target_samples, _ = _prom_samples(
-                    _prom_range(client, target_prometheus, start, end, namespace)
-                )
-                target_digest = _sample_digest(target_samples)
-        metrics_status = _family_status(
-            len(source_samples),
-            len(target_samples),
-            unsupported_histograms == 0
-            and not source_metrics.get("warnings")
-            and not source_metrics.get("infos"),
-            source_digest,
-            target_digest,
-        )
-        if unsupported_histograms and metrics_status == "complete":
-            metrics_status = "partial"
-        results["metrics"] = {
-            "status": metrics_status,
-            "source_samples": len(source_samples),
-            "target_samples": len(target_samples),
-            "unsupported_histograms": unsupported_histograms,
-            "source_sha256": source_digest,
-            "target_sha256": target_digest,
-        }
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         results["metrics"] = {"status": "partial", "error": _record_error(exc)}
         bundle["source"]["metrics_error"] = _record_error(exc)
@@ -1301,7 +1393,10 @@ def migrate_run(
     return _save_run_archive(object_client, bucket, prefix, bundle, manifest)
 
 
-def run_migration(input_path: Path) -> Dict[str, Any]:
+def run_migration(
+    input_path: Path, *, metrics_only: bool = False, dry_run: bool = False,
+    metric_family: str = "all",
+) -> Dict[str, Any]:
     raw = input_path.read_bytes()
     payload_bytes = gzip.decompress(raw) if input_path.suffix == ".gz" else raw
     payload = json.loads(payload_bytes)
@@ -1311,6 +1406,49 @@ def run_migration(input_path: Path) -> Dict[str, Any]:
     runs = payload.get("runs")
     if not isinstance(runs, list) or not runs:
         raise ValueError("migration input must contain at least one run")
+    if dry_run and not metrics_only:
+        raise ValueError("dry-run is currently supported only with metrics-only")
+    if metrics_only:
+        results = []
+        with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+            for run in runs:
+                if not isinstance(run, dict):
+                    raise ValueError("each migration run entry must be an object")
+                start, end = _window_times(run)
+                try:
+                    metrics, source = migrate_metrics(
+                        client, os.environ["SOURCE_PROMETHEUS_URL"],
+                        os.environ["TARGET_PROMETHEUS_URL"], start, end,
+                        str(run.get("namespace") or "sock-shop"), dry_run=dry_run,
+                        metric_family=metric_family,
+                    )
+                except (httpx.HTTPError, ValueError, KeyError) as exc:
+                    if not dry_run:
+                        raise
+                    results.append({"run_id": run["run_id"], "metrics": {
+                        "status": "tool_error", "error": _record_error(exc), "dry_run": True,
+                    }})
+                    continue
+                source_samples, _ = _prom_samples(source)
+                coverage = {}
+                for phase, window in (run["observation_window"].get("phases") or {}).items():
+                    lo = _iso_datetime(window["start"]).timestamp()
+                    hi = _iso_datetime(window["end"]).timestamp()
+                    phase_samples = [
+                        sample for sample in source_samples
+                        if lo <= sample["timestamp_ms"] / 1000 <= hi
+                    ]
+                    coverage[phase] = {
+                        "sample_count": len(phase_samples),
+                        "metric_sample_counts": dict(Counter(
+                            sample["labels"]["__name__"] for sample in phase_samples
+                        )),
+                    }
+                metrics["source_phase_coverage"] = coverage
+                results.append({"run_id": run["run_id"], "window": run["observation_window"]["window"],
+                                "metrics": metrics})
+        return {"campaign_id": campaign_id, "run_count": len(results),
+                "metrics_only": True, "dry_run": dry_run, "runs": results}
 
     settings = {
         "source_prometheus": os.environ["SOURCE_PROMETHEUS_URL"],
@@ -1365,8 +1503,16 @@ def run_migration(input_path: Path) -> Dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--metrics-only", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--metric-family", choices=("all", "http"), default="all")
     args = parser.parse_args()
-    summary = run_migration(args.input)
+    if args.metric_family != "all" and not args.metrics_only:
+        parser.error("--metric-family requires --metrics-only")
+    summary = run_migration(
+        args.input, metrics_only=args.metrics_only, dry_run=args.dry_run,
+        metric_family=args.metric_family,
+    )
     print(json.dumps(summary, indent=2))
     return 0
 

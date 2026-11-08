@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from .domain import RunStatus, utc_now_iso
 from .plugins.mcp_client import MCPToolClient
+from .analysis.istio_edges import istio_expression
 from experiment.eval.memory_hog.resource_intensity import (
     _CPU_SUFFIXES, _MEMORY_SUFFIXES, _parse_quantity,
 )
@@ -72,6 +73,9 @@ def build_time_budget(policy: dict[str, Any]) -> dict[str, Any]:
         "active_intervention": max(ACTIVE_SECONDS.values()), "post_observation": 120,
         "experimental_recovery": int(policy["recovery_timeout_seconds"]),
         "operational_recovery": int((policy.get("resilience") or {}).get("operational_timeout_seconds", 0)),
+        "late_operational_recovery": int(
+            (policy.get("resilience") or {}).get("late_operational_timeout_seconds", 0)
+        ),
         "cooldown": 30, "collection_and_controller_allowance": 900,
     }
     load_seconds = sum(stages.values())
@@ -105,13 +109,34 @@ def validate_cpu_profile(calibration: dict[str, Any]) -> dict[str, Any]:
     if not (candidate or configured.get("evidence")):
         raise GateBlocked("CPU needs explicit measured evidence or a documented candidate profile")
     cores, load = configured.get("cores"), configured.get("load")
+    minimum_present = "minimum_quota_fraction" in configured
+    target_fields_present = (
+        "target_quota_fraction" in configured
+        or "target_tolerance_fraction" in configured
+    )
+    minimum = configured.get("minimum_quota_fraction")
     target = configured.get("target_quota_fraction", .8)
     tolerance = configured.get("target_tolerance_fraction", .05)
+    if minimum_present:
+        invalid_acceptance = (
+            target_fields_present
+            or type(minimum) not in (int, float)
+            or not math.isfinite(minimum)
+            or not .70 <= minimum <= 1.0
+        )
+    else:
+        invalid_acceptance = (
+            type(target) not in (int, float)
+            or not math.isfinite(target)
+            or not .70 <= target <= 1.0
+            or type(tolerance) not in (int, float)
+            or not math.isfinite(tolerance)
+            or not 0 < tolerance < .20
+        )
     if (
         type(cores) is not int or cores < 1
         or type(load) is not int or not 1 <= load <= 100
-        or type(target) not in (int, float) or not .70 <= target <= 1.0
-        or type(tolerance) not in (int, float) or not 0 < tolerance < .20
+        or invalid_acceptance
     ):
         raise GateBlocked("invalid candidate CPU parameters (cores/load/target/tolerance)")
     return configured
@@ -289,8 +314,15 @@ def resource_environment(
         raise GateBlocked(f"not a resource intervention: {fault}")
     configured = validate_cpu_profile(calibration)
     cores, load = int(configured["cores"]), int(configured["load"])
-    target = float(configured.get("target_quota_fraction", .8))
-    tolerance = float(configured.get("target_tolerance_fraction", .05))
+    minimum_fraction = configured.get("minimum_quota_fraction")
+    if minimum_fraction is None:
+        target = float(configured.get("target_quota_fraction", .8))
+        tolerance = float(configured.get("target_tolerance_fraction", .05))
+        acceptance_mode = "target_band"
+    else:
+        target = float(minimum_fraction)
+        tolerance = None
+        acceptance_mode = "minimum_mean"
     baseline_fraction = baseline["cpu_cores"]["p95"] / cpu_quota
     if baseline_fraction >= .70 or baseline_fraction >= target - .10:
         raise GateBlocked(
@@ -301,7 +333,10 @@ def resource_environment(
     return {
         "environment": {"CPU_CORES": str(cores), "CPU_LOAD": str(load), "TOTAL_CHAOS_DURATION": "180"},
         "quota_cores": cpu_quota, "baseline_cores": baseline["cpu_cores"],
-        "candidate_target_quota_fraction": target, "target_tolerance_fraction": tolerance,
+        "cpu_acceptance_mode": acceptance_mode,
+        "candidate_target_quota_fraction": target if acceptance_mode == "target_band" else None,
+        "minimum_quota_fraction": minimum_fraction,
+        "target_tolerance_fraction": tolerance,
         "calibration_status": configured.get("calibration_status", "measured"),
         "calibration": configured,
         "semantics": "stress-ng --cpu N --cpu-load P; P is duty cycle per worker, not container quota",
@@ -894,25 +929,27 @@ class ControlledRun:
         traffic_rate = f"sum(rate(istio_requests_total{{{mesh}}}[30s]))"
         server_5xx_rate = f'sum(rate(istio_requests_total{{{mesh},response_code=~"5.."}}[30s]))'
         if self.fault == "http-status-code" and self.service == "front-end":
-            target_edge = (
-                f'destination_workload_namespace="{self.namespace}",'
-                f'destination_workload="{self.service}",reporter="destination"'
-            )
+            target_reporter = "destination"
         else:
-            target_edge = (
-                f'destination_workload_namespace="{self.namespace}",'
-                f'destination_workload="{self.service}",source_workload!="unknown",'
-                "reporter=\"source\""
-            )
+            target_reporter = "source"
+        target_edge = istio_expression(
+            "istio_requests_total", self.namespace, service=self.service,
+            reporter=target_reporter, lookback="30s",
+        )
         target_edge_requests = (
-            f"sum(rate(istio_requests_total{{{target_edge}}}[30s]))"
+            f"sum({target_edge})"
         )
         target_edge_5xx = (
-            f'sum(rate(istio_requests_total{{{target_edge},response_code=~"5.."}}[30s]))'
+            "sum(" + istio_expression(
+                "istio_requests_total", self.namespace, service=self.service,
+                reporter=target_reporter, codes="5..", lookback="30s",
+            ) + ")"
         )
         target_edge_latency = (
-            f'histogram_quantile(0.95,sum by(le)(rate(istio_request_duration_milliseconds_bucket'
-            f"{{{target_edge}}}[30s])))"
+            "histogram_quantile(0.95,sum by(le)(" + istio_expression(
+                "istio_request_duration_milliseconds_bucket", self.namespace,
+                service=self.service, reporter=target_reporter, lookback="30s",
+            ) + "))"
         )
         queries = {
             "cpu_cores": f"sum(rate(container_cpu_usage_seconds_total{{{selector}}}[30s]))",
@@ -1741,26 +1778,56 @@ class ControlledRun:
             result["baseline_mean_quota_fraction"] = baseline["mean"] / quota
             result["intervention_mean_quota_fraction"] = observed["mean"] / quota
             calibration = self.report["intensity"]["calibration"]
-            target = self.report["intensity"]["candidate_target_quota_fraction"]
-            tolerance = self.report["intensity"]["target_tolerance_fraction"]
-            target_floor = target * (1 - tolerance)
-            target_ceiling = target * (1 + tolerance)
+            minimum = calibration.get("minimum_quota_fraction")
+            if minimum is not None:
+                target_floor = float(minimum)
+                mean_fraction = observed["mean"] / quota
+                mean_passed = mean_fraction >= target_floor
+                acceptance = {
+                    "mode": "minimum_mean",
+                    "minimum_quota_fraction": target_floor,
+                }
+            else:
+                target = self.report["intensity"]["candidate_target_quota_fraction"]
+                tolerance = self.report["intensity"]["target_tolerance_fraction"]
+                target_floor = target * (1 - tolerance)
+                target_ceiling = target * (1 + tolerance)
+                mean_fraction = observed["mean"] / quota
+                mean_passed = target_floor <= mean_fraction <= target_ceiling
+                acceptance = {
+                    "mode": "target_band",
+                    "target_quota_fraction": target,
+                    "accepted_mean_fraction": [target_floor, target_ceiling],
+                }
             target_sustained = sustained(
                 [(timestamp, value / quota) for timestamp, value in points if timestamp >= lo],
                 target_floor,
                 float(self.policy.get("sustained_seconds", 60)),
                 20,
             )
+            minimum_mean_mode = minimum is not None
             result["target_attainment"] = {
                 **target_sustained,
-                "passed": target_sustained["passed"] and target_floor <= observed["mean"] / quota <= target_ceiling,
-                "target_quota_fraction": target,
-                "accepted_mean_fraction": [target_floor, target_ceiling],
-                "observed_mean_fraction": observed["mean"] / quota,
+                "passed": (
+                    mean_passed
+                    if minimum_mean_mode
+                    else target_sustained["passed"] and mean_passed
+                ),
+                **acceptance,
+                "mean_passed": mean_passed,
+                "observed_mean_fraction": mean_fraction,
                 "calibration_status": self.report["intensity"]["calibration_status"],
+                "sustained_requirement_applied": not minimum_mean_mode,
                 "limitation": "candidate parameters are not prior proof; this run measures whether the configured target was reached",
             }
-            result["passed"] = result["passed"] and result["target_attainment"]["passed"]
+            if minimum_mean_mode:
+                result["cpu_delta_sustained_diagnostic"] = {
+                    **target_sustained,
+                    "applied_as_gate": False,
+                }
+                result["passed"] = result["target_attainment"]["passed"]
+            else:
+                result["passed"] = result["passed"] and result["target_attainment"]["passed"]
             result["throttling_separately"] = {
                 "throttled_seconds_per_second": {
                     "unit": "seconds_per_second",
@@ -1830,7 +1897,14 @@ class ControlledRun:
         if not result["passed"]:
             self.report["limitations"].append("mechanism not sustained/detectable: calibration required; no automatic escalation")
 
-    def recovery_check(self) -> dict[str, Any]:
+    def recovery_check(
+        self, *, latency_p95_limit_override_ms: float | None = None,
+    ) -> dict[str, Any]:
+        if latency_p95_limit_override_ms is not None and (
+            type(latency_p95_limit_override_ms) not in (int, float)
+            or not 0 < latency_p95_limit_override_ms < float("inf")
+        ):
+            raise ValueError("latency P95 limit override must be a finite positive number")
         if self.fault == "container-kill":
             self.observe_container_kill_state("recovery_check")
         now = utc_now_iso()
@@ -1839,35 +1913,88 @@ class ControlledRun:
         healthy = self.health()
         recovered = healthy["healthy"]
         latency_key = "target_edge_latency_ms" if self.fault == "network-latency" else "latency_ms"
+        checks = {}
         for key in ("traffic", "cpu_cores", "memory_bytes", "errors_percent", latency_key):
             observed = summary.get(key, {})
-            if observed.get("status") != "ok" or observed["samples"] < 4:
+            baseline = self.baseline.get(key, {})
+            if baseline.get("status") != "ok":
+                checks[key] = {
+                    "passed": False,
+                    "reason": "missing_baseline",
+                    "baseline_status": baseline.get("status"),
+                }
                 recovered = False
                 continue
-            base = self.baseline[key]
+            if observed.get("status") != "ok" or observed.get("samples", 0) < 4:
+                checks[key] = {
+                    "passed": False,
+                    "reason": "missing_or_insufficient_samples",
+                    "observed_status": observed.get("status"),
+                    "sample_count": observed.get("samples", 0),
+                    "minimum_samples": 4,
+                }
+                recovered = False
+                continue
             if key == "traffic":
-                recovered &= observed["mean"] >= base["mean"] * .8
+                threshold = baseline["mean"] * .8
+                value = observed["mean"]
+                comparison = ">="
             else:
                 margin = {
                     "cpu_cores": .05, "memory_bytes": 16 * 2**20,
                     "errors_percent": 1, "latency_ms": 50,
                     "target_edge_latency_ms": 50,
                 }[key]
-                recovered &= observed["p95"] <= max(base["p95"] * 1.2, base["p95"] + margin)
-        return {"passed": bool(recovered), "health": healthy, "summary": summary}
+                threshold = max(
+                    baseline["p95"] * 1.2,
+                    baseline["p95"] + margin,
+                )
+                if key == latency_key and latency_p95_limit_override_ms is not None:
+                    if latency_p95_limit_override_ms < threshold:
+                        raise ValueError("latency P95 limit override cannot lower the baseline threshold")
+                    threshold = float(latency_p95_limit_override_ms)
+                value = observed["p95"]
+                comparison = "<="
+            passed = value >= threshold if comparison == ">=" else value <= threshold
+            checks[key] = {
+                "passed": bool(passed),
+                "reason": None if passed else "threshold_not_met",
+                "observed": value,
+                "comparison": comparison,
+                "threshold": threshold,
+            }
+            recovered &= passed
+        result = {
+            "passed": bool(recovered),
+            "health": healthy,
+            "summary": summary,
+            "metric_checks": checks,
+        }
+        if latency_p95_limit_override_ms is not None:
+            result["latency_p95_limit_override_ms"] = latency_p95_limit_override_ms
+        return result
 
-    def operational_recovery(self) -> None:
+    def operational_recovery(
+        self,
+        *,
+        gate_name: str = "operational_recovery",
+        timeout_seconds: int | None = None,
+        latency_p95_limit_override_ms: float | None = None,
+    ) -> bool:
         policy = self.policy.get("resilience")
         if not isinstance(policy, dict) or policy.get("version") != 1:
-            return
-        timeout = policy.get("operational_timeout_seconds")
+            return False
+        timeout = (
+            policy.get("operational_timeout_seconds")
+            if timeout_seconds is None else timeout_seconds
+        )
         stable_seconds = policy.get("stable_seconds")
         if (
             type(timeout) is not int or type(stable_seconds) is not int
             or not 120 <= stable_seconds < timeout <= 600
         ):
             raise RuntimeError("invalid operational recovery budget")
-        self.mark("operational_recovery_started")
+        self.mark(f"{gate_name}_started")
         deadline = time.monotonic() + timeout
         stable_since: float | None = None
         last_check: float | None = None
@@ -1887,7 +2014,13 @@ class ControlledRun:
                 or status["restart_count"] != expected_restarts
             ):
                 raise RuntimeError("application container changed during operational recovery")
-            check = self.recovery_check()
+            check = (
+                self.recovery_check()
+                if latency_p95_limit_override_ms is None
+                else self.recovery_check(
+                    latency_p95_limit_override_ms=latency_p95_limit_override_ms,
+                )
+            )
             if self.fault == "memory-hog":
                 self.check_memory_safety(check["summary"], self.pods(), {"items": []})
             if not status["ready"] or not status["running"]:
@@ -1903,18 +2036,26 @@ class ControlledRun:
                 stable_since = None
             stable_for = now - stable_since if stable_since is not None else 0
             passed = check["passed"] and stable_for >= stable_seconds and now < deadline
-            self.report["gates"]["operational_recovery"] = {
+            recovery_gate = {
                 **check, "passed": bool(passed), "policy_version": 1,
                 "target": status,
                 "stable_seconds": stable_for, "required_stable_seconds": stable_seconds,
-                "source": "same_load_same_baseline_unchanged_recovery_thresholds",
+                "source": (
+                    "same_load_same_baseline_user_authorized_latency_p95_limit_override"
+                    if latency_p95_limit_override_ms is not None
+                    else "same_load_same_baseline_unchanged_recovery_thresholds"
+                ),
             }
+            if latency_p95_limit_override_ms is not None:
+                recovery_gate["latency_p95_limit_override_ms"] = latency_p95_limit_override_ms
+            self.report["gates"][gate_name] = recovery_gate
             self.checkpoint()
             if passed:
-                self.mark("operational_recovery_observed")
-                return
+                self.mark(f"{gate_name}_observed")
+                return True
             self.wait(15)
-        self.mark("operational_recovery_exhausted")
+        self.mark(f"{gate_name}_exhausted")
+        return False
 
     def recover(self) -> str:
         self.mark("post_observation_started")
@@ -1935,6 +2076,15 @@ class ControlledRun:
             if time.monotonic() >= deadline:
                 self.mark("experimental_recovery_expired")
                 self.operational_recovery()
+                operational = self.report["gates"].get("operational_recovery") or {}
+                late_timeout = (self.policy.get("resilience") or {}).get(
+                    "late_operational_timeout_seconds", 0,
+                )
+                if not operational.get("passed") and late_timeout:
+                    self.operational_recovery(
+                        gate_name="late_operational_recovery",
+                        timeout_seconds=late_timeout,
+                    )
                 raise RuntimeError("recovery not confirmed; campaign must stop before next service")
             self.wait(15)
 

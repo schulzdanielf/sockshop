@@ -291,3 +291,747 @@ data:
         }
       ]
     }
+  evaluation-progress.json: |
+    {
+      "id": null,
+      "uid": "evaluation-progress",
+      "title": "Progresso das avaliações",
+      "tags": ["evaluation", "rca", "tempo"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 2,
+      "refresh": "30s",
+      "time": {
+        "from": "now-7d",
+        "to": "now"
+      },
+      "templating": {
+        "list": [
+          {
+            "name": "evaluation_id",
+            "label": "Rodada",
+            "type": "query",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus"
+            },
+            "definition": "query_result(topk(1, last_over_time(evaluation_run_started_timestamp_seconds[15d])))",
+            "query": {
+              "query": "query_result(topk(1, last_over_time(evaluation_run_started_timestamp_seconds[15d])))",
+              "refId": "StandardVariableQuery"
+            },
+            "regex": "/evaluation_id=\"([^\"]+)\"/",
+            "refresh": 2,
+            "sort": 1,
+            "current": {
+              "selected": true,
+              "text": "test-base-v6-20261107T121952077600Z",
+              "value": "test-base-v6-20261107T121952077600Z"
+            },
+            "options": [],
+            "hide": 0,
+            "includeAll": false,
+            "multi": false,
+            "skipUrlSync": false
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "text",
+          "title": "Acompanhamento da rodada selecionada",
+          "gridPos": {
+            "h": 5,
+            "w": 24,
+            "x": 0,
+            "y": 0
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "Selecione a rodada no filtro **Rodada**. O progresso é atualizado a cada caso; os resultados de acurácia, recuperação e tokens só são publicados depois que todos os diagnósticos estiverem persistidos e validados, sem expor rótulos ao modelo.\n\nMétricas concluídas permanecem consultáveis por 30 dias. Uma rodada nova iniciada enquanto este dashboard está aberto pode exigir recarregar a página para atualizar o filtro. Traces correlacionados aparecem depois de executar a avaliação com a nova instrumentação; a tabela legada abaixo mantém chamadas sem ID de rodada."
+          }
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Estado",
+          "description": "0 = diagnóstico em andamento, 1 = cálculo do relatório, 2 = concluído, 3 = falhou.",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 0, "y": 5},
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {"text": "Diagnóstico", "color": "blue"},
+                    "1": {"text": "Pontuação", "color": "yellow"},
+                    "2": {"text": "Concluída", "color": "green"},
+                    "3": {"text": "Falhou", "color": "red"}
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "blue", "value": null},
+                  {"color": "yellow", "value": 1},
+                  {"color": "green", "value": 2},
+                  {"color": "red", "value": 3}
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_run_state{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Casos esperados",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 4, "y": 5},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_cases_expected{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Casos concluídos",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 8, "y": 5},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_cases_completed{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "Conclusão",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 12, "y": 5},
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "decimals": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "red", "value": null},
+                  {"color": "yellow", "value": 0.5},
+                  {"color": "green", "value": 1}
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_completion_ratio{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "Em andamento",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 16, "y": 5},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_cases_in_progress{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "type": "stat",
+          "title": "Casos com falha",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 20, "y": 5},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_cases_failed{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "type": "stat",
+          "title": "Serviço correto",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 0, "y": 9},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_service_correct{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 9,
+          "type": "stat",
+          "title": "Causa correta",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 4, "y": 9},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_fault_type_correct{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 10,
+          "type": "stat",
+          "title": "Serviço + causa corretos",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 8, "y": 9},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_joint_correct{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 11,
+          "type": "stat",
+          "title": "Recuperação Hit@3",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 12, "y": 9},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_retrieval_hit_cases{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 12,
+          "type": "stat",
+          "title": "Acerto conjunto após Hit@3",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 16, "y": 9},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_joint_correct_given_retrieval{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 13,
+          "type": "stat",
+          "title": "Chamadas ao modelo",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 20, "y": 9},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_model_calls_total{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 14,
+          "type": "stat",
+          "title": "Acurácia de serviço",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 0, "y": 13},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_service_accuracy_ratio{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 15,
+          "type": "stat",
+          "title": "Acurácia de causa",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 4, "y": 13},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_fault_type_accuracy_ratio{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 16,
+          "type": "stat",
+          "title": "Acurácia conjunta",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 8, "y": 13},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_joint_accuracy_ratio{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 17,
+          "type": "stat",
+          "title": "Taxa de Hit@3",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 12, "y": 13},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_retrieval_hit_rate_ratio{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 18,
+          "type": "stat",
+          "title": "Acurácia conjunta após Hit@3",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 16, "y": 13},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_joint_accuracy_given_retrieval_ratio{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 19,
+          "type": "stat",
+          "title": "Tempo total",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 20, "y": 13},
+          "fieldConfig": {"defaults": {"unit": "s", "decimals": 1}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_elapsed_seconds{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 20,
+          "type": "stat",
+          "title": "Tokens (medidos + estimados)",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 0, "y": 17},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_tokens_total{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 21,
+          "type": "stat",
+          "title": "Tempo médio por request",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 4, "y": 17},
+          "fieldConfig": {"defaults": {"unit": "s", "decimals": 2}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_mean_request_duration_seconds{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 22,
+          "type": "stat",
+          "title": "Tempo médio de resposta",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 8, "y": 17},
+          "fieldConfig": {"defaults": {"unit": "s", "decimals": 2}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_mean_response_duration_seconds{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 23,
+          "type": "stat",
+          "title": "Chamadas com tokens medidos",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 12, "y": 17},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_measured_token_calls{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 24,
+          "type": "stat",
+          "title": "Chamadas com tokens estimados",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 16, "y": 17},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_estimated_token_calls{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 25,
+          "type": "stat",
+          "title": "Caso atual",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 4, "w": 4, "x": 20, "y": 17},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "expr": "last_over_time(evaluation_current_case_index{evaluation_id=\"$evaluation_id\"}[15d])",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 26,
+          "type": "barchart",
+          "title": "Acurácia por serviço",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 10, "w": 8, "x": 0, "y": 21},
+          "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+          "options": {
+            "orientation": "horizontal",
+            "showValue": "always",
+            "stacking": "none",
+            "legend": {"showLegend": false},
+            "tooltip": {"mode": "single", "sort": "none"}
+          },
+          "targets": [
+            {
+              "expr": "100 * last_over_time(evaluation_service_correct_by_service{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d]) / last_over_time(evaluation_cases_by_service{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "legendFormat": "{{service}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 27,
+          "type": "barchart",
+          "title": "Acurácia por causa",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 10, "w": 8, "x": 8, "y": 21},
+          "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+          "options": {
+            "orientation": "horizontal",
+            "showValue": "always",
+            "stacking": "none",
+            "legend": {"showLegend": false},
+            "tooltip": {"mode": "single", "sort": "none"}
+          },
+          "targets": [
+            {
+              "expr": "100 * last_over_time(evaluation_fault_type_correct_by_fault_type{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d]) / last_over_time(evaluation_cases_by_fault_type{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "legendFormat": "{{fault_type}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 28,
+          "type": "barchart",
+          "title": "Acurácia conjunta por serviço + causa",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "gridPos": {"h": 10, "w": 8, "x": 16, "y": 21},
+          "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+          "options": {
+            "orientation": "horizontal",
+            "showValue": "always",
+            "stacking": "none",
+            "legend": {"showLegend": false},
+            "tooltip": {"mode": "single", "sort": "none"}
+          },
+          "targets": [
+            {
+              "expr": "100 * last_over_time(evaluation_joint_correct_by_service_fault{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d]) / last_over_time(evaluation_cases_by_service_fault{evaluation_id=\"$evaluation_id\",strategy=\"exploratory_rag\"}[15d])",
+              "instant": true,
+              "legendFormat": "{{service}} / {{fault_type}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 29,
+          "type": "table",
+          "title": "Traces correlacionados à rodada selecionada",
+          "description": "Cada trace contém o span evaluation.case e spans de cliente HTTP. O Trace ID abre a cadeia no Explore. A busca depende da instrumentação em execuções novas.",
+          "datasource": {
+            "type": "tempo",
+            "uid": "P8D6546721A1D106C"
+          },
+          "gridPos": {
+            "h": 14,
+            "w": 24,
+            "x": 0,
+            "y": 31
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "queryType": "traceql",
+              "query": "{ span.evaluation.id = \"$evaluation_id\" }",
+              "limit": 100,
+              "tableType": "traces",
+              "filters": []
+            }
+          ]
+        },
+        {
+          "id": 30,
+          "type": "table",
+          "title": "Chamadas RAG legadas (sem correlação de rodada)",
+          "description": "Traces da rota de diagnóstico RAG que não carregam o identificador da avaliação. Eles não podem ser associados com segurança a uma rodada específica.",
+          "datasource": {
+            "type": "tempo",
+            "uid": "P8D6546721A1D106C"
+          },
+          "gridPos": {
+            "h": 14,
+            "w": 24,
+            "x": 0,
+            "y": 45
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "queryType": "traceql",
+              "query": "{ resource.service.name = \"rca-platform\" && name = \"POST /api/runs/{run_id}/skill-rag\" }",
+              "limit": 100,
+              "tableType": "traces",
+              "filters": []
+            }
+          ]
+        }
+      ]
+    }

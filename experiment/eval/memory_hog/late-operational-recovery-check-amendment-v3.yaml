@@ -1,0 +1,22 @@
+version: controlled-late-operational-recovery-check-v3
+supersedes: controlled-late-operational-recovery-check-v2
+campaign_id: controlled-20261103T234452388707Z
+user_authorized: true
+scope: single_aborted_run_only
+target_run:
+  cell_id: orders-container-kill-r0
+  run_id: run-503646080ca5
+timeout_seconds: 600
+stable_seconds: 120
+max_attempts: 4
+same_load: true
+same_baseline: true
+thresholds_unchanged: false
+other_thresholds_unchanged: true
+latency_p95_limit_override_ms: 370.0
+retry_after_cgroup_sampling_fix_only: true
+retry_after_marginal_latency_stability_failure_only: true
+fault_injection: false
+automatic_restart: false
+original_run_status_preserved: true
+continue_only_after_recovery_and_cleanup: true

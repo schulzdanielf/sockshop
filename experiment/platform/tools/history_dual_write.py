@@ -23,6 +23,22 @@ _REMOTE_WRITE_NAME = "history-dual-write"
 _REMOTE_WRITE_URL = (
     "http://prometheus-history.monitoring-history.svc.cluster.local:9090/api/v1/write"
 )
+_HISTORY_LOG_FILTER = {
+    "error_mode": "propagate",
+    "logs": {"log_record": [
+        'attributes["namespace"] != "sock-shop" and '
+        'resource.attributes["k8s.namespace.name"] != "sock-shop" and '
+        'resource.attributes["service.namespace"] != "sock-shop"'
+    ]},
+}
+_HISTORY_METRIC_FILTER = [{
+    "source_labels": [
+        "kubernetes_namespace", "namespace", "service_namespace", "k8s_namespace_name", "job",
+    ],
+    "separator": ";",
+    "regex": "sock-shop;.*|.*;sock-shop;.*|.*;sock-shop|.*;sock-shop/.+",
+    "action": "keep",
+}]
 
 
 def _queued_exporter(endpoint: str, *, protocol: str) -> dict[str, Any]:
@@ -83,12 +99,21 @@ def toggle_otel_config(config: dict[str, Any], *, enabled: bool) -> dict[str, An
             trace_exporters.append("otlp/tempo-history")
 
         history_logs = pipelines.get("logs/history")
+        processors = updated.setdefault("processors", {})
+        existing_filter = processors.get("filter/history_logs")
+        if existing_filter is not None and existing_filter != _HISTORY_LOG_FILTER:
+            raise ValueError("Collector history log filter has unexpected settings")
+        processors["filter/history_logs"] = copy.deepcopy(_HISTORY_LOG_FILTER)
+        history_processors = list(logs.get("processors") or [])
+        history_processors.insert(0, "filter/history_logs")
         expected_log_pipeline = {
             **copy.deepcopy(logs),
-            "receivers": ["filelog"],
+            "processors": history_processors,
             "exporters": ["loki/history"],
         }
-        if history_logs is not None and history_logs != expected_log_pipeline:
+        legacy_log_pipeline = {**copy.deepcopy(logs), "receivers": ["filelog"],
+                               "exporters": ["loki/history"]}
+        if history_logs is not None and history_logs not in (expected_log_pipeline, legacy_log_pipeline):
             raise ValueError("Collector logs/history pipeline has unexpected settings")
         pipelines["logs/history"] = expected_log_pipeline
     else:
@@ -98,6 +123,11 @@ def toggle_otel_config(config: dict[str, Any], *, enabled: bool) -> dict[str, An
                 name for name in traces_exporters if name != "otlp/tempo-history"
             ]
         pipelines.pop("logs/history", None)
+        processors = updated.get("processors", {})
+        if processors.get("filter/history_logs") == _HISTORY_LOG_FILTER:
+            processors.pop("filter/history_logs")
+            if not processors:
+                updated.pop("processors", None)
         exporters.pop("otlp/tempo-history", None)
         exporters.pop("loki/history", None)
     return updated
@@ -148,19 +178,11 @@ def toggle_prometheus_config(
                         "max_samples_per_send": 1000,
                         "batch_send_deadline": "5s",
                     },
-                    "write_relabel_configs": [
-                        {
-                            "source_labels": [
-                                "kubernetes_namespace",
-                                "namespace",
-                            ],
-                            "separator": ";",
-                            "regex": "sock-shop;.*|.*;sock-shop",
-                            "action": "keep",
-                        }
-                    ],
+                    "write_relabel_configs": copy.deepcopy(_HISTORY_METRIC_FILTER),
                 }
             )
+        else:
+            matching[0]["write_relabel_configs"] = copy.deepcopy(_HISTORY_METRIC_FILTER)
         updated["remote_write"] = remote_write
     else:
         for item in matching:

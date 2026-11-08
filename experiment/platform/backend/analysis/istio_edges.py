@@ -11,6 +11,8 @@ payload ``edge_metrics`` consumido pelo ``graph_builder`` (formato
 """
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Dict
 
 # Métricas Istio que alimentam as golden metrics por aresta.
@@ -23,17 +25,115 @@ ISTIO_EDGE_METRICS = (
 # PromQL de range query por métrica, escopo sock-shop. Mantemos os labels
 # source_workload/destination_workload/response_code para o builder.
 # Sem rate(): queremos os valores brutos por janela (o builder calcula a razão).
-_QUERY_TEMPLATE = (
-    'sum by (source_workload, destination_workload, response_code, response_flags, reporter, '
-    'destination_workload_namespace) '
-    '({metric}{{destination_workload_namespace="{ns}"}})'
+HTTP_EDGE_LABELS = (
+    "source_workload,source_workload_namespace,destination_workload,"
+    "destination_workload_namespace,destination_service_name,destination_service,"
+    "response_code,response_flags,reporter"
 )
+
+
+def istio_expression(
+    metric: str,
+    namespace: str,
+    *,
+    service: str | None = None,
+    reporter: str | None = None,
+    codes: str | None = None,
+    lookback: str | None = None,
+    normalize_destination: bool = False,
+) -> str:
+    ns = json.dumps(namespace)
+    extra = ""
+    if reporter is not None:
+        extra += f",reporter={json.dumps(reporter)}"
+        if reporter == "source":
+            extra += ',source_workload!="unknown"'
+    if codes is not None:
+        extra += f",response_code=~{json.dumps(codes)}"
+    known = f'destination_workload_namespace={ns},destination_workload!="unknown"'
+    if service is not None:
+        known += f",destination_workload={json.dumps(service)}"
+    host = re.escape(service) if service is not None else "[^.]+"
+    fqdn = host + r"\." + re.escape(namespace) + r"\.svc(\.cluster\.local)?"
+    unknown = (
+        'destination_workload="unknown",'
+        f"destination_service=~{json.dumps(fqdn)}"
+    )
+    if service is not None:
+        unknown += f",destination_service_name={json.dumps(service)}"
+    expressions = []
+    for selector in (known, unknown):
+        expression = f"{metric}{{{selector}{extra}}}"
+        if lookback is not None:
+            expression = f"rate({expression}[{lookback}])"
+        expressions.append(expression)
+    if normalize_destination:
+        # Preserve the proxy's original identity before deriving the intended service.
+        expressions[1] = (
+            f'label_replace(label_replace({expressions[1]},'
+            '"original_destination_workload","$1","destination_workload","(.*)"),'
+            '"destination_workload","$1","destination_service_name","(.+)")'
+        )
+    return f"({expressions[0]} or {expressions[1]})"
+
+
+def http_status_query(namespace: str, service: str | None = None) -> str:
+    expression = istio_expression(
+        "istio_requests_total", namespace, service=service, lookback="1m"
+    )
+    return f"sum by ({HTTP_EDGE_LABELS}) ({expression})"
+
+
+def http_client_expression(
+    metric: str, namespace: str, *, codes: str | None = None, lookback: str = "1m"
+) -> str:
+    source = istio_expression(
+        metric, namespace, reporter="source", codes=codes, lookback=lookback,
+        normalize_destination=True,
+    )
+    selector = (
+        f'destination_workload_namespace={json.dumps(namespace)},'
+        'destination_workload!="unknown",source_workload="unknown",reporter="destination"'
+    )
+    if codes is not None:
+        selector += f",response_code=~{json.dumps(codes)}"
+    return f"({source} or rate({metric}{{{selector}}}[{lookback}]))"
+
+
+def http_golden_query(metric: str, namespace: str, lookback: str = "1m") -> str:
+    traffic = f"sum by (destination_workload) ({http_client_expression('istio_requests_total', namespace, lookback=lookback)})"
+    if metric == "request_rate":
+        return traffic
+    if metric == "error_rate":
+        errors = f"sum by (destination_workload) ({http_client_expression('istio_requests_total', namespace, codes='5..', lookback=lookback)})"
+        return f"100 * ({errors} or on(destination_workload) 0 * {traffic}) / clamp_min({traffic}, 0.0001)"
+    quantiles = {"latency_p50": 0.50, "latency_p95": 0.95, "latency_p99": 0.99}
+    expression = http_client_expression(
+        "istio_request_duration_milliseconds_bucket", namespace, lookback=lookback
+    )
+    return f"histogram_quantile({quantiles[metric]}, sum by (le, destination_workload) ({expression}))"
+
+
+def resolve_istio_destination(labels: dict[str, Any], namespace: str) -> str | None:
+    workload = labels.get("destination_workload")
+    if isinstance(workload, str) and workload and workload != "unknown":
+        if labels.get("destination_workload_namespace", namespace) == namespace:
+            return workload
+        return None
+    service = labels.get("destination_service_name")
+    if not isinstance(service, str) or not re.fullmatch(r"[a-z0-9][-a-z0-9]*", service):
+        return None
+    if labels.get("destination_service") in {
+        f"{service}.{namespace}.svc", f"{service}.{namespace}.svc.cluster.local",
+    }:
+        return service
+    return None
 
 
 def build_istio_queries(namespace: str = "sock-shop", step_seconds: int = 15) -> Dict[str, str]:
     """Retorna {metric_name: promql} para as golden metrics por aresta."""
     return {
-        m: _QUERY_TEMPLATE.format(metric=m, ns=namespace, step=step_seconds)
+        m: f"sum by ({HTTP_EDGE_LABELS}) ({istio_expression(m, namespace)})"
         for m in ISTIO_EDGE_METRICS
     }
 

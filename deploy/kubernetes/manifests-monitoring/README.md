@@ -27,10 +27,49 @@ Once the grafana pod is in the Running state apply the `23-grafana-import-dash-b
 
 `kubectl apply -f 23-grafana-import-dash-batch.yaml`
 
-The OpenTelemetry pipeline health dashboard is provisioned from
-`48-otel-pipeline-dashboard.yaml` when Grafana is restarted.
+The OpenTelemetry pipeline health and **Progresso das avaliações** dashboards
+are provisioned from `48-otel-pipeline-dashboard.yaml`. The evaluation
+dashboard shows per-round case progress, diagnosis/retrieval scores, token and
+duration totals, breakdowns by service/fault, and correlated Tempo traces.
+
+Apply the dashboard ConfigMap with
+`kubectl apply -f 48-otel-pipeline-dashboard.yaml`. Grafana polls provisioned
+dashboards every 30 seconds; if an update does not appear, restart Grafana with
+`kubectl -n monitoring rollout restart deployment/grafana-core`.
 
 Grafana will be exposed on the NodePort `31300` 
+
+### Evaluation telemetry
+
+The test-base evaluator exports OTLP metrics and traces to the Collector's
+host-facing NodePort `30318` by default. Override the endpoint with
+`EVALUATION_OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` when
+the evaluator runs elsewhere. Each metric is tagged with the evaluation ID;
+diagnosis spans include the case/run IDs, and HTTP client spans propagate
+`traceparent` to the API for trace correlation.
+
+Run an evaluation normally to publish live progress and final scores:
+
+```sh
+python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --run experiment/eval/memory_hog/out/knowledge_evaluation/<evaluation-id>
+```
+
+To publish the report from an already completed evaluation without rerunning
+diagnostics (useful for the initial dashboard population):
+
+```sh
+python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --publish-metrics experiment/eval/memory_hog/out/knowledge_evaluation/<evaluation-id>
+```
+
+Progress metrics are exported while the evaluator runs. Accuracy and token
+metrics are emitted only after persisted diagnostics pass report validation.
+The dashboard retains the most recent sample within Prometheus's 15-day
+retention window and selects the
+latest evaluation ID when loaded; reload the dashboard to select a run started
+after it was opened. Existing traces without evaluation attributes remain
+visible in a separate legacy panel but cannot be correlated to a specific run.
 
 ### OpenTelemetry
 
@@ -82,6 +121,38 @@ export failures so a prolonged Tempo outage is visible. Spans still inside the
 lost on an abrupt process or node failure; the persistent queue protects
 batches only after sampling decisions are made.
 
+### HTTP failure observability
+
+From the repository root, enable the namespace-scoped Istio access-log provider:
+
+```sh
+./.venv/bin/python -m experiment.platform.tools.configure_http_access_logs
+./.venv/bin/python -m experiment.platform.tools.configure_http_access_logs --apply
+```
+
+The first command checks configuration without modifying the cluster. The second
+merges only the named provider into the existing mesh configuration and applies
+`71-sock-shop-http-telemetry.yaml`. JSON access logs retain HTTP errors, response
+flags/details, intended authority, upstream, duration, and correlation headers.
+They deliberately exclude URL paths/query strings, request bodies and credentials.
+Trace/request IDs remain log fields, not Prometheus or Loki index labels.
+
+The Collector parses these records and preserves `FI` as
+`proxy_fault_injection`. RCA log queries include the application and its
+`istio-proxy` container on the same workload pod, but exclude similarly named
+database pods. HTTP queries retain both reporters separately and resolve an
+unknown destination workload only through its namespace-verified service FQDN.
+RED aggregates prefer the caller reporter; external requests without a known
+caller use the server reporter. Never add both reporters as distinct requests.
+
+Java SDK metrics are exported through OTLP; apply `44-otel-java-instrumentation.yaml`
+and restart the Java workloads to activate that setting. Collector datapoints
+receive their resource namespace, and Tempo dimensions include namespace,
+HTTP method/status and normalized route. The tail sampler additionally retains
+HTTP 5xx under both legacy and current semantic-convention keys, even when the
+span's status is not `ERROR`. These metrics remain the `metrics` family;
+span-derived metrics do not independently corroborate their source traces.
+
 ### Tempo
 
 Deploy Tempo and Grafana datasources manifests:
@@ -120,8 +191,11 @@ temporary dual-write after recording its campaign ID:
 ```
 
 The toggle adds a filtered Prometheus remote-write target for `sock-shop`
-metrics and enables queued Collector fan-out for its file logs and sampled
-traces. Existing live exporters remain unchanged. The campaign validates
+metrics, including normalized resource namespaces and legacy HTTP OTLP series
+whose `job` identifies `sock-shop/<service>`. It enables queued Collector fan-out
+for file logs, namespace-scoped OTLP logs and sampled traces. Unscoped OTLP logs
+are excluded. Existing live exporters remain unchanged. Re-enabling the same
+campaign refreshes the managed filters without changing its identity. The campaign validates
 read-back from historical Prometheus, Loki, and Tempo through the historical
 MCP before evaluating each run. After the final run is validated, disable the
 fan-out and pass the same campaign ID:
@@ -135,6 +209,27 @@ Disabling waits for final exporter batches to flush and rolls both monitoring
 workloads. Monitor historical PVC and exporter-queue capacity throughout a
 long campaign. Do not run the per-run migration Jobs for the same dual-written
 runs; they are reserved for backfilling older runs.
+
+For a metrics-only backfill, inspect original live samples before importing:
+
+```sh
+SOURCE_PROMETHEUS_URL=http://127.0.0.1:9091 \
+TARGET_PROMETHEUS_URL=http://127.0.0.1:19091 \
+./.venv/bin/python -m experiment.platform.tools.migrate_observability_history \
+  --input <migration-input.json> --metrics-only --metric-family http --dry-run
+```
+
+Use the migration input's original run windows. This mode writes neither backend
+nor object storage and reports metric names, phase coverage and missing samples.
+Removing `--dry-run` imports only missing samples, refusing conflicting values or
+incomplete source responses. Raw range-vector queries preserve scrape timestamps,
+labels and values; `query_range` interpolation is not used as archival evidence.
+Existing extra historical series are preserved; verification requires the exact
+source samples to be covered, not the removal of unrelated target series.
+HTTP scope limits the scan to Istio RED, HTTP client/server and namespace-scoped
+Tempo metrics. Coverage tolerates the additional historical `history_campaign`
+provenance label without rewriting original labels or duplicating existing scrapes.
+Unscoped legacy Tempo metrics are not automatically assigned to a namespace.
 
 Create the namespace and generated S3 credentials, then build the migrator
 image used by the bucket bootstrap and per-run migration Jobs:

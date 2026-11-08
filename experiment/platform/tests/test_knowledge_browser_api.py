@@ -72,7 +72,96 @@ def test_knowledge_browser_lists_and_returns_a_b_pairs(knowledge_client):
     assert data["mode"] == "exploratory"
     assert data["pairs"][0]["a"]["symptoms"][0]["description"] == "CPU increased"
     assert data["pairs"][0]["b"]["recommended_checks"] == ["Check CPU"]
+    assert data["pairs"][0]["b_eligible"] is None
     assert "index" not in data
+
+
+def test_knowledge_browser_identifies_latest_evaluation_for_corpus(
+    knowledge_client, monkeypatch
+):
+    client, storage = knowledge_client
+    install_base(storage, "campaign-a", mode="exploratory")
+    base_path = (
+        storage.object_store_root
+        / ".rca_knowledge"
+        / "campaign-a"
+        / "exploratory_base.json"
+    )
+    base = json.loads(base_path.read_text(encoding="utf-8"))
+    evaluation_id = "test-base-v6-20261107T215646147881Z"
+    evaluation_root = storage.object_store_root.parent / "knowledge_evaluation"
+    report_dir = evaluation_root / evaluation_id
+    report_dir.mkdir(parents=True)
+    (report_dir / "test_base_rag_evaluation.json").write_text(
+        json.dumps(
+            {
+                "evaluation_id": evaluation_id,
+                "provenance": {
+                    "corpus_id": "campaign-a",
+                    "corpus_sha256": base["sha256"],
+                    "retriever_version": "opensearch-bm25-metric-gated-rrf-v6",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api, "KNOWLEDGE_EVALUATION_ROOT", evaluation_root)
+
+    response = client.get(
+        "/api/skill-rag/corpora",
+        headers={"X-User-Role": "admin"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()[0]["latest_evaluation"] == {
+        "evaluation_id": evaluation_id,
+        "retriever_version": "opensearch-bm25-metric-gated-rrf-v6",
+    }
+
+
+def test_knowledge_browser_reports_procedural_b_eligibility(knowledge_client):
+    client, storage = knowledge_client
+    install_base(storage, "campaign-a", mode="exploratory")
+    path = (
+        storage.object_store_root
+        / ".rca_knowledge"
+        / "campaign-a"
+        / "exploratory_base.json"
+    )
+    base = json.loads(path.read_text(encoding="utf-8"))
+    eligible_pair = base["pairs"][0]
+    eligible_pair.update(
+        guide_status="procedurally_validated",
+        causal_status="supported",
+        b_procedural_status="passed",
+        effect_validated=False,
+    )
+    pending_pair = {
+        **eligible_pair,
+        "pair_id": "pair-2",
+        "source_run_id": "run-train-2",
+        "guide_status": "procedural_pending",
+        "causal_status": "inconclusive",
+        "b_procedural_status": "pending",
+    }
+    base["training_run_ids"].append("run-train-2")
+    base["pairs"].append(pending_pair)
+    base["sha256"] = api.knowledge_digest(
+        {key: value for key, value in base.items() if key != "sha256"}
+    )
+    path.write_text(json.dumps(base), encoding="utf-8")
+
+    response = client.get(
+        "/api/skill-rag/campaign-a/pairs",
+        headers={"X-User-Role": "admin"},
+    )
+
+    assert response.status_code == 200
+    pairs = {pair["pair_id"]: pair for pair in response.json()["pairs"]}
+    assert pairs["pair-1"]["effect_validated"] is False
+    assert pairs["pair-1"]["b_eligible"] is True
+    assert pairs["pair-2"]["b_procedural_status"] == "pending"
+    assert pairs["pair-2"]["b_eligible"] is False
 
 
 def test_knowledge_browser_requires_an_authorized_role(knowledge_client):

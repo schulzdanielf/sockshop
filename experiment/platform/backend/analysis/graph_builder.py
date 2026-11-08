@@ -25,6 +25,8 @@ import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from .istio_edges import resolve_istio_destination
+
 SCHEMA_VERSION = "1.0"
 GRAPH_SCHEMA_VERSION = "gat-v1"
 
@@ -372,10 +374,17 @@ def _edge_series_istio(
     ``only_5xx=True``, soma apenas séries cujo ``response_code`` começa com 5.
     """
     result = ((edge_metrics.get(metric_name) or {}).get("data") or {}).get("result") or []
+    edge_series = [
+        series for series in result
+        if (series.get("metric") or {}).get("source_workload") == src
+        and resolve_istio_destination(series.get("metric") or {}, "sock-shop") == dst
+    ]
+    reporters = {(series.get("metric") or {}).get("reporter") for series in edge_series}
+    reporter = "source" if "source" in reporters else ("destination" if "destination" in reporters else None)
     by_ts: Dict[float, float] = {}
-    for series in result:
+    for series in edge_series:
         metric = series.get("metric") or {}
-        if metric.get("source_workload") != src or metric.get("destination_workload") != dst:
+        if reporter is not None and metric.get("reporter") != reporter:
             continue
         if only_5xx:
             code = str(metric.get("response_code") or "")

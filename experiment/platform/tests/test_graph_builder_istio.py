@@ -98,3 +98,23 @@ def test_build_gat_graph_edge_source_full():
               and g["nodes"][e["dst"]]["service"] == "catalogue"
               and e["direction"] == "real")
     assert fe["features"]["latency_lr"] is not None and fe["features"]["latency_lr"] > 0.9
+
+
+def test_http_fault_identity_in_graph_preserves_intended_destination():
+    em = make_istio_metrics()
+    em["istio_requests_total"]["data"]["result"][0]["metric"]["reporter"] = "source"
+    error = em["istio_requests_total"]["data"]["result"][1]
+    error["metric"].update({
+        "destination_workload": "unknown",
+        "destination_workload_namespace": "unknown",
+        "destination_service_name": "catalogue",
+        "destination_service": "catalogue.sock-shop.svc.cluster.local",
+        "source_workload_namespace": "sock-shop",
+        "response_flags": "FI",
+        "reporter": "source",
+    })
+    feats = _edge_features(
+        em, "front-end", "catalogue", _ts(FAULT[0]), _ts(FAULT[1]),
+        _ts(BASELINE[0]), _ts(BASELINE[1]),
+    )
+    assert feats["error_lr"] is not None and feats["error_lr"] > 0

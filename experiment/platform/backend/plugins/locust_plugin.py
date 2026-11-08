@@ -56,6 +56,19 @@ else:
 print(json.dumps(result))
 """
 
+_REMOTE_READ_HANDLE = """
+import json, os, sys
+base = sys.argv[1]
+identity, log_path = base + '.json', base + '.log'
+if not os.path.isfile(identity):
+    print(json.dumps({'identity_exists': False, 'log_exists': os.path.exists(log_path)}))
+else:
+    with open(identity) as source:
+        record = json.load(source)
+    print(json.dumps({'identity_exists': True, 'log_exists': os.path.exists(log_path),
+                      'record': record}))
+"""
+
 
 class LocustLoadPlugin:
     def validate(self, config: Dict[str, Any]) -> None:
@@ -180,6 +193,81 @@ class LocustLoadPlugin:
             return {"stopped": True}
         except Exception as exc:
             return {"stopped": False, "error": str(exc)}
+
+    def stop_orphaned_remote_load(
+        self, context: Dict[str, Any], run_id: str,
+    ) -> Dict[str, Any]:
+        import re
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+            raise ValueError("invalid controlled load run identifier")
+        pods = self._kube_json([
+            "-n", "loadtest", "get", "pods", "-l", "app=locust-web", "-o", "json",
+        ])
+        if len(pods.get("items", [])) != 1:
+            raise RuntimeError("controlled load requires exactly one locust-web pod")
+        pod = pods["items"][0]
+        statuses = [
+            status for status in pod.get("status", {}).get("containerStatuses", [])
+            if status.get("name") == "locust"
+        ]
+        if (
+            len(statuses) != 1
+            or not statuses[0].get("ready")
+            or not statuses[0].get("containerID")
+        ):
+            raise RuntimeError("locust application container is not ready")
+        base = f"/tmp/controlled-load-{run_id}"
+        remote = self._kube_json([
+            "-n", "loadtest", "exec", pod["metadata"]["name"], "-c", "locust", "--",
+            "python", "-c", _REMOTE_READ_HANDLE, base,
+        ])
+        if not remote.get("identity_exists"):
+            if remote.get("log_exists"):
+                raise RuntimeError(
+                    "orphaned controlled load has a log without an identity; refusing to retry"
+                )
+            return {
+                "found": False, "stopped": True,
+                "identity_source": "no_remote_start_marker",
+            }
+        record = remote.get("record") or {}
+        if (
+            type(record.get("remote_pid")) is not int
+            or not isinstance(record.get("start_ticks"), str)
+            or record.get("log_path") != f"{base}.log"
+        ):
+            raise RuntimeError("orphaned controlled load identity is invalid")
+        handle = {
+            "provider": "locust",
+            "controlled_remote": True,
+            "pod": pod["metadata"]["name"],
+            "pod_uid": pod["metadata"].get("uid"),
+            "container_id": statuses[0]["containerID"],
+            "image_id": statuses[0].get("imageID"),
+            **record,
+        }
+        before = self._remote_control(handle, "status")
+        stop_result = None
+        if before.get("state") == "running":
+            stop_result = self.stop_load(context, handle)
+            if stop_result.get("stopped") is not True:
+                raise RuntimeError("orphaned controlled load stop was not confirmed")
+        after = self._remote_control(handle, "status")
+        if after.get("state") != "completed" or after.get("stopped") is not True:
+            raise RuntimeError("orphaned controlled load termination could not be verified")
+        return {
+            "found": True,
+            "stopped": True,
+            "remote_pid": record["remote_pid"],
+            "start_ticks": record["start_ticks"],
+            "pod_uid": handle["pod_uid"],
+            "container_id": handle["container_id"],
+            "status_before": before,
+            "stop_result": stop_result,
+            "status_after": after,
+            "identity_source": "pod_uid_and_proc_start_ticks",
+        }
 
     def collect_summary(
         self, context: Dict[str, Any], handle: Dict[str, Any]

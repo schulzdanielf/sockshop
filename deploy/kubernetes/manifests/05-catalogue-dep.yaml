@@ -22,6 +22,9 @@ spec:
         command: ["/app"]
         args:
         - -port=80
+        env:
+        - name: ZIPKIN
+          value: http://otel-collector.monitoring.svc.cluster.local:9411/api/v1/spans
         resources:
           limits:
             cpu: 200m

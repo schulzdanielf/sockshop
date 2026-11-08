@@ -6,7 +6,7 @@ import copy
 import json
 from typing import Any
 
-MODEL_EVIDENCE_CONTEXT_CHARS = 56000
+MODEL_EVIDENCE_CONTEXT_CHARS = 120_000
 PROJECTION_VERSION = "structured-evidence-v2"
 EVIDENCE_FORMAT_NOTICE = (
     "Evidencias compactadas sao objetos JSON. Tabelas columns/rows preservam os "
@@ -120,11 +120,16 @@ def columnar_projection(value: Any, pointer: str) -> Any:
     return rows
 
 
-def compact_evidence_for_model(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def compact_evidence_for_model(
+    evidence: list[dict[str, Any]], *, char_budget: int | None = None,
+) -> list[dict[str, Any]]:
+    budget = MODEL_EVIDENCE_CONTEXT_CHARS if char_budget is None else char_budget
+    if budget <= 0:
+        raise ValueError("structured evidence context budget must be positive")
     if not evidence:
         return []
     if all(item.get("projection_version") == PROJECTION_VERSION for item in evidence):
-        if len(_json(evidence)) > MODEL_EVIDENCE_CONTEXT_CHARS:
+        if len(_json(evidence)) > budget:
             raise ValueError("structured evidence exceeds the model context budget")
         for item in evidence:
             if not isinstance(item["arguments_summary"], dict) or not isinstance(
@@ -167,7 +172,7 @@ def compact_evidence_for_model(evidence: list[dict[str, Any]]) -> list[dict[str,
         ]
 
     encoded = encode()
-    while len(_json(encoded)) > MODEL_EVIDENCE_CONTEXT_CHARS:
+    while len(_json(encoded)) > budget:
         candidates = [
             candidate
             for _, _, digest in projections

@@ -32,15 +32,24 @@ from .analysis.edge_latency import (
     build_edge_latency_queries,
     normalize_edge_latency_result,
 )
+from .analysis.istio_edges import http_status_query
 from .analysis.llm_client import LLMClientError, call_llm_tool_messages
 from .analysis.system_card import load_system_card, render_system_card
 from .evidence_projection import compact_evidence_for_model, EVIDENCE_FORMAT_NOTICE
-from .analysis.telemetry_coverage import termination_query, termination_summary
-from .rca_options import validate_possible_fault_types
+from .analysis.telemetry_coverage import (
+    phase_series_summary,
+    termination_query,
+    termination_summary,
+)
+from .rca_options import (
+    MAX_ADDITIONAL_MCP_CHECKS,
+    validate_possible_fault_types,
+)
 
 SKILL_DIR = Path(__file__).resolve().parents[3] / ".github" / "skills" / "rca"
 MAX_LOG_SERVICES = 6
 MAX_LOG_LINES = 150
+MAX_SKILL_MODEL_ATTEMPTS = 3
 _RAW_OVERRIDE = object()
 TOOL_ERRORS = (
     httpx.HTTPError,
@@ -66,6 +75,33 @@ class InvestigationPlan(StrictModel):
     candidates: list[str] = Field(min_length=1, max_length=3)
     hypotheses: list[str] = Field(min_length=2, max_length=5)
     reasoning: str = Field(min_length=1, max_length=2000)
+
+
+class SkillAdditionalCheck(StrictModel):
+    kind: Literal[
+        "logs",
+        "traces",
+        "trace_detail",
+        "cpu",
+        "memory",
+        "lifecycle",
+        "cpu_throttling",
+        "gc",
+        "http",
+        "network",
+    ]
+    service: str
+    phase: Literal["baseline", "fault", "post"]
+    hypothesis: str = Field(min_length=1, max_length=600)
+    expected_support: str = Field(min_length=1, max_length=600)
+    expected_refutation: str = Field(min_length=1, max_length=600)
+    patterns: list[str] = Field(default_factory=list, max_length=5)
+
+
+class SkillAdditionalCheckDecision(StrictModel):
+    action: Literal["query", "stop"]
+    reason: str = Field(min_length=1, max_length=1000)
+    check: SkillAdditionalCheck | None
 
 
 class Alternative(StrictModel):
@@ -222,6 +258,163 @@ def _edge_latency_candidates(
     return candidates
 
 
+def _prepare_skill_additional_check(
+    check: SkillAdditionalCheck,
+    namespace: str,
+    windows: dict[str, dict[str, str]],
+    known_services: set[str],
+    calls: list[dict[str, Any]],
+    tools: dict[str, dict[str, Any]],
+) -> tuple[
+    str,
+    dict[str, Any],
+    str,
+    Callable[[dict[str, Any]], dict[str, Any]] | None,
+    dict[str, Any] | None,
+]:
+    if check.service not in known_services or check.phase not in windows:
+        raise SkillRCAError("Additional check is outside the known service/time scope")
+    window = windows[check.phase]
+    family = "metrics"
+    normalize = None
+    candidate = None
+
+    if check.kind == "logs":
+        name, family = "loki_range_query", "logs"
+        query = (
+            f'{{namespace="{namespace}",container=~"{check.service}|istio-proxy",'
+            f'pod=~"^{re.escape(check.service)}(-[a-z0-9]+)*$"}}'
+        )
+        if any(not pattern or len(pattern) > 160 for pattern in check.patterns):
+            raise SkillRCAError("Additional log patterns must be non-empty and bounded")
+        if check.patterns:
+            expression = "|".join(re.escape(pattern) for pattern in check.patterns)
+            query += " |~ " + json.dumps(expression)
+        arguments = {
+            "query": query,
+            "start": window["start"],
+            "end": window["end"],
+            "limit": MAX_LOG_LINES,
+        }
+
+        def normalize_logs(raw: dict[str, Any]) -> dict[str, Any]:
+            normalized = _rca_normalize_loki_range_result(
+                raw,
+                service=check.service,
+                namespace=namespace,
+                fault_window=window,
+                line_limit=MAX_LOG_LINES,
+            )
+            phases = normalized.get("phases") or {}
+            if "fault" in phases:
+                normalized["phases"] = {check.phase: phases["fault"]}
+            return normalized
+
+        normalize = normalize_logs
+    elif check.kind == "trace_detail":
+        name, family = "tempo_analyze_trace", "traces"
+        candidate = _rca_next_trace_candidate(calls)
+        if candidate is None or candidate.get("phase") != check.phase:
+            raise SkillRCAError("No matching current trace candidate is available")
+        if candidate.get("service") and candidate["service"] != check.service:
+            raise SkillRCAError("Trace candidate belongs to a different service")
+        arguments = {"trace_id": candidate["trace_id"]}
+        normalize = lambda raw: _rca_normalize_trace_result(raw, candidate)
+    elif check.kind == "traces":
+        name, family = "tempo_service_graph_phases", "traces"
+        arguments = _rca_tool_arguments(
+            name,
+            {},
+            (tools.get(name) or {}).get("inputSchema") or {},
+            phases=windows,
+            namespace=namespace,
+        )
+        arguments["query"] = (
+            f'{{ resource.k8s.namespace.name = "{namespace}" '
+            f'&& resource.service.name = "{check.service}" }}'
+        )
+    elif check.kind in {"cpu", "memory"}:
+        name, family = f"get_{check.kind}_saturation_top", "metrics"
+        arguments = {
+            "start": window["start"],
+            "end": window["end"],
+            "namespace": namespace,
+            "service": check.service,
+            "step": "15s",
+            "k": 3,
+        }
+    elif check.kind in {
+        "lifecycle",
+        "cpu_throttling",
+        "gc",
+        "http",
+        "network",
+    }:
+        name, family = "prometheus_range_query", "metrics"
+        namespace_selector = json.dumps(namespace)
+        workload_selector = json.dumps(check.service)
+        pod_selector = json.dumps(
+            f"^{re.escape(check.service)}-[a-z0-9]+-[a-z0-9]+$"
+        )
+        if check.kind == "lifecycle":
+            query = termination_query(namespace, [check.service])
+        elif check.kind == "cpu_throttling":
+            selector = f"namespace={namespace_selector},pod=~{pod_selector}"
+            query = (
+                f"100 * sum(rate(container_cpu_cfs_throttled_periods_total{{{selector}}}[1m]))"
+                f" / sum(rate(container_cpu_cfs_periods_total{{{selector}}}[1m]))"
+            )
+        elif check.kind == "gc":
+            query = (
+                "sum by(gc)(rate(jvm_gc_collection_seconds_sum{"
+                f"kubernetes_namespace={namespace_selector},kubernetes_name={workload_selector}"
+                "}[1m]))"
+            )
+        elif check.kind == "http":
+            query = http_status_query(namespace, check.service)
+        else:
+            selector = (
+                f"destination_workload_namespace={namespace_selector},"
+                f'destination_workload={workload_selector},reporter="source",'
+                'source_workload!="unknown"'
+            )
+            group = "sum by(source_workload,destination_workload)"
+            query = (
+                f"{group}(rate(istio_request_duration_milliseconds_sum{{{selector}}}[1m]))"
+                f" / {group}(rate(istio_request_duration_milliseconds_count{{{selector}}}[1m]))"
+            )
+        arguments = {
+            "query": query,
+            "start": windows["baseline"]["start"],
+            "end": windows.get("post", windows["fault"])["end"],
+            "step": "15s",
+        }
+        if check.kind == "lifecycle":
+            normalize = lambda raw: termination_summary(raw, windows)
+        elif check.kind in {"cpu_throttling", "gc", "http", "network"}:
+            purposes = {
+                "cpu_throttling": ("cpu_throttling", "%"),
+                "gc": ("gc_collection_time", "s/s"),
+                "http": ("http_status_rates", "req/s"),
+                "network": ("network_edge_latency", "ms"),
+            }
+            purpose, unit = purposes[check.kind]
+            normalize = lambda raw: phase_series_summary(
+                raw, windows, purpose=purpose, unit=unit, service=check.service,
+                namespace=namespace,
+            )
+    else:
+        raise SkillRCAError(f"Unsupported additional check kind: {check.kind}")
+
+    if name not in tools:
+        raise SkillRCAError(f"Requested MCP tool unavailable: {name}")
+    if any(
+        call["tool"] == name and call["arguments"] == arguments for call in calls
+    ):
+        raise SkillRCAError("Additional check repeats an executed MCP query")
+    return name, arguments, family, normalize, candidate
+
+
 def validate_diagnosis(
     diagnosis: Diagnosis,
     evidence: list[dict[str, Any]],
@@ -359,11 +552,15 @@ def answer_skill_rca(
     mcp_client: Any,
     phases: dict[str, dict[str, str]],
     namespace: str,
+    max_additional_checks: int = 0,
     window_metadata: dict[str, Any] | None = None,
     possible_fault_types: list[str] | None = None,
     require_best_guess: bool = False,
     archive_traces: dict[str, Any] | None = None,
     evidence_source: Literal["live", "history"] = "live",
+    model: str | None = None,
+    temperature: float | None = None,
+    seed: int | None = None,
     llm: Callable[..., dict[str, Any]] = call_llm_tool_messages,
 ) -> dict[str, Any]:
     skill, references, skill_hash = load_skill()
@@ -373,6 +570,15 @@ def answer_skill_rca(
     if require_best_guess and not possible_fault_types:
         raise SkillRCAError(
             "Best-guess classification requires benchmark fault-type options"
+        )
+    if (
+        isinstance(max_additional_checks, bool)
+        or not isinstance(max_additional_checks, int)
+        or not 0 <= max_additional_checks <= MAX_ADDITIONAL_MCP_CHECKS
+    ):
+        raise SkillRCAError(
+            "Additional MCP check budget must be between zero and "
+            f"{MAX_ADDITIONAL_MCP_CHECKS}"
         )
     if not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", namespace):
         raise SkillRCAError("Invalid namespace")
@@ -426,6 +632,10 @@ def answer_skill_rca(
         arguments: dict[str, Any],
         normalize: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         raw_override: Any = _RAW_OVERRIDE,
+        *,
+        service: str | None = None,
+        phase: str | None = None,
+        kind: str | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
         if raw_override is not _RAW_OVERRIDE:
@@ -451,8 +661,10 @@ def answer_skill_rca(
                 result = {"status": "tool_error", "error": _mcp_exception_detail(exc)}
         result = _sanitize(result)
         try:
-            count = _observation_count(name, result)
+            count = _observation_count(name, result, phase)
             fault_count = _observation_count(name, result, "fault")
+            if kind in {"cpu", "memory"}:
+                fault_count = count if phase == "fault" else 0
             if count < 0 or fault_count < 0:
                 raise SkillRCAError("MCP observation counts cannot be negative")
         except (ValueError, TypeError, AttributeError) as exc:
@@ -478,14 +690,20 @@ def answer_skill_rca(
             "fault_observation_count": fault_count,
             "arguments": arguments,
             "digest": _rca_tool_digest(name, result),
+            **({"service": service} if service else {}),
+            **({"phase": phase} if phase else {}),
         }
         evidence.append(item)
         calls.append(
             {
                 "tool": name,
+                "level": level,
                 "arguments": arguments,
                 "duration_ms": round((time.monotonic() - started) * 1000),
                 "result": {**result, "status": status},
+                **({"service": service} if service else {}),
+                **({"phase": phase} if phase else {}),
+                **({"kind": kind} if kind else {}),
             }
         )
         if status != "ok":
@@ -513,6 +731,7 @@ def answer_skill_rca(
         *,
         allowed_fault_types: list[str] | None = None,
         allowed_services: list[str] | None = None,
+        validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         output_schema = schema.model_json_schema()
         if allowed_fault_types:
@@ -533,6 +752,10 @@ def answer_skill_rca(
             required = output_schema.setdefault("required", [])
             if "primary_service" not in required:
                 required.append("primary_service")
+        if schema is SkillAdditionalCheckDecision:
+            check_schema = output_schema["$defs"]["SkillAdditionalCheck"]["properties"]
+            check_schema["service"]["enum"] = sorted(known)
+            check_schema["phase"]["enum"] = sorted(windows)
         messages.append(
             {
                 "role": "user",
@@ -548,7 +771,7 @@ def answer_skill_rca(
                 ),
             }
         )
-        for attempt in range(3):
+        for attempt in range(MAX_SKILL_MODEL_ATTEMPTS):
             # Each stage already carries its observations and current evidence.
             current_stage = next(
                 index
@@ -562,6 +785,13 @@ def answer_skill_rca(
                 if message["role"] in {"user", "system"}
                 and not message["content"].startswith(('{"stage":', "Resposta invalida:"))
             ] + messages[current_stage:]
+            generation_options: dict[str, Any] = {}
+            if model is not None:
+                generation_options["model"] = model
+            if temperature is not None:
+                generation_options["temperature"] = temperature
+            if seed is not None:
+                generation_options["seed"] = seed
             response = llm(
                 model_messages,
                 [],
@@ -576,10 +806,13 @@ def answer_skill_rca(
                         "schema": output_schema,
                     },
                 },
+                **generation_options,
             )
             try:
                 value = _json_content(response)
-                schema.model_validate(value)
+                validated = schema.model_validate(value).model_dump()
+                if validator is not None:
+                    validator(validated)
                 if (
                     allowed_fault_types
                     and value.get("fault_type") not in allowed_fault_types
@@ -604,7 +837,7 @@ def answer_skill_rca(
                         "error": _rca_redact_text(exc),
                     }
                 )
-                if attempt == 2:
+                if attempt + 1 == MAX_SKILL_MODEL_ATTEMPTS:
                     raise SkillRCAError(f"Qwen returned invalid {stage} JSON") from exc
                 messages.append(
                     {
@@ -633,6 +866,9 @@ def answer_skill_rca(
     planning_was_invalid = False
     golden_result: dict[str, Any] = {}
     edge_latency_results: list[dict[str, Any]] = []
+    additional_checks: list[dict[str, Any]] = []
+    additional_check_error: str | None = None
+    additional_check_stop_reason: str | None = None
     try:
         tools = {
             tool["name"]: tool
@@ -640,6 +876,21 @@ def answer_skill_rca(
             if isinstance(tool, dict) and isinstance(tool.get("name"), str)
         }
         messages.append({"role": "user", "content": references["evidence-contract.md"]})
+        messages.append({
+            "role": "user",
+            "content": (
+                "Em HTTP, distinga a aplicacao-alvo do proxy que respondeu. FI em "
+                "response_flags indica fault injection no proxy; destination_workload "
+                "unknown nao elimina a identidade quando o FQDN valida o servico. "
+                "Compare codigo/flags/aresta por reporter e busque logs do chamador "
+                "e seu istio-proxy ou spans CLIENT. Um abort pode impedir o span "
+                "SERVER e o log da aplicacao-alvo. Ausencia desses registros nao "
+                "comprova o abort; exija corroboracao da mesma ocorrencia. "
+                "Complemente com familias http_client_* e http_server_* do SDK, "
+                "por namespace/job e codigo/metodo/rota, separando probes de "
+                "trafego de negocio e respeitando as unidades dos histogramas."
+            ),
+        })
         for name, level in (
             ("get_run_golden_signals", 1),
             ("check_service_readiness", 2),
@@ -685,6 +936,17 @@ def answer_skill_rca(
             )
         if "prometheus_range_query" in tools:
             query_end = windows.get("post", windows["fault"])["end"]
+            query(
+                "prometheus_range_query", 1, "metrics",
+                {
+                    "query": http_status_query(namespace),
+                    "start": windows["baseline"]["start"], "end": query_end, "step": "15s",
+                },
+                lambda raw: phase_series_summary(
+                    raw, windows, purpose="http_status_rates", unit="req/s",
+                    service=None, namespace=namespace,
+                ),
+            )
             for spec in build_edge_latency_queries(namespace, sorted(known)):
                 arguments = {
                     "query": spec["query"],
@@ -759,10 +1021,10 @@ def answer_skill_rca(
             for phase_name, window in windows.items():
                 if phase_name not in {"baseline", "fault", "post"}:
                     continue
-                # Exact container identity excludes matching app-db pods and sidecars.
+                # Keep proxy failures on the same pod, without including app-db pods.
                 arguments = {
                     "query": (
-                        f'{{namespace="{namespace}",container="{service}",'
+                        f'{{namespace="{namespace}",container=~"{service}|istio-proxy",'
                         'pod=~"^'
                         + re.escape(service).replace(r"\-", "-")
                         + '(-[a-z0-9]+)*$"}'
@@ -830,6 +1092,145 @@ def answer_skill_rca(
                 namespace=namespace,
             )
             query(name, 4, "metrics", arguments)
+        additional_check_kinds = (
+            "cpu",
+            "memory",
+            "lifecycle",
+            "cpu_throttling",
+            "gc",
+            "http",
+            "network",
+            "logs",
+            "traces",
+            "trace_detail",
+        )
+        for check_round in range(max_additional_checks):
+            executable_checks = []
+            for kind in additional_check_kinds:
+                for service in sorted(known):
+                    for phase_name in ("baseline", "fault", "post"):
+                        if phase_name not in windows:
+                            continue
+                        patterns = [kind] if kind == "logs" else []
+                        candidate_check = SkillAdditionalCheck(
+                            kind=kind,
+                            service=service,
+                            phase=phase_name,
+                            hypothesis="Inventory candidate",
+                            expected_support="Inventory candidate",
+                            expected_refutation="Inventory candidate",
+                            patterns=patterns,
+                        )
+                        try:
+                            name, _, _, _, _ = (
+                                _prepare_skill_additional_check(
+                                    candidate_check,
+                                    namespace,
+                                    windows,
+                                    known,
+                                    calls,
+                                    tools,
+                                )
+                            )
+                        except SkillRCAError:
+                            continue
+                        executable_checks.append(
+                            {
+                                "kind": kind,
+                                "service": service,
+                                "phase": phase_name,
+                                "tool": name,
+                                "patterns_required": kind == "logs",
+                            }
+                        )
+            if not executable_checks:
+                additional_check_stop_reason = "no_executable_checks"
+                break
+
+            def validate_additional_check(value: dict[str, Any]) -> None:
+                check_value = value.get("check")
+                if value["action"] == "stop":
+                    if check_value is not None:
+                        raise ValueError("stop decision must not include a check")
+                    return
+                if check_value is None:
+                    raise ValueError("query decision must include a check")
+                check = SkillAdditionalCheck.model_validate(check_value)
+                _prepare_skill_additional_check(
+                    check, namespace, windows, known, calls, tools
+                )
+
+            try:
+                decision = SkillAdditionalCheckDecision.model_validate(
+                    model_json(
+                        "additional_mcp_check",
+                        SkillAdditionalCheckDecision,
+                        {
+                            "round": check_round + 1,
+                            "max_additional_checks": max_additional_checks,
+                            "plan": plan.model_dump(),
+                            "restarted_services": restarted,
+                            "edge_latency_candidates": edge_candidates,
+                            "evidence": compact_evidence_for_model(evidence),
+                            "previous_checks": additional_checks,
+                            "executable_checks": executable_checks,
+                            "rules": [
+                                "Selecione no máximo um check executável desta rodada ou pare com motivo.",
+                                "Priorize checks que discriminem hipóteses ainda abertas; não repita uma consulta.",
+                                "Escolha o serviço e a fase a partir do inventário; logs exigem padrões literais observados.",
+                                "Histórico consultado é evidência do run atual; não invente métricas nem resultados.",
+                                "Se não houver pergunta diagnóstica útil, pare antes do limite.",
+                            ],
+                        },
+                        validator=validate_additional_check,
+                    )
+                )
+            except (*TOOL_ERRORS, LLMClientError, SkillRCAError, ValidationError) as exc:
+                additional_check_error = _rca_redact_text(
+                    _mcp_exception_detail(exc)
+                )
+                additional_check_stop_reason = "additional_check_model_error"
+                limitations.append(
+                    "Checks adicionais interrompidos por erro do modelo: "
+                    + additional_check_error
+                )
+                break
+
+            if decision.action == "stop":
+                additional_check_stop_reason = decision.reason
+                break
+            check = decision.check
+            if check is None:
+                additional_check_stop_reason = "query_decision_missing_check"
+                break
+            name, arguments, family, normalize, candidate = (
+                _prepare_skill_additional_check(
+                    check, namespace, windows, known, calls, tools
+                )
+            )
+            result = query(
+                name,
+                5,
+                family,
+                arguments,
+                normalize,
+                service=check.service,
+                phase=check.phase,
+                kind=check.kind,
+            )
+            additional_checks.append(
+                {
+                    "check": check.model_dump(),
+                    "evidence_id": evidence[-1]["id"],
+                    "status": evidence[-1]["status"],
+                    "tool": name,
+                    "service": check.service,
+                    "phase": check.phase,
+                    "result": _rca_tool_digest(name, result),
+                }
+            )
+            if check_round + 1 == max_additional_checks:
+                additional_check_stop_reason = "max_additional_mcp_checks"
         limitations.append(
             "Eventos Kubernetes historicos, exit code e motivos de probes nao foram "
             "consultados diretamente; nao inventar o motivo de um restart"
@@ -843,6 +1244,9 @@ def answer_skill_rca(
                     "plan": plan.model_dump(),
                     "restarted_services": restarted,
                     "edge_latency_candidates": edge_candidates,
+                    "additional_checks": additional_checks,
+                    "additional_check_stop_reason": additional_check_stop_reason,
+                    "additional_check_error": additional_check_error,
                     "collection_limitations": limitations,
                     "possible_fault_types": possible_fault_types,
                     "known_services": sorted(known),
@@ -913,6 +1317,9 @@ def answer_skill_rca(
         "reference_source": reference_source,
         "calls": calls,
         "evidence": evidence,
+        "additional_checks": additional_checks,
+        "additional_check_stop_reason": additional_check_stop_reason,
+        "additional_check_error": additional_check_error,
         "evidence_bundle": bundle,
         "model_attempts": model_attempts,
         "tools_used": [call["tool"] for call in calls],

@@ -4,6 +4,7 @@ import yaml
 
 from experiment.eval.memory_hog import controlled_campaign
 from experiment.eval.memory_hog import exploratory_rag_campaign as exploratory
+from experiment.platform.backend import rca_knowledge as knowledge
 from experiment.platform.backend.rca_knowledge import digest
 
 
@@ -85,9 +86,10 @@ def test_test_only_preparation_reuses_existing_corpus_and_open_search(
             return base
 
     class Index:
-        def __init__(self, url, sha256):
+        def __init__(self, url, sha256, *, retriever_version):
             assert url == exploratory.DEFAULT_OPENSEARCH_URL
             assert sha256 == "b" * 64
+            assert retriever_version == knowledge.OPENSEARCH_RETRIEVER_VERSION
 
         def connect_existing(self, *, expected_pair_ids, expected_a_text_version):
             assert expected_pair_ids == {pair["pair_id"] for pair in pairs}

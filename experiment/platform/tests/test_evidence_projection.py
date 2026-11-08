@@ -20,6 +20,22 @@ def item(identifier, digest):
     }
 
 
+def test_explicit_budget_keeps_protected_facts_and_records_omissions():
+    evidence = [item("N001", {
+        "top_delta": [{"service": "catalogue", "baseline": 15.07, "fault": 54.73}],
+        "traces": [{"traceID": str(index), "details": "span-" * 40} for index in range(40)],
+    })]
+    original = copy.deepcopy(evidence)
+    compact = projection.compact_evidence_for_model(evidence, char_budget=2000)
+    text = json.dumps(compact, separators=(",", ":"), ensure_ascii=False)
+    assert len(text) <= 2000
+    assert "54.73" in text and "15.07" in text
+    assert "projection_omitted_traces_count" in text
+    assert evidence == original
+    with pytest.raises(ValueError, match="must be positive"):
+        projection.compact_evidence_for_model(evidence, char_budget=0)
+
+
 def test_preserves_metric_edge_and_event_facts_even_when_last_in_large_payload():
     facts = {
         "metrics": {
@@ -64,7 +80,7 @@ def test_preserves_metric_edge_and_event_facts_even_when_last_in_large_payload()
             }
         },
     }
-    raw = item("E001", {"observations": ["generic latency"] * 5000, **facts})
+    raw = item("E001", {"observations": ["generic latency"] * 8000, **facts})
     original = copy.deepcopy(raw)
     compacted = projection.compact_evidence_for_model([raw])
     digest = compacted[0]["digest_summary"]
@@ -97,6 +113,25 @@ def test_preserves_trace_errors_and_lifecycle_reason_lists():
     digest = compacted[0]["digest_summary"]
     for key in ("critical_path", "error_spans", "termination_events"):
         assert digest[key] == raw["digest"][key]
+
+
+def test_preserves_large_critical_evidence_within_expanded_context_budget():
+    rows = [
+        {"service": f"service-{index}", "fact": "x" * 80}
+        for index in range(800)
+    ]
+    compacted = projection.compact_evidence_for_model(
+        [item("E001", {"critical_path": rows})]
+    )
+    encoded = json.dumps(compacted, ensure_ascii=False, sort_keys=True)
+    critical_path = compacted[0]["digest_summary"]["critical_path"]
+
+    assert 56_000 < len(encoded) <= projection.MODEL_EVIDENCE_CONTEXT_CHARS
+    assert critical_path["source_pointer"] == "/digest/critical_path"
+    assert [
+        dict(zip(critical_path["columns"], row))
+        for row in critical_path["rows"]
+    ] == rows
 
 
 def test_large_critical_payload_is_an_explicit_error_not_empty_success():
