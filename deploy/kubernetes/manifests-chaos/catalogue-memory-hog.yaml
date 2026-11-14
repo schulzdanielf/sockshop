@@ -151,7 +151,7 @@ spec:
                               value: "120"
                             - name: CHAOS_KILL_COMMAND
                               value: >-
-                                kill -9 $(ps afx | grep "[dd] if /dev/zero" | awk '{print $1}' |
+                                kill -9 $(ps afx | grep "[s]tress-ng.*--vm-bytes" | awk '{print $1}' |
                                 tr '
 
                                 ' ' ')

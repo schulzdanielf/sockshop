@@ -13,6 +13,7 @@ from experiment.platform.backend.rca_knowledge import (
     VERSION,
     write_once,
 )
+from experiment.platform.backend.resource_signature import resource_signature_metadata
 
 
 def config(tmp_path):
@@ -20,6 +21,22 @@ def config(tmp_path):
     config = campaign.build_config(source, tmp_path, "rag", 42, {})
     config["historical_observability"] = {"required": False}
     return config
+
+
+def skill_response(budget, *, resource_signature_policy="none"):
+    return {
+        "status": "inconclusive",
+        "model_calls": 0,
+        "total_tokens": 0,
+        "budget": {
+            **budget,
+            "model_calls_used": 0,
+            "total_tokens_used": 0,
+            "additional_checks_used": 0,
+        },
+        "additional_checks": [],
+        "resource_signature": resource_signature_metadata(resource_signature_policy),
+    }
 
 
 def test_exact_matrix_and_split(tmp_path):
@@ -52,9 +69,7 @@ def test_unvalidated_experimental_policy_only_applies_to_exploratory_rag(tmp_pat
 
 def test_unvalidated_procedural_policy_only_applies_to_exploratory_rag(tmp_path):
     cfg = config(tmp_path)
-    cfg["knowledge_campaign"][
-        "include_unvalidated_procedural_experimental"
-    ] = True
+    cfg["knowledge_campaign"]["include_unvalidated_procedural_experimental"] = True
 
     assert (
         rag.options_for(cfg, "exploratory_rag")[
@@ -64,9 +79,7 @@ def test_unvalidated_procedural_policy_only_applies_to_exploratory_rag(tmp_path)
     )
     for mode in ("original", "exploratory_control"):
         assert (
-            rag.options_for(cfg, mode)[
-                "include_unvalidated_procedural_experimental"
-            ]
+            rag.options_for(cfg, mode)["include_unvalidated_procedural_experimental"]
             is False
         )
 
@@ -115,6 +128,36 @@ def test_exploratory_modes_use_a_bounded_token_budget(tmp_path):
     assert (
         rag.options_for(cfg, "exploratory_rag")["max_total_tokens"]
         == rag.EXPLORATORY_MAX_TOTAL_TOKENS
+    )
+
+
+def test_shared_resource_signature_is_forwarded_to_skill_and_rag(tmp_path):
+    cfg = config(tmp_path)
+    cfg["knowledge_campaign"]["resource_signature_policy"] = "cpu-memory-v1"
+
+    for mode in ("original", "exploratory_rag"):
+        assert (
+            rag.options_for(cfg, mode)["resource_signature_policy"] == "cpu-memory-v1"
+        )
+
+
+def test_resource_signature_response_is_verified_even_without_history_gate():
+    cfg = {
+        "knowledge_campaign": {
+            "resource_signature_policy": "cpu-memory-v1",
+        },
+        "historical_observability": {"required": False},
+    }
+
+    with pytest.raises(ValueError, match="pinned resource signature"):
+        rag.validate_historical_diagnostic(cfg, "original", {"status": "inconclusive"})
+    rag.validate_historical_diagnostic(
+        cfg,
+        "original",
+        {
+            "status": "inconclusive",
+            "resource_signature": resource_signature_metadata("cpu-memory-v1"),
+        },
     )
 
 
@@ -179,7 +222,10 @@ def test_dual_write_history_gate_waits_for_online_readback(monkeypatch, tmp_path
             assert path == "/api/runs/run-test/history/validation"
             self.calls += 1
             if self.calls == 1:
-                return {"status": "pending", "telemetry": {"logs": {"status": "pending"}}}
+                return {
+                    "status": "pending",
+                    "telemetry": {"logs": {"status": "pending"}},
+                }
             return {
                 "status": "complete",
                 "mode": "dual_write",
@@ -368,9 +414,7 @@ def test_historical_rag_validation_uses_campaign_retriever_version(
     )
 
 
-def test_process_cell_retries_one_persisted_diagnostic_error(
-    monkeypatch, tmp_path
-):
+def test_process_cell_retries_one_persisted_diagnostic_error(monkeypatch, tmp_path):
     cfg = config(tmp_path)
     cfg["knowledge_campaign"]["exploratory"] = True
     cell = cfg["test_experiments"][0]
@@ -403,7 +447,7 @@ def test_process_cell_retries_one_persisted_diagnostic_error(
     def post(path, *, body, request_timeout):
         responses.append((path, body, request_timeout))
         if path.endswith("/skill-rca"):
-            return {"status": "inconclusive"}
+            return skill_response(rag.skill_model_budget(cfg))
         return {"status": "confirmed", "version": VERSION}
 
     api = Mock()
@@ -428,9 +472,7 @@ def test_process_cell_retries_one_persisted_diagnostic_error(
     assert any(body.get("max_total_tokens") == 300_000 for _, body, _ in responses)
 
 
-def test_process_cell_allows_a_bounded_corrective_retry(
-    monkeypatch, tmp_path
-):
+def test_process_cell_allows_a_bounded_corrective_retry(monkeypatch, tmp_path):
     cfg = config(tmp_path)
     cfg["knowledge_campaign"]["exploratory"] = True
     cell = cfg["test_experiments"][0]
@@ -463,7 +505,7 @@ def test_process_cell_allows_a_bounded_corrective_retry(
 
     def post(path, *, body, request_timeout):
         if path.endswith("/skill-rca"):
-            return {"status": "inconclusive"}
+            return skill_response(rag.skill_model_budget(cfg))
         return {"status": "confirmed", "version": VERSION}
 
     api = Mock()
@@ -488,12 +530,17 @@ def test_process_cell_stops_after_maximum_diagnostic_retries(
     results = directory / "rag_results" / cell["cell_id"]
     results.mkdir(parents=True)
     for method in ("original", "exploratory_rag"):
+        response = (
+            skill_response(rag.skill_model_budget(cfg))
+            if method == "original"
+            else {"status": "inconclusive"}
+        )
         write_once(
             results / f"{method}.json",
             {
                 "run_id": "run-test",
                 "method": method,
-                "response": {"status": "inconclusive"},
+                "response": response,
             },
         )
     write_once(
@@ -531,10 +578,13 @@ def test_exploratory_run_can_pause_after_first_test(monkeypatch, tmp_path):
 
     monkeypatch.setattr(exploratory.controlled_campaign, "execute", execute)
 
-    assert exploratory.run_campaign(
-        directory,
-        stop_after_first_test=True,
-    ) == 0
+    assert (
+        exploratory.run_campaign(
+            directory,
+            stop_after_first_test=True,
+        )
+        == 0
+    )
     assert calls == {
         "path": directory.resolve(),
         "resume": False,
@@ -592,21 +642,36 @@ def test_exploratory_manifest_counter_reconciles_unique_started_test_attempts(tm
     cfg = config(tmp_path)
     cfg["knowledge_campaign"]["exploratory"] = True
     manifest_path = tmp_path / "exploratory_manifest.json"
-    manifest_path.write_text(json.dumps({
-        "mode": "exploratory",
-        "corpus_id": cfg["knowledge_campaign"]["corpus_id"],
-        "test_runs_started": 0,
-    }))
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "mode": "exploratory",
+                "corpus_id": cfg["knowledge_campaign"]["corpus_id"],
+                "test_runs_started": 0,
+            }
+        )
+    )
     first, second = cfg["test_experiments"][:2]
     ledger = [
         {"cell_id": cfg["train_experiments"][0]["cell_id"], "run_id": "train-1"},
-        {"cell_id": first["cell_id"], "attempt": 1, "run_id": "test-1", "status": "submitted"},
-        {"cell_id": first["cell_id"], "attempt": 1, "run_id": "test-1", "status": "aborted"},
+        {
+            "cell_id": first["cell_id"],
+            "attempt": 1,
+            "run_id": "test-1",
+            "status": "submitted",
+        },
+        {
+            "cell_id": first["cell_id"],
+            "attempt": 1,
+            "run_id": "test-1",
+            "status": "aborted",
+        },
         {"cell_id": second["cell_id"], "attempt": 1, "status": "prepared"},
     ]
 
     assert rag.reconcile_exploratory_test_runs(tmp_path, cfg, ledger) == {
-        "previous": 0, "reconciled": 1,
+        "previous": 0,
+        "reconciled": 1,
     }
     assert json.loads(manifest_path.read_text())["test_runs_started"] == 1
     assert rag.reconcile_exploratory_test_runs(tmp_path, cfg, ledger) is None
@@ -616,11 +681,15 @@ def test_exploratory_manifest_rejects_counter_ahead_of_ledger(tmp_path):
     cfg = config(tmp_path)
     cfg["knowledge_campaign"]["exploratory"] = True
     manifest_path = tmp_path / "exploratory_manifest.json"
-    manifest_path.write_text(json.dumps({
-        "mode": "exploratory",
-        "corpus_id": cfg["knowledge_campaign"]["corpus_id"],
-        "test_runs_started": 2,
-    }))
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "mode": "exploratory",
+                "corpus_id": cfg["knowledge_campaign"]["corpus_id"],
+                "test_runs_started": 2,
+            }
+        )
+    )
 
     with pytest.raises(ValueError, match="absent from the ledger"):
         rag.reconcile_exploratory_test_runs(tmp_path, cfg, [])
@@ -631,11 +700,17 @@ def test_test_requests_contain_no_current_ground_truth_and_are_resumable(tmp_pat
     cell = cfg["test_experiments"][0]
     entry = {"run_id": "opaque-test", "status": "completed"}
     api = Mock()
-    api.post.return_value = {
-        "version": VERSION,
-        "status": "inconclusive",
-        "run_id": entry["run_id"],
-    }
+
+    def post(path, *, body, request_timeout):
+        if path.endswith("/skill-rca"):
+            return skill_response(rag.skill_model_budget(cfg))
+        return {
+            "version": VERSION,
+            "status": "inconclusive",
+            "run_id": entry["run_id"],
+        }
+
+    api.post.side_effect = post
     rag.process_cell(tmp_path, cfg, cell, entry, api)
     assert api.post.call_count == 3
     for call in api.post.call_args_list:
@@ -646,23 +721,75 @@ def test_test_requests_contain_no_current_ground_truth_and_are_resumable(tmp_pat
     assert api.post.call_count == 3
 
 
+def test_skill_results_without_matching_budget_are_not_resumable(tmp_path):
+    cfg = config(tmp_path)
+    budget = rag.skill_model_budget(cfg)
+
+    assert not rag._diagnostic_record_is_valid(
+        {
+            "method": "original",
+            "response": {"status": "inconclusive"},
+        },
+        method="original",
+        skill_budget=budget,
+    )
+    assert rag._diagnostic_record_is_valid(
+        {
+            "method": "original",
+            "response": skill_response(budget),
+        },
+        method="original",
+        skill_budget=budget,
+    )
+    assert not rag._diagnostic_record_is_valid(
+        {
+            "method": "original",
+            "response": skill_response(
+                {**budget, "max_total_tokens": budget["max_total_tokens"] - 1}
+            ),
+        },
+        method="original",
+        skill_budget=budget,
+    )
+
+
 def test_exploratory_diagnostics_require_best_guess_for_every_method(tmp_path):
     cfg = config(tmp_path)
     cfg["knowledge_campaign"]["exploratory"] = True
+    cfg["knowledge_campaign"]["resource_signature_policy"] = "cpu-memory-v1"
     cfg["historical_observability"]["required"] = False
     cell = cfg["test_experiments"][0]
     api = Mock()
-    api.post.return_value = {"version": VERSION, "status": "inconclusive"}
+
+    def post(path, *, body, request_timeout):
+        if path.endswith("/skill-rca"):
+            return skill_response(
+                rag.skill_model_budget(cfg),
+                resource_signature_policy="cpu-memory-v1",
+            )
+        return {
+            "version": VERSION,
+            "status": "inconclusive",
+            "resource_signature": resource_signature_metadata("cpu-memory-v1"),
+        }
+
+    api.post.side_effect = post
 
     rag.process_cell(
         tmp_path, cfg, cell, {"run_id": "opaque-test", "status": "completed"}, api
     )
 
     assert api.post.call_count == 3
-    assert all(call.kwargs["body"]["require_best_guess"] is True for call in api.post.call_args_list)
+    assert all(
+        call.kwargs["body"]["require_best_guess"] is True
+        for call in api.post.call_args_list
+    )
+    assert all(
+        call.kwargs["body"]["resource_signature_policy"] == "cpu-memory-v1"
+        for call in api.post.call_args_list
+    )
     original_call = next(
-        call for call in api.post.call_args_list
-        if call.args[0].endswith("/skill-rca")
+        call for call in api.post.call_args_list if call.args[0].endswith("/skill-rca")
     )
     assert original_call.kwargs["body"]["possible_fault_types"]
     assert (
@@ -670,9 +797,17 @@ def test_exploratory_diagnostics_require_best_guess_for_every_method(tmp_path):
         == cfg["knowledge_campaign"]["max_rounds"]
         == 4
     )
+    assert {
+        key: original_call.kwargs["body"][key]
+        for key in (
+            "max_model_calls",
+            "max_total_tokens",
+            "timeout_seconds",
+            "max_additional_checks",
+        )
+    } == rag.skill_model_budget(cfg)
     knowledge_calls = [
-        call for call in api.post.call_args_list
-        if call.args[0].endswith("/skill-rag")
+        call for call in api.post.call_args_list if call.args[0].endswith("/skill-rag")
     ]
     assert len(knowledge_calls) == 2
     assert all(
@@ -803,11 +938,14 @@ def test_exploratory_runner_can_pause_after_first_test_while_resuming(
         or 7,
     )
 
-    assert exploratory.run_campaign(
-        tmp_path,
-        resume=True,
-        stop_after_first_test=True,
-    ) == 7
+    assert (
+        exploratory.run_campaign(
+            tmp_path,
+            resume=True,
+            stop_after_first_test=True,
+        )
+        == 7
+    )
     assert calls == [(tmp_path.resolve(), True, True)]
 
 
@@ -922,8 +1060,11 @@ def test_full_70_run_orchestration_and_resume_without_cluster(monkeypatch, tmp_p
                 return {
                     "version": VERSION,
                     "modes": [
-                        "annotate", "control", "rag",
-                        "exploratory_control", "exploratory_rag",
+                        "annotate",
+                        "control",
+                        "rag",
+                        "exploratory_control",
+                        "exploratory_rag",
                     ],
                 }
             if path == "/api/runs":
@@ -965,6 +1106,8 @@ def test_full_70_run_orchestration_and_resume_without_cluster(monkeypatch, tmp_p
             else:
                 assert frozen
                 diagnostics.append((run_id, body.get("mode", "original")))
+            if path.endswith("/skill-rca"):
+                return skill_response(rag.skill_model_budget(cfg))
             return {
                 "version": VERSION,
                 "status": "inconclusive",
@@ -999,51 +1142,76 @@ def test_full_70_run_orchestration_and_resume_without_cluster(monkeypatch, tmp_p
 
 
 def test_reviewed_rag_training_retry_preserves_split_and_excludes_aborted_run(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     cfg = config(tmp_path)
     cells = campaign.campaign_cells(cfg)
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
     (tmp_path / "plan.json").write_text(json.dumps(cells))
     retry_cell = next(
-        cell for cell in cfg["train_experiments"]
+        cell
+        for cell in cfg["train_experiments"]
         if cell["chaos_type"] == "container-kill"
     )
     original_run_id = "aborted-training-run"
     retry_dir = campaign.attempt_directory(tmp_path, retry_cell["cell_id"], 1)
     retry_dir.mkdir(parents=True)
-    (retry_dir / "run.json").write_text(json.dumps({
-        "status": "failed",
-        "summary": {
-            "controlled_status": "aborted",
-            "controlled_gates": {
-                "submitted": True,
-                "mechanism_observed": {"passed": True, "restart_count_delta": 1},
-                "recovery": {"passed": False},
-                "cleanup": {"passed": True},
-                "load_stopped": {"stopped": True},
-                "application_stability": {"healthy": True},
-            },
+    (retry_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "summary": {
+                    "controlled_status": "aborted",
+                    "controlled_gates": {
+                        "submitted": True,
+                        "mechanism_observed": {
+                            "passed": True,
+                            "restart_count_delta": 1,
+                        },
+                        "recovery": {"passed": False},
+                        "cleanup": {"passed": True},
+                        "load_stopped": {"stopped": True},
+                        "application_stability": {"healthy": True},
+                    },
+                },
+            }
+        )
+    )
+    campaign.append_ledger(
+        tmp_path / "ledger.jsonl",
+        {
+            "cell_id": retry_cell["cell_id"],
+            "phase": "train",
+            "status": "aborted",
+            "attempt": 1,
+            "run_id": original_run_id,
         },
-    }))
-    campaign.append_ledger(tmp_path / "ledger.jsonl", {
-        "cell_id": retry_cell["cell_id"], "phase": "train", "status": "aborted",
-        "attempt": 1, "run_id": original_run_id,
-    })
+    )
 
     training_ids = set()
     for cell in cfg["train_experiments"]:
         if cell["cell_id"] == retry_cell["cell_id"]:
             continue
         run_id = f"completed-{cell['cell_id']}"
-        campaign.append_ledger(tmp_path / "ledger.jsonl", {
-            "cell_id": cell["cell_id"], "phase": "train", "status": "completed",
-            "attempt": 1, "run_id": run_id,
-        })
+        campaign.append_ledger(
+            tmp_path / "ledger.jsonl",
+            {
+                "cell_id": cell["cell_id"],
+                "phase": "train",
+                "status": "completed",
+                "attempt": 1,
+                "run_id": run_id,
+            },
+        )
         training_ids.add(run_id)
-        write_once(rag.result_path(tmp_path, cell, "annotate"), {
-            "run_id": run_id, "response": {"status": "inconclusive"},
-        })
+        write_once(
+            rag.result_path(tmp_path, cell, "annotate"),
+            {
+                "run_id": run_id,
+                "response": {"status": "inconclusive"},
+            },
+        )
 
     starts = []
     freeze_requests = []
@@ -1059,8 +1227,11 @@ def test_reviewed_rag_training_retry_preserves_split_and_excludes_aborted_run(
                 return {
                     "version": VERSION,
                     "modes": [
-                        "annotate", "control", "rag",
-                        "exploratory_control", "exploratory_rag",
+                        "annotate",
+                        "control",
+                        "rag",
+                        "exploratory_control",
+                        "exploratory_rag",
                     ],
                 }
             if path == "/api/runs":
@@ -1096,7 +1267,13 @@ def test_reviewed_rag_training_retry_preserves_split_and_excludes_aborted_run(
                 assert len(body["training_run_ids"]) == 35
                 assert original_run_id not in body["training_run_ids"]
                 assert "replacement-1" in body["training_run_ids"]
-                return {"version": VERSION, "sha256": "frozen-base", "eligible_count": 35}
+                return {
+                    "version": VERSION,
+                    "sha256": "frozen-base",
+                    "eligible_count": 35,
+                }
+            if path.endswith("/skill-rca"):
+                return skill_response(rag.skill_model_budget(cfg))
             return {
                 "version": VERSION,
                 "status": "inconclusive",
@@ -1109,16 +1286,22 @@ def test_reviewed_rag_training_retry_preserves_split_and_excludes_aborted_run(
     monkeypatch.setattr(campaign, "require_environment", lambda *args: None)
     monkeypatch.setattr(campaign, "require_controlled_backend", lambda *args: None)
     monkeypatch.setattr(campaign, "require_scrape_metadata_tool", lambda *args: None)
-    assert campaign.execute(
-        tmp_path, resume=True,
-        retry_reviewed_container_kill={retry_cell["cell_id"]},
-    ) == 0
+    assert (
+        campaign.execute(
+            tmp_path,
+            resume=True,
+            retry_reviewed_container_kill={retry_cell["cell_id"]},
+        )
+        == 0
+    )
 
     assert len(starts) == 36
     assert starts[0]["is_training"] is True
     assert len(freeze_requests) == 1
     assert len(training_ids) == 34
-    protocol = json.loads((tmp_path / campaign.RAG_REVIEWED_RETRY_PROTOCOL_FILE).read_text())
+    protocol = json.loads(
+        (tmp_path / campaign.RAG_REVIEWED_RETRY_PROTOCOL_FILE).read_text()
+    )
     assert protocol["previous_run_id"] == original_run_id
     assert protocol["additional_attempt_budget"] == 1
     assert protocol["split_unchanged"] == {"train": 35, "test": 35}
@@ -1136,7 +1319,8 @@ def test_reviewed_rag_training_retry_preserves_split_and_excludes_aborted_run(
     starts_before_duplicate = len(starts)
     with pytest.raises(RuntimeError, match="first-attempt training cell"):
         campaign.execute(
-            tmp_path, resume=True,
+            tmp_path,
+            resume=True,
             retry_reviewed_container_kill={retry_cell["cell_id"]},
         )
     assert len(starts) == starts_before_duplicate

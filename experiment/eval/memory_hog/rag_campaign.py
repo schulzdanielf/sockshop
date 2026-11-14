@@ -22,6 +22,8 @@ from experiment.platform.backend.rca_knowledge import (
     digest,
     write_once,
 )
+from experiment.platform.backend.rca_options import SkillRCABenchmarkOptions
+from experiment.platform.backend.resource_signature import resource_signature_metadata
 
 from .controlled_campaign import (
     campaign_cells,
@@ -30,9 +32,7 @@ from .controlled_campaign import (
 )
 
 METHODS = ("original", "control", "rag")
-EXPLORATORY_METHODS = (
-    "original", "exploratory_control", "exploratory_rag"
-)
+EXPLORATORY_METHODS = ("original", "exploratory_control", "exploratory_rag")
 EXPLORATORY_MAX_TOTAL_TOKENS = 300_000
 MAX_DIAGNOSTIC_RETRIES = 2
 TERMINAL = {"completed", "blocked", "aborted", "failed", "stopped"}
@@ -49,10 +49,9 @@ def reconcile_exploratory_test_runs(
 
     path = directory / "exploratory_manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        manifest.get("mode") != "exploratory"
-        or manifest.get("corpus_id") != knowledge.get("corpus_id")
-    ):
+    if manifest.get("mode") != "exploratory" or manifest.get(
+        "corpus_id"
+    ) != knowledge.get("corpus_id"):
         raise ValueError("exploratory manifest does not match the saved campaign")
 
     test_cells = {cell["cell_id"] for cell in config["test_experiments"]}
@@ -164,13 +163,72 @@ def result_path(directory: Path, cell: dict[str, Any], method: str) -> Path:
     return retries[-1] if retries else base
 
 
-def _diagnostic_record_is_valid(record: dict[str, Any]) -> bool:
-    response = record.get("response")
+def skill_model_budget(config: dict[str, Any]) -> dict[str, int]:
+    knowledge = config["knowledge_campaign"]
+    defaults = SkillRCABenchmarkOptions()
+    max_total_tokens = knowledge.get("max_total_tokens")
+    if max_total_tokens is None:
+        max_total_tokens = (
+            EXPLORATORY_MAX_TOTAL_TOKENS
+            if knowledge.get("exploratory")
+            else defaults.max_total_tokens
+        )
+    budget = SkillRCABenchmarkOptions(
+        max_model_calls=knowledge.get("max_model_calls", defaults.max_model_calls),
+        max_total_tokens=max_total_tokens,
+        timeout_seconds=knowledge.get("timeout_seconds", defaults.timeout_seconds),
+        max_additional_checks=knowledge.get(
+            "max_rounds", defaults.max_additional_checks
+        ),
+    )
+    return {
+        "max_model_calls": budget.max_model_calls,
+        "max_total_tokens": budget.max_total_tokens,
+        "timeout_seconds": budget.timeout_seconds,
+        "max_additional_checks": budget.max_additional_checks,
+    }
+
+
+def _skill_budget_matches(response: dict[str, Any], expected: dict[str, int]) -> bool:
+    budget = response.get("budget")
+    if not isinstance(budget, dict):
+        return False
+    model_calls = response.get("model_calls")
+    total_tokens = response.get("total_tokens")
+    additional_checks = response.get("additional_checks")
     return (
+        all(budget.get(key) == value for key, value in expected.items())
+        and type(model_calls) is int
+        and 0 <= model_calls <= expected["max_model_calls"]
+        and type(total_tokens) is int
+        and 0 <= total_tokens <= expected["max_total_tokens"]
+        and budget.get("model_calls_used") == model_calls
+        and budget.get("total_tokens_used") == total_tokens
+        and isinstance(additional_checks, list)
+        and len(additional_checks) <= expected["max_additional_checks"]
+        and budget.get("additional_checks_used") == len(additional_checks)
+    )
+
+
+def _diagnostic_record_is_valid(
+    record: dict[str, Any],
+    *,
+    method: str,
+    skill_budget: dict[str, int] | None = None,
+) -> bool:
+    response = record.get("response")
+    valid = (
         isinstance(response, dict)
         and response.get("status") != "error"
         and not record.get("validation_error")
     )
+    if not valid:
+        return False
+    if method == "original":
+        return skill_budget is not None and _skill_budget_matches(
+            response, skill_budget
+        )
+    return True
 
 
 def wait_for_history_archive(
@@ -294,7 +352,10 @@ def wait_for_history_archive(
                 validation = api.get(
                     f"/api/runs/{quote(run_id, safe='')}/history/validation"
                 )
-                if not isinstance(validation, dict) or validation.get("status") != "complete":
+                if (
+                    not isinstance(validation, dict)
+                    or validation.get("status") != "complete"
+                ):
                     raise RuntimeError(
                         f"history validation failed for {run_id}: {validation!r}"
                     )
@@ -326,18 +387,25 @@ def validate_historical_diagnostic(
             f"{method} diagnostic returned an error: "
             f"{str(response.get('error') or 'unspecified error')[:300]}"
         )
+    knowledge = config["knowledge_campaign"]
+    expected_signature = resource_signature_metadata(
+        knowledge.get("resource_signature_policy", "none")
+    )
+    if knowledge.get("resource_signature_policy", "none") != "none" and (
+        response.get("resource_signature") != expected_signature
+    ):
+        raise ValueError(
+            f"{method} diagnostic did not use the pinned resource signature policy"
+        )
     history = config.get("historical_observability") or {}
     if not history.get("required"):
         return
-    knowledge = config["knowledge_campaign"]
     if response.get("observability_source") != "history":
         raise ValueError(f"{method} diagnostic did not use historical observability")
     if method == "original" and history.get("mode") != "dual_write":
         archive = response.get("history_archive") or {}
         if archive.get("status") != "ok":
-            raise ValueError(
-                f"Skill RCA did not validate archived traces: {archive!r}"
-            )
+            raise ValueError(f"Skill RCA did not validate archived traces: {archive!r}")
     families = {
         item.get("family")
         for item in response.get("evidence") or []
@@ -351,13 +419,15 @@ def validate_historical_diagnostic(
             f"{families}"
         )
     if method != "exploratory_rag":
-        if method == "exploratory_control" and (
-            knowledge.get("external_test_evaluation_id") is not None
-        ) and (
-            response.get("external_test_evaluation_id")
-            != knowledge["external_test_evaluation_id"]
-            or response.get("external_test_base_sha256")
-            != knowledge.get("external_test_base_sha256")
+        if (
+            method == "exploratory_control"
+            and (knowledge.get("external_test_evaluation_id") is not None)
+            and (
+                response.get("external_test_evaluation_id")
+                != knowledge["external_test_evaluation_id"]
+                or response.get("external_test_base_sha256")
+                != knowledge.get("external_test_base_sha256")
+            )
         ):
             raise ValueError(
                 f"{method} diagnostic did not use the pinned external test base"
@@ -384,8 +454,7 @@ def validate_historical_diagnostic(
         retrieval.get("backend") != "opensearch"
         or retrieval.get("retriever_version")
         != knowledge.get("retriever_version", OPENSEARCH_RETRIEVER_VERSION)
-        or response.get("base_sha256")
-        != knowledge.get("opensearch_base_sha256")
+        or response.get("base_sha256") != knowledge.get("opensearch_base_sha256")
     ):
         raise ValueError("RAG diagnostic did not use the pinned OpenSearch corpus")
     compatibility = retrieval.get("skill_compatibility") or {}
@@ -472,13 +541,16 @@ def process_cell(
             index = config["test_experiments"].index(cell) % len(method_order)
             methods = method_order[index:] + method_order[:index]
     for method in methods:
+        skill_budget = skill_model_budget(config) if method == "original" else None
         path = result_path(directory, cell, method)
         retry_metadata = None
         if path.exists():
             saved = json.loads(path.read_text(encoding="utf-8"))
             if saved["run_id"] != run_id:
                 raise ValueError("persisted diagnostic belongs to a different run")
-            valid = _diagnostic_record_is_valid(saved)
+            valid = _diagnostic_record_is_valid(
+                saved, method=method, skill_budget=skill_budget
+            )
             if valid:
                 continue
             retry_match = re.search(r"\.retry-(\d+)$", path.stem)
@@ -503,25 +575,44 @@ def process_cell(
         endpoint = "skill-rag"
         if method == "original":
             endpoint = "skill-rca"
+            if skill_budget is None:
+                raise RuntimeError("Skill RCA budget was not configured")
             body = {
                 "possible_fault_types": body["possible_fault_types"],
                 "require_best_guess": body["require_best_guess"],
-                "max_additional_checks": config["knowledge_campaign"]["max_rounds"],
+                **skill_budget,
                 "model": body.get("model"),
                 "temperature": body.get("temperature"),
                 "seed": body.get("seed"),
+                "resource_signature_policy": body.get(
+                    "resource_signature_policy", "none"
+                ),
             }
         started = time.monotonic()
         try:
             response = api.post(
                 f"/api/runs/{escaped}/{endpoint}",
                 body=body,
-                request_timeout=config["knowledge_campaign"]["timeout_seconds"] + 60,
+                request_timeout=(
+                    skill_budget["timeout_seconds"]
+                    if skill_budget is not None
+                    else config["knowledge_campaign"]["timeout_seconds"]
+                )
+                + 60,
             )
             if not isinstance(response, dict):
                 raise ValueError("diagnostic endpoint returned a non-object")
             if method != "original" and response.get("version") != VERSION:
                 raise ValueError("loaded knowledge strategy version mismatch")
+            if (
+                method == "original"
+                and response.get("status") != "error"
+                and (
+                    skill_budget is None
+                    or not _skill_budget_matches(response, skill_budget)
+                )
+            ):
+                raise ValueError("Skill RCA did not honor the configured model budget")
         except (RuntimeError, OSError, ValueError) as exc:
             response = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
         response["request_duration_ms"] = round((time.monotonic() - started) * 1000)
@@ -530,6 +621,8 @@ def process_cell(
             record["retry"] = {
                 **retry_metadata,
                 "max_total_tokens": body.get("max_total_tokens"),
+                "max_model_calls": body.get("max_model_calls"),
+                "timeout_seconds": body.get("timeout_seconds"),
             }
         try:
             validate_historical_diagnostic(config, method, response)
@@ -618,16 +711,14 @@ def prepare_test(
                     knowledge.get("allow_legacy_model_mismatch")
                 ),
             }
-        frozen = api.get(
-            f"/api/skill-rag/{corpus}/exploratory-base", **query
-        )
+        frozen = api.get(f"/api/skill-rag/{corpus}/exploratory-base", **query)
         if frozen.get("mode") != "exploratory":
-            raise ValueError("the installed corpus is not an exploratory knowledge base")
+            raise ValueError(
+                "the installed corpus is not an exploratory knowledge base"
+            )
         if knowledge.get("retrieval_backend") == "opensearch" and (
-            frozen.get("source_model")
-            != knowledge.get("opensearch_source_model")
-            or frozen.get("current_model")
-            != knowledge.get("opensearch_current_model")
+            frozen.get("source_model") != knowledge.get("opensearch_source_model")
+            or frozen.get("current_model") != knowledge.get("opensearch_current_model")
             or frozen.get("models_match")
             is not (
                 knowledge.get("opensearch_source_model")
@@ -730,16 +821,16 @@ def build_evaluation(directory: Path, config: dict[str, Any]) -> dict[str, Any]:
     ledger = read_ledger(directory / "ledger.jsonl")
     latest = {row["cell_id"]: row for row in ledger}
     reviewed_retry_protocol = validate_rag_reviewed_retry_protocol(
-        directory, config, campaign_cells(config), ledger,
+        directory,
+        config,
+        campaign_cells(config),
+        ledger,
     )
     attempts = {}
     for row in ledger:
         key = (row["cell_id"], int(row.get("attempt", 1)))
         attempts[key] = row
-    submitted_attempts = [
-        row for row in attempts.values()
-        if row.get("run_id")
-    ]
+    submitted_attempts = [row for row in attempts.values() if row.get("run_id")]
     frozen_path = directory / "rag_base.json"
     frozen = (
         json.loads(frozen_path.read_text(encoding="utf-8"))
@@ -950,14 +1041,22 @@ def build_exploratory_evaluation(
 ) -> dict[str, Any]:
     cells = config.get("test_experiments") or []
     if len(cells) not in {1, 35}:
-        raise ValueError("exploratory evaluation requires one pilot or all 35 test cells")
-    latest = {
-        row["cell_id"]: row for row in read_ledger(directory / "ledger.jsonl")
-    }
+        raise ValueError(
+            "exploratory evaluation requires one pilot or all 35 test cells"
+        )
+    latest = {row["cell_id"]: row for row in read_ledger(directory / "ledger.jsonl")}
     frozen_path = directory / "rag_base.json"
-    base = json.loads(frozen_path.read_text(encoding="utf-8")) if frozen_path.exists() else None
+    base = (
+        json.loads(frozen_path.read_text(encoding="utf-8"))
+        if frozen_path.exists()
+        else None
+    )
     audit_path = directory / "label_audit.json"
-    audit = json.loads(audit_path.read_text(encoding="utf-8")) if audit_path.exists() else {}
+    audit = (
+        json.loads(audit_path.read_text(encoding="utf-8"))
+        if audit_path.exists()
+        else {}
+    )
     source_by_run = {
         row["run_id"]: row.get("target_labels")
         for row in audit.get("records", [])
@@ -989,15 +1088,13 @@ def build_exploratory_evaluation(
         for method in ("exploratory_rag",):
             response = responses.get(method)
             if response and response.get("status") != "error":
-                expected_base_sha256 = (
-                    config["knowledge_campaign"].get("opensearch_base_sha256")
-                    or (base or {}).get("sha256")
-                )
-                if (
-                    not base
-                    or response.get("base_sha256") != expected_base_sha256
-                ):
-                    raise ValueError("exploratory diagnosis used a different knowledge base")
+                expected_base_sha256 = config["knowledge_campaign"].get(
+                    "opensearch_base_sha256"
+                ) or (base or {}).get("sha256")
+                if not base or response.get("base_sha256") != expected_base_sha256:
+                    raise ValueError(
+                        "exploratory diagnosis used a different knowledge base"
+                    )
         control_response = responses.get("exploratory_control")
         if control_response and control_response.get("status") != "error":
             if control_response.get("base_sha256") is not None:
@@ -1020,12 +1117,12 @@ def build_exploratory_evaluation(
                 "ground_truth_service": cell["service"],
                 "chaos_type": cell["chaos_type"],
                 "effect_validated": (
-                    (entry.get("gates") or {}).get(
-                        "intervention_confirmed_on_target"
-                    ) is True
+                    (entry.get("gates") or {}).get("intervention_confirmed_on_target")
+                    is True
                     and (
                         (entry.get("gates") or {}).get("mechanism_observed") or {}
-                    ).get("passed") is True
+                    ).get("passed")
+                    is True
                 ),
                 "methods": {
                     method: _score(
@@ -1062,15 +1159,13 @@ def build_exploratory_evaluation(
                     row["methods"][method]["service_selected"] for row in selected
                 ),
                 "fault_type_selected": sum(
-                    row["methods"][method]["fault_type_selected"]
-                    for row in selected
+                    row["methods"][method]["fault_type_selected"] for row in selected
                 ),
                 "service_correct": sum(
                     row["methods"][method]["service_correct"] for row in selected
                 ),
                 "fault_type_correct": sum(
-                    row["methods"][method]["fault_type_correct"]
-                    for row in selected
+                    row["methods"][method]["fault_type_correct"] for row in selected
                 ),
                 "joint_correct": sum(
                     row["methods"][method]["joint_correct"] for row in selected

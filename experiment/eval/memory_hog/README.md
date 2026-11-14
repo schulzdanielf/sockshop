@@ -1,5 +1,167 @@
 # Memory-hog evaluation harness
 
+## Autonomous second test block (35 to 70)
+
+The [replication plan](../../../research/planos/2026-11-10-replicacao-autonoma-35-testes.md)
+records the authorized overnight policy and scientific limitations.
+`test_replication_campaign` prepares a frozen seven-service/five-fault test-only
+matrix, waits for a verified successful evaluation, runs two fresh no-fault
+controls, and collects up to 35 new accepted incidents. Preparation and `--check`
+only inspect/write local files; `--run` explicitly arms autonomous execution.
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.test_replication_campaign \
+  --prepare <evaluation-directory> --output <new-campaign-directory>
+./.venv/bin/python -m experiment.eval.memory_hog.test_replication_campaign \
+  --check <new-campaign-directory>
+./.venv/bin/python -m experiment.eval.memory_hog.test_replication_campaign \
+  --run <new-campaign-directory>
+```
+
+Training/RAG remain frozen and no diagnostic evaluation is started. At most two
+attempts per cell are allowed; reinjection requires an explicit technical failure,
+confirmed cleanup and recovery. A negative measured effect alone is not a retry
+reason. The 24-hour post-release budget never turns missing runs into successes.
+Published original/new/combined cohorts include truthful counts and completeness,
+alongside all failed attempts. A complete combined cohort has 70 distinct held-out
+run IDs. This uses a prospective protocol amendment, not identical historical
+replication. Terminal `blocked`/`partial` campaigns require review, not blind restart.
+
+## Six-case supplemental campaign
+
+Check readiness without starting load, changing dual-write, creating a campaign
+or injecting faults:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.supplemental_campaign --preflight
+```
+
+This checks the API's **loaded implementation**, the exact six-case environment
+and 600 seconds of wall/monotonic clock agreement. The API captures a SHA-256
+fingerprint of the controlled lifecycle, engine, load/injection plugins and
+resource-intensity code at import. A matching protocol number alone is not
+sufficient: restart the API from the same checkout after changing those files.
+The fingerprint, measurement policy and memory-worker signature must match
+before controls or experiment submission.
+
+The clock check preserves the 1-second drift limit and detects both individual
+steps and accumulated drift. Passing it is a prerequisite, not a guarantee of
+future clock stability. Keep Windows/WSL and the Kubernetes node synchronized,
+avoid suspend/resume and manual clock changes during a campaign, and investigate
+recurring host clock steps instead of enlarging the tolerance. A dedicated Linux
+host avoids the additional WSL/Windows clock boundary but still needs validation.
+Do not treat `NTPSynchronized=yes` alone as proof that no step occurred.
+
+Run the frozen three-train/three-test complement with:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.supplemental_campaign --run
+```
+
+The command first persists the same readiness checks in `initial_readiness.json`.
+A failed check blocks before dual-write or load. It then enables historical
+dual-write under the campaign's shared
+`history_campaign_id`, runs two 600-second no-fault controls, performs the
+six-case preflight, and pauses for calibration review before any injection.
+Each control must cover at least 600 seconds by both wall and monotonic clocks;
+it may extend by at most 30 monotonic seconds to account for clock-rate drift.
+The versioned `supplemental-all-stability-25pct-v1` policy uses a 25% relative
+limit for every stability metric during calibration preparation and no-fault
+control windows, while preserving each metric's existing floor. Coverage,
+health, effect, recovery and safety gates are unchanged. This policy applies
+only to new controls: prior reports are never reclassified.
+
+New supplemental campaigns additionally pin
+`no-fault-control-diagnostic-v1` in `control_acceptance_policy`. The long
+600-second window's variability checks are **diagnostic**, not acceptance
+gates. The same 25% limits and floors are still computed, individual
+`stability.*.passed` values remain truthful, and a failed variability check
+sets `no_fault_window.stability_passed=false` with explicit `warnings`.
+The report's top-level `passed` means acceptance under its recorded policy,
+not that every variability check passed. The two controls must still pass
+preparation, baseline, coverage/error-rate, health, container identity,
+clock integrity and load-cleanup checks. Missing/invalid telemetry or an
+exception never becomes a warning-only result.
+
+This is a prospective protocol amendment, not identical-protocol replication.
+Existing campaigns without this policy keep blocking variability checks,
+including on historical revalidation. A continuation verifies the control
+policy against its manifest. Generic load rehearsals default to the original
+blocking mode. No old failed report is reclassified or reused as an accepted
+new control.
+
+Per-case gates remain unchanged: the local preparation still requires two
+consecutive 60-second windows within 600 seconds, using the existing **20%**
+relative stability limit (not the calibration's 25%). Each case still checks
+its own baseline, effect, recovery, cleanup and evidence. Long-window variance
+is a heuristic noise diagnostic, not proof that samples are corrupt or that
+the injected mechanism is unidentifiable. Conversely, diagnostic acceptance
+does not guarantee an interpretable chaos run; the per-case checks can still
+block or abort for a concrete integrity/safety/effect problem. Both accepted
+controls are reviewed, including their warnings, before training starts.
+Before starting load, it waits up to the configured visibility timeout for
+fresh history-labeled samples from `front-end`, `orders`, and `user`; failure
+blocks the campaign and disables dual-write without starting load.
+Training/test continuations repeat readiness checks and preserve the reports
+as `training_readiness.json` / `test_readiness.json`. A readiness failure disables
+the campaign's dual-write and prevents submission.
+Dual-write stays enabled across the review and training-base pauses so the
+later cases use the same history label; it is disabled when the campaign
+blocks or completes. Continue only after reviewing the saved reports:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.supplemental_campaign \
+  --continue-training --resume <campaign-directory>
+```
+
+Each single-cell supplemental run defers RCA cohort evaluation until the
+complete cohort exists; a one-cell training plan has no test fault matrix to
+score. If a previously completed training run was blocked only by the known
+`campaign contains no test fault types` post-processing error,
+`--continue-training` accepts it only when its ledger, run ID and experiment
+gates match the recorded failure. The command repeats readiness and history
+checks, validates the completed run and continues without reinjecting that
+case. Other blocked or failed runs remain blocked.
+
+The test phase additionally requires the reviewed 35-pair training base and
+uses `--continue-tests --resume <campaign-directory> --training-base <rag_base.json>`.
+
+An empty cgroup exec response with the exact transport error
+`error: error stream protocol error: unknown error` is retried once, with the
+failure recorded and the application-container identity rechecked first.
+The successful read has its own timing interval. Partial output, changed
+identity, other command errors, a repeated transport error or invalid timing
+still block collection. This is a read retry, never a repeated fault injection.
+
+## Historical no-fault control revalidation
+
+Controlled measurements now record `controlled-measurement-v2`: Prometheus
+rates and histogram rates use a 60-second lookback (the query step remains
+5 seconds), and cgroup CPU deltas use monotonic elapsed time. Clock jumps over
+1 second during/between reads block collection explicitly. Stability floors,
+the 20% rule, effect thresholds and recovery thresholds are unchanged. The
+longer lookback includes observations before each window's first timestamp;
+this is a versioned measurement change, not identical-protocol replication.
+
+To requery completed controls of a blocked supplemental campaign without
+starting load or injecting faults:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.revalidate_load_controls \
+  --campaign experiment/eval/memory_hog/out/supplemental_campaign/<campaign-id>
+```
+
+The command queries historical MCP at `127.0.0.1:18082/sse`, preserves the
+original windows and resource samples, and recomputes coverage and stability
+for every preparation, baseline and 600-second control window. It writes
+separate timestamped reports under `revalidations/`, with query responses and
+SHA-256 provenance, and updates `campaign_state.json` to reference the revised
+checks. Original reports, raw evidence and the campaign manifest are not
+overwritten. Legacy CPU reads with clock anomalies become `invalid`, not
+successful: absent monotonic timestamps cannot be reconstructed retroactively.
+The campaign remains blocked pending review/fresh preflight even if revised
+checks pass. No training/test set is changed by this command.
+
 ## Quantitative retrieval for new procedural evaluations
 
 New test-base evaluations compare the original Skill with RAG using the Qwen 3.5
@@ -22,11 +184,96 @@ with `--precollect <evaluation-directory>`; `--run <evaluation-directory>`
 retains the existing online collection gates. Do not reuse old diagnostic
 responses as a new evaluation.
 
+To prepare the completed 35-run test cohort produced by the supplemental
+campaign, pass its derived manifest and the matching indexed training corpus:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --prepare \
+  --test-cohort experiment/eval/memory_hog/out/supplemental_campaign/<campaign-id>/derived_test_source_cohort.json \
+  --corpus-id supplemental-training-35-<campaign-id> \
+  --api-base http://127.0.0.1:8010
+```
+
+This validates the original 32 runs, the three completed supplemental cases,
+the training-base file hash, and train/test disjointness before writing a
+frozen evaluation plan. The derived cohort reuses 32 previously evaluated
+runs, so the resulting 35-run evaluation remains exploratory rather than a
+blind independent test. Preparation does not collect evidence or run
+diagnostics; do not start precollection or inference until explicitly ready.
+
+To compare the shared resource-signature prompt fairly, prepare a paired
+2x2 Skill/RAG comparison. The command creates frozen `none` and
+`cpu-memory-v1` arms, preserves the same cohort/corpus/retriever, and balances
+the order of the two prompt conditions across runs:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --prepare-comparison --api-base http://127.0.0.1:8010
+./.venv/bin/python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --precollect-comparison <comparison-directory>
+./.venv/bin/python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --run-comparison <comparison-directory>
+```
+
+For a small, balanced CPU/memory pilot, select the same number of `cpu-hog`
+and `memory-hog` runs. The sample and scheduling seeds are separate and saved
+in the parent manifest. For example, three cases per type:
+
+```bash
+./.venv/bin/python -m experiment.eval.memory_hog.test_base_rag_evaluation \
+  --prepare-comparison --resource-cases-per-type 3
+```
+
+This creates six paired runs (24 diagnoses across the four conditions). It is
+an exploratory pilot, not a confirmatory estimate; the selected run IDs and
+selection seed are recorded before precollection and inference.
+
+Every Skill/RAG model call keeps the 120,000-character evidence-context cap.
+After lossless compaction, evidence over 60,000 characters is summarized before
+it is reused across model stages; the hard-cap fallback still partitions only
+at evidence-ID boundaries. The shared pipeline uses neutral, per-ID summaries
+that retain source IDs and hashes, allow only source-supported numeric values
+(with one repair attempt), and redact unsupported numeric claims if repair
+also fails. Redaction is explicit in the summary metadata. Summaries are cached
+by source hash across Skill/RAG stages and newly added evidence, and recorded
+as `evidence_context_projection` under `bounded-evidence-summary-v7`. The
+manifest pins both character limits. Repeated nested metric-series labels use
+lossless JSON-Pointer columns; all series, values, source IDs, and hashes are
+preserved. Summary calls are capped at 3,072 output tokens. An item that still
+cannot fit fails explicitly. This changes the inference pipeline, so
+comparisons using it are exploratory under the new protocol and require fresh
+MCP precollection.
+
+Precollection performs new historical MCP queries for both arms; it must
+complete before inference. The runner interleaves conditions per run and does
+not score any condition until all four diagnoses per run have been sealed.
+It then writes `factorial_report.json` with paired accuracy contrasts, exact
+McNemar tests with Holm adjustment, bootstrap intervals, and CPU-/memory-hog
+confusion counts. This previously inspected 32-run cohort is exploratory, not
+a blind independent confirmation.
+
+For a single-method-pair diagnostic run, `--prepare` and
+`--prepare-and-run` also accept `--resource-signature-policy none` or
+`--resource-signature-policy cpu-memory-v1`. The default `none` preserves the
+legacy prompt and options fingerprints.
+
 New test-base evaluations pin model generation to temperature `0.1` and seed
 `20261107`. Both values are saved in the evaluation config/report and sent with
 each model call. This improves repeatability for identical prompts, model and
 runtime; it does not guarantee byte-identical output across different runtimes,
 hardware, or changing online evidence.
+
+The test-base comparison gives both methods the same per-case model budget:
+30 calls, 300,000 tokens and 600 seconds. Skill's four additional checks match
+RAG's four additional rounds by count; they are not identical work units.
+Skill calls for planning, retries, diagnosis and evidence-projection summaries
+all count toward its shared call and token limits. Token checks use the same
+accounting as RAG: canonical input characters divided by four plus the
+requested output cap before a call, then provider token usage when available or
+input/output character estimates otherwise. Reports separate measured from
+estimated usage. Earlier Skill results without budget metadata are not
+equal-budget observations and must not be relabeled as such.
 
 V6 compares positive metric deltas by service/metric/unit/statistic, with
 corpus-only median scales, threshold 10, numeric weight 0.75 and RRF constant 10.
@@ -192,13 +439,36 @@ any required supported restart reason must pass. Metrics derived from spans
 alone do not independently corroborate traces. Missing data, contradictions,
 exhausted budgets and tool/contract errors do not promote a guide.
 
+For every `http-status-code` B rebuild, the Istio status/flags/edge metric is
+collected before planning so the model can select the observed caller. A `FI`
+response is attributed to the proxy only when the destination resolves to the
+target; the procedure then investigates caller/proxy logs and caller CLIENT
+traces rather than requiring a destination SERVER span. A 4xx/5xx without
+`FI` is not proof of injection. Caller corroboration is accepted only when a
+fault-phase log/trace reports an HTTP 5xx and a positive Istio `5xx`/`FI` rate
+resolves that caller-to-target edge. The family gate collapses
+Prometheus evidence to one metrics family, maps span-derived metrics to the
+trace family, and does not count unknown metric provenance. The inventory
+reports SDK HTTP metrics
+as `not_queried`: historical `http_client_*`/`http_server_*` series have no
+registered executable query contract here, so they are not silently treated
+as missing data or mixed with Istio request rates.
+
+When an audit prompt is oversized, optional historical guidance is removed
+before current evidence or schema, and the omitted-document count is recorded.
+Already executed audit checks are skipped and linked to existing evidence,
+while available new checks still run. A reviewer cannot return `pass` with
+non-empty factual/scope violation lists; a contradictory response is retried
+and remains pending if it does not satisfy the contract.
+
 Limits per audited case:
 
 - Coverage: nine fresh queries (Prometheus, Loki and Tempo in each of
   baseline/fault/post); then two triage queries.
 - Investigation: three model planning rounds, at most four MCP checks each.
   Forced target checks add at most six queries for CPU/memory or three for
-  other faults, skipping checks already executed.
+  other faults, skipping checks already executed. The HTTP target Istio check
+  runs before planning and counts toward that same limit.
 - Audit: at most three decisions, two corrections and two follow-up reviews;
   at most four new MCP checks per correction round (eight total). This cycle
   has a hard ceiling of **21 model attempts**, including JSON retries, and
@@ -329,6 +599,54 @@ review-manifest SHA-256. Their ground-truth labels remain separate from the
 historical model diagnosis; label agreement is not required for this status.
 The history projection still omits both labels and diagnosis, and keeps every
 guide inconclusive.
+
+### Import supplemental training runs
+
+The supplemental importer validates the completed run ledgers, controlled
+reports, effective specs, historical read-back gates and the exact 35-cell
+matrix before rebuilding A/B for the three new training runs. It reads
+historical MCP data only and never injects chaos. The derived corpus preserves
+all 32 parent pairs and hashes, records the parent/active Skill-hash lineage,
+and uses its manifest pair count for test-base evaluation (legacy manifests
+without that field continue to mean 32 pairs).
+
+```bash
+python -m experiment.eval.memory_hog.supplemental_training_import --plan
+python -m experiment.eval.memory_hog.supplemental_training_import --build
+python -m experiment.eval.memory_hog.supplemental_training_import --prepare-review
+```
+
+`--build` is resumable and retains `procedurally_validated` versus
+`procedural_pending` results. By default, `--index` refuses to publish until
+every pair has the independent blind-live adjudication status and
+review-manifest hash. The model's supervised procedural review is not a
+substitute for that adjudication.
+
+An explicitly authorized exception is available for completing the index
+before blind-live review:
+
+```bash
+python -m experiment.eval.memory_hog.supplemental_training_import \
+  --index --bypass-blind-review
+```
+
+This writes a separate `rag_base_indexed.json` and a versioned 35-document
+index without altering the candidate base or claiming that a review occurred.
+Only the three supplemental pairs may use
+`review_status=not_reviewed_user_authorized`; no review-manifest hashes are
+created for them. The bypass is recorded in the indexed base and manifest.
+Procedurally validated examples follow the normal retrieval policy, while
+`procedural_pending` examples remain excluded unless the separately gated
+external-test opt-in is used. This command does not run an evaluation or change
+an existing alias.
+
+`--prepare-review` emits a reviewer packet with randomized case IDs and no
+source run/pair IDs or ground-truth labels. Its separate custodian map is
+written with owner-only permissions and must not be shared with reviewers.
+The packet includes incident A and its historical-MCP evidence, but excludes
+the supervised B guide and review. Reviewers must independently query the
+historical MCP over the supplied phase windows and attach those fresh results
+before returning their adjudication.
 
 Frozen bases declare `a_text_version`; bases without it retain the byte-identical
 v1 search representation. Queries use the base's version, and mixed-version
@@ -490,8 +808,11 @@ in its filename; `--report-output <path>` can override the destination.
 For a staged run, use `--prepare`, `--precollect <evaluation-dir>`, then
 `--run <evaluation-dir>`. The prepared directory is under
 `out/knowledge_evaluation/`. External use of the corpus is restricted to
-completed runs pinned to the test split, and the API rejects any run ID found
-in the frozen corpus training set.
+completed runs pinned to the test split. Completed supplemental runs without a
+split pin are accepted only when they are listed as new test cases in that
+evaluation's hash-checked cohort and complete MCP precollection manifests.
+Explicitly train-pinned runs and any run ID in the frozen corpus training set
+remain rejected.
 
 Deploy the history-only MCP service and keep its port-forward on loopback:
 
@@ -516,6 +837,12 @@ LLM_MODEL=qwen3.5-9b-grafana \
   --api-base http://127.0.0.1:8012
 ```
 
+When reusing a legacy frozen index, pin the retriever version to its schema.
+For the original v1 index, add
+`--retriever-version opensearch-hybrid-rrf-v1`; preparation verifies the index
+read-only and records the selected retriever in the campaign manifest. It does
+not rebuild or modify the index.
+
 Start the platform API and persistent local OpenSearch on port 8012 with
 `HISTORY_MIGRATION_ENABLED=false` and `HISTORY_ARCHIVE_ENABLED=false`; the
 existing default platform port remains 8010:
@@ -528,6 +855,9 @@ make experiment-platform-up-bg PLATFORM_PORT=8012 \
 The target starts OpenSearch from `opensearch-compose.yml` and waits for its
 health endpoint before starting the API. Do not forward SeaweedFS for this mode.
 Keep the live MCP on port 18080 unchanged.
+The controlled pre-intervention sample-age query is scoped to the active
+`history_campaign`, so a still-visible series from an older campaign cannot
+duplicate or satisfy the current pod's freshness gate.
 After preparation, enable temporary dual-write with the campaign ID printed in
 the prepared directory:
 
@@ -1377,6 +1707,10 @@ contadores ou cobertura suficientes faltarem, a combinacao bloqueia.
   interrompe a campanha. Scrapes, consultas e abort podem atrasar: **nao
   promete prevenir OOM**. Restart/OOM inesperado e desvio, nao um caso
   bem-sucedido de pressao sem OOM; nao aumenta intensidade nem repete.
+  A confirmacao do stressor exige observar no container-alvo o processo
+  `stress-ng` com `--vm-bytes`; o `CHAOS_KILL_COMMAND` do template deve encerrar
+  esse mesmo worker. A ausencia dessa assinatura nao autoriza estimar a janela
+  de falha: o run e abortado sem avaliar o efeito.
   Exige contador OOM observado: compara o contador absoluto com o baseline
   para detectar inclusive morte de worker sem restart da aplicacao. Repete
   a verificacao ao final da recuperacao/cooldown; ausencia desse contador
@@ -1483,6 +1817,14 @@ agregados do painel.
 O ensaio `--level rag --load-check` nao recebe identificacao de treino/teste
 nem registra conhecimento A/B. Ele usa a mesma configuracao operacional, sem
 alterar a configuracao original ou exigir uma fase de anotacao.
+
+Os controles sem falha da complementacao suplementar usam a politica de
+preparacao persistida no manifesto: warmup minimo de 180 s, duas janelas
+sucessivas nao sobrepostas de 60 s, prazo de preparacao de 600 s e baseline de
+180 s. Cada janela precisa passar cobertura e estabilidade para todos os
+servicos; falha zera a sequencia de janelas estaveis. A saude e verificada a
+cada 15 s durante warmup, janelas e baseline. Esses valores nao alteram os
+limiares de variabilidade nem certificam recuperacao apos falha.
 
 Antes de campanhas no WSL, verifique tambem a sincronizacao do host Windows
 e do Linux. Um servico NTP ativo ou `NTPSynchronized=yes` isoladamente nao

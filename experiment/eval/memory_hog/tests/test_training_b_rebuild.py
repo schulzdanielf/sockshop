@@ -108,8 +108,8 @@ def test_target_metric_context_links_to_current_evidence_without_copying_results
 
 
 def test_renewed_pair_a_references_its_new_online_evidence():
-    from experiment.platform.tests.test_rca_knowledge import document, metric_evidence
     from experiment.platform.backend.rca_knowledge import validate_a
+    from experiment.platform.tests.test_rca_knowledge import document, metric_evidence
     evidence = metric_evidence()
     evidence[0]["id"] = "N010"
     factual = rebuild._live_training_a(SimpleNamespace(evidence=evidence))
@@ -130,16 +130,415 @@ def test_renewed_pair_a_references_its_new_online_evidence():
 
 def test_causal_gate_does_not_count_span_metrics_as_independent_of_traces():
     evidence = {
-        "N001": _evidence("get_run_golden_signals", {}),
-        "N002": _evidence("tempo_service_graph_phases", {}, "traces"),
+        "N001": _evidence(
+            "get_run_golden_signals", {}, source_provenance="span_derived",
+            identifier="N001",
+        ),
+        "N002": _evidence(
+            "tempo_service_graph_phases", {}, "traces",
+            source_provenance="tempo_traces", identifier="N002",
+        ),
     }
     diagnosis = {"supporting_evidence": list(evidence), "causal_chain": ["Sintoma observado."]}
     assert "causal_independent_families_missing" in rebuild._causal_issues(
         diagnosis, evidence, "user"
     )
-    evidence["N003"] = _evidence("get_memory_saturation_top", {})
+    evidence["N003"] = _evidence(
+        "get_memory_saturation_top", {"service": "user"}, identifier="N003"
+    )
     diagnosis["supporting_evidence"].append("N003")
     assert rebuild._causal_issues(diagnosis, evidence, "user") == []
+
+
+def test_guide_issues_passes_fault_type_to_the_http_causal_gate(monkeypatch):
+    observed_fault_types = []
+
+    def causal_gate(diagnosis, evidence_index, service, *, fault_type=None):
+        observed_fault_types.append(fault_type)
+        return []
+
+    monkeypatch.setattr(rebuild, "_causal_issues", causal_gate)
+    target = {
+        "service": "payment",
+        "fault_type": "http-status-code",
+        "causal_category": "http-error",
+    }
+    guide = {
+        "symptom_relation": "",
+        "service_cause_explanation": "",
+        "hypotheses": [],
+        "investigation_steps": [],
+        "metric_confirmation_step_id": "S1",
+        "diagnosis": {
+            "primary_service": "payment",
+            "fault_type": "http-status-code",
+            "category": "http-error",
+            "status": "inconclusive",
+            "supporting_evidence": [],
+            "contradicting_evidence": [],
+            "alternatives": [],
+            "causal_chain": [],
+        },
+    }
+
+    rebuild._guide_issues(guide, {}, target, [], require_causal=True)
+
+    assert observed_fault_types == ["http-status-code"]
+
+
+def test_http_istio_metric_and_caller_trace_are_independent_when_target_is_bound():
+    http_result = {
+        "purpose": "http_status_rates",
+        "service": "payment",
+        "phases": {
+            "fault": {
+                "series": [
+                    {
+                        "labels": {
+                            "source_workload": "orders",
+                            "source_workload_namespace": "sock-shop",
+                            "destination_workload": "payment",
+                            "destination_workload_namespace": "sock-shop",
+                            "response_code": "500",
+                            "response_flags": "FI",
+                        },
+                        "mean": 1.0,
+                        "max": 2.0,
+                    }
+                ],
+            },
+        },
+    }
+    evidence = {
+        "N001": _evidence(
+            "prometheus_range_query",
+            http_result,
+            source_provenance="prometheus_istio",
+            identifier="N001",
+        ),
+        "N002": {
+            **_evidence(
+                "loki_range_query",
+                {
+                    "service": "orders",
+                    "phases": {
+                        "fault": {
+                            "sample_lines": [
+                                {
+                                    "message": (
+                                        "HTTP 500 from "
+                                        "http://payment.sock-shop.svc.cluster.local/api"
+                                    ),
+                                }
+                            ],
+                        },
+                    },
+                },
+                "logs",
+                source_provenance="loki_logs",
+                identifier="N002",
+            ),
+            "service": "orders",
+        },
+    }
+    diagnosis = {
+        "supporting_evidence": list(evidence),
+        "causal_chain": ["O proxy aborta a chamada e o chamador propaga o erro."],
+    }
+
+    assert (
+        rebuild._causal_issues(
+            diagnosis, evidence, "payment", fault_type="http-status-code"
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "caller_result",
+    [
+        {"message": "HTTP 500 from http://payment.sock-shop.svc/api"},
+        {
+            "service": "orders",
+            "phases": {
+                "fault": {
+                    "sample_lines": [
+                        {
+                            "message": "HTTP 500 from http://shipping.sock-shop.svc/api",
+                        }
+                    ],
+                },
+            },
+        },
+        {
+            "service": "orders",
+            "phases": {
+                "baseline": {
+                    "sample_lines": [
+                        {
+                            "message": "HTTP 500 from http://payment.sock-shop.svc/api",
+                        }
+                    ],
+                },
+            },
+        },
+    ],
+)
+def test_http_causal_gate_rejects_unscoped_or_nonfault_caller_errors(caller_result):
+    http_result = {
+        "purpose": "http_status_rates",
+        "service": "payment",
+        "phases": {
+            "fault": {
+                "series": [
+                    {
+                        "labels": {
+                            "source_workload": "orders",
+                            "source_workload_namespace": "sock-shop",
+                            "destination_workload": "payment",
+                            "destination_workload_namespace": "sock-shop",
+                            "response_code": "500",
+                            "response_flags": "-",
+                        },
+                        "mean": 1.0,
+                        "max": 2.0,
+                    }
+                ],
+            },
+        },
+    }
+    logs = {
+        **_evidence(
+            "loki_range_query",
+            caller_result,
+            "logs",
+            source_provenance="loki_logs",
+            identifier="N002",
+        ),
+        "service": "orders",
+    }
+    if "baseline" in (caller_result.get("phases") or {}):
+        logs["fault_observation_count"] = 0
+    evidence = {
+        "N001": _evidence(
+            "prometheus_range_query",
+            http_result,
+            source_provenance="prometheus_istio",
+            identifier="N001",
+        ),
+        "N002": logs,
+    }
+    diagnosis = {
+        "supporting_evidence": ["N001", "N002"],
+        "causal_chain": ["A chamada recebeu um erro HTTP."],
+    }
+
+    assert "causal_independent_families_missing" in rebuild._causal_issues(
+        diagnosis, evidence, "payment", fault_type="http-status-code"
+    )
+
+
+@pytest.mark.parametrize(
+    ("response_flags", "rate_max"),
+    [("-", 2.0), ("FI", 0.0)],
+)
+def test_http_caller_error_requires_correlated_positive_5xx_fi_edge(
+    response_flags, rate_max
+):
+    http_result = {
+        "purpose": "http_status_rates",
+        "service": "payment",
+        "phases": {
+            "fault": {
+                "series": [{
+                    "labels": {
+                        "source_workload": "orders",
+                        "source_workload_namespace": "sock-shop",
+                        "destination_workload": "payment",
+                        "destination_workload_namespace": "sock-shop",
+                        "response_code": "500",
+                        "response_flags": response_flags,
+                    },
+                    "mean": 0.0,
+                    "max": rate_max,
+                }],
+            },
+        },
+    }
+    evidence = {
+        "N001": _evidence(
+            "prometheus_range_query", http_result,
+            source_provenance="prometheus_istio", identifier="N001",
+        ),
+        "N002": {
+            **_evidence(
+                "loki_range_query", {"message": "HttpServerErrorException: 500"},
+                "logs", source_provenance="loki_logs", identifier="N002",
+            ),
+            "service": "orders",
+        },
+    }
+    diagnosis = {
+        "supporting_evidence": list(evidence),
+        "causal_chain": ["O chamador registrou a falha HTTP."],
+    }
+
+    assert "causal_independent_families_missing" in rebuild._causal_issues(
+        diagnosis, evidence, "payment", fault_type="http-status-code"
+    )
+
+
+def test_http_causal_gate_does_not_count_two_metrics_or_unknown_provenance():
+    evidence = {
+        "N001": _evidence(
+            "prometheus_range_query", {"service": "user"},
+            source_provenance="prometheus_istio", identifier="N001",
+        ),
+        "N002": _evidence(
+            "get_memory_saturation_top", {"service": "user"}, identifier="N002"
+        ),
+        "N003": _evidence(
+            "tempo_service_graph_phases", {"service": "user"}, "traces",
+            source_provenance="tempo_traces", identifier="N003",
+        ),
+    }
+    diagnosis = {
+        "supporting_evidence": ["N001", "N002"],
+        "causal_chain": ["O erro é propagado ao chamador."],
+    }
+    assert "causal_independent_families_missing" in rebuild._causal_issues(
+        diagnosis, evidence, "user", fault_type="http-status-code"
+    )
+    diagnosis["supporting_evidence"] = ["N001", "N003"]
+    evidence["N001"]["source_provenance"] = "unknown"
+    unknown_reasons = rebuild._causal_issues(
+        diagnosis, evidence, "user", fault_type="http-status-code"
+    )
+    assert "causal_independent_families_missing" in unknown_reasons
+    assert "causal_metric_provenance_unknown" in unknown_reasons
+
+
+@pytest.mark.parametrize("audited", [False, True])
+def test_http_metric_is_collected_before_planning_once(monkeypatch, tmp_path, audited):
+    windows = {
+        phase: {
+            "start": f"2026-10-02T10:0{index}:00Z",
+            "end": f"2026-10-02T10:0{index}:30Z",
+        }
+        for phase, index in (("baseline", 0), ("fault", 1), ("post", 2))
+    }
+    execution_order = []
+    metric_result = {
+        "status": "ok",
+        "purpose": "http_status_rates",
+        "service": "user",
+        "phases": {
+            phase: {"status": "ok", "series": []} for phase in windows
+        },
+    }
+    metric_item = {
+        "id": "N001",
+        "tool": "prometheus_range_query",
+        "family": "metrics",
+        "kind": "http",
+        "source_provenance": "prometheus_istio",
+        "service": "user",
+        "phase": "fault",
+        "source": "history",
+        "status": "ok",
+        "observation_count": 3,
+        "fault_observation_count": 1,
+        "arguments": {},
+        "digest": metric_result,
+    }
+
+    class Session:
+        def __init__(self, client, phases, directory):
+            self.windows = windows
+            self.evidence = []
+            self.calls = []
+            self.tools = {}
+
+        def collect_coverage(self):
+            return {"status": "ok"}
+
+        def triage(self):
+            return None
+
+        def execute(self, check, scope):
+            execution_order.append(check.kind)
+            self.evidence.append(metric_item)
+            self.calls.append({
+                "tool": "prometheus_range_query",
+                "kind": check.kind,
+                "service": check.service,
+                "phase": check.phase,
+                "evidence_id": "N001",
+                "result": metric_result,
+            })
+
+        def index(self):
+            return {
+                "N001": {
+                    **metric_item,
+                    "usable": True,
+                    "phases": list(windows),
+                    "text": rebuild.canonical(metric_result),
+                    "result": metric_result,
+                }
+            } if self.evidence else {}
+
+    monkeypatch.setattr(rebuild, "HistoricalQueries", Session)
+    monkeypatch.setattr(
+        rebuild,
+        "_live_training_a",
+        lambda session: SimpleNamespace(model_dump=lambda: {"symptoms": []}),
+    )
+    monkeypatch.setattr(
+        rebuild, "check_inventory", lambda *args: {"executable_checks": []}
+    )
+
+    def generate(stage, schema, context, **kwargs):
+        assert stage == "plan_historical_checks"
+        assert execution_order == ["http"]
+        assert any(item.get("kind") == "http" for item in context["evidence"])
+        return {
+            "hypotheses": [
+                {
+                    "hypothesis_id": f"H{index}",
+                    "service": "user",
+                    "category": "http-error",
+                    "mechanism": "Falha candidata",
+                    "supporting_evidence": [],
+                    "contradicting_evidence": [],
+                    "unresolved_questions": ["Qual chamada propagou o erro?"],
+                }
+                for index in (1, 2)
+            ],
+            "reason": "A metrica HTTP orienta a selecao do chamador.",
+            "checks": [],
+            "stop": True,
+        }, [], {}
+
+    monkeypatch.setattr(rebuild, "_model_json", generate)
+    pair = {
+        "phases": windows,
+        "a": {"symptoms": []},
+    }
+
+    session, result = rebuild._investigation(
+        pair, object(), tmp_path,
+        supervised_target={
+            "service": "user",
+            "fault_type": "http-status-code",
+            "causal_category": "http-error",
+        },
+        audited=audited,
+    )
+
+    assert execution_order == ["http"]
+    assert len(result["forced_metric_checks"]) == 1
+    assert rebuild._target_metric_query_exists(session.calls, "http", "user", "post")
 
 
 def test_online_training_a_ignores_old_narrative():
@@ -317,6 +716,106 @@ def test_audit_stops_after_two_corrections_without_promoting_unresolved_guide(mo
     assert records[-1]["gate_reasons"] == ["missing_metric"]
 
 
+def test_audit_skips_duplicate_check_without_blocking_a_new_query(
+    monkeypatch, tmp_path,
+):
+    from experiment.platform.tests.test_rca_knowledge import document
+
+    pair = {
+        "source_run_id": "run-train",
+        "labels": {
+            "service": "user",
+            "fault_type": "memory-hog",
+            "causal_category": "memory-exhaustion",
+        },
+    }
+    executed = []
+    session = SimpleNamespace(
+        evidence=[], calls=[], tools={}, windows={},
+        index=lambda: {},
+        execute=lambda check, scope: executed.append(check.service),
+    )
+    guide = {"diagnosis": {}, "limitations": [], "investigation_steps": []}
+    checks = [
+        {
+            "kind": "logs", "service": "user", "phase": "fault",
+            "hypothesis": "Correlacionar logs com a pressao",
+            "expected_support": "Erro no chamador",
+            "expected_refutation": "Sem erro relacionado",
+            "historical_pair_ids": [], "patterns": [],
+        },
+        {
+            "kind": "traces", "service": "orders", "phase": "fault",
+            "hypothesis": "Verificar chamada da dependencia",
+            "expected_support": "Span CLIENT com erro",
+            "expected_refutation": "Sem erro no trace",
+            "historical_pair_ids": [], "patterns": [],
+        },
+    ]
+    audit_values = iter([
+        {
+            "action": "query", "issues": ["Falta correlacao"],
+            "checks": checks, "rationale": "Consultar uma fonte nova",
+        },
+        {
+            "action": "approve", "issues": [], "checks": [],
+            "rationale": "Guia corrigido",
+        },
+    ])
+    review = {
+        "result": "pass", "target_matches": True, "path_reaches_target": True,
+        "metric_confirmation": True, "alternatives_explained": True,
+        "unsupported_claims": [], "unsupported_evidence_references": [],
+        "scope_violations": [], "rationale": "Validado",
+    }
+
+    monkeypatch.setattr(rebuild, "_gate_reasons", lambda *args, **kwargs: [])
+    monkeypatch.setattr(rebuild, "_guide_issues", lambda *args, **kwargs: [])
+    monkeypatch.setattr(rebuild, "_target_metric_evidence", lambda *args: [])
+    monkeypatch.setattr(
+        rebuild, "check_inventory", lambda *args: {"executable_checks": []}
+    )
+
+    def prepare(check, *args):
+        if check.service == "user":
+            raise rebuild.CheckUnavailable(
+                rebuild.DUPLICATE_QUERY_ERROR, evidence_id="N099"
+            )
+        return "tempo_service_graph_phases", {}, "traces", None
+
+    monkeypatch.setattr(rebuild, "prepare_check", prepare)
+
+    def generate(stage, schema, context, **kwargs):
+        if stage == "audit_training_b":
+            value = next(audit_values)
+            assert kwargs["validate"](value) == []
+            return value, [], {}
+        if stage == "repair_audited_training_b":
+            return guide, [], {}
+        if stage == "review_audited_training_b":
+            return review, [], {}
+        raise AssertionError(stage)
+
+    monkeypatch.setattr(rebuild, "_model_json", generate)
+    rag = SimpleNamespace(retrieve=lambda *args: {
+        "history": [], "provided_pair_ids": [],
+    })
+
+    _, _, records, _ = rebuild._audit_and_correct(
+        pair, guide, review, session,
+        {"observed_incident_a": document()}, {}, rag, tmp_path,
+    )
+
+    assert executed == ["orders"]
+    assert records[0]["skipped_duplicate_checks"] == [{
+        "check": checks[0],
+        "existing_evidence_id": "N099",
+    }]
+    assert [check["service"] for check in records[0]["decision"]["checks"]] == [
+        "orders"
+    ]
+
+
 @pytest.mark.parametrize(("fail_stage", "failure_type"), [
     ("audit_training_b", rebuild.ModelContractError),
     ("audit_training_b", rebuild.AuditBudgetError),
@@ -372,12 +871,27 @@ def test_invalid_selection_and_ablation_options_fail_before_collection(options):
         rebuild.rebuild(**options)
 
 
-def _evidence(tool: str, result: dict, family: str = "metrics") -> dict:
+def _evidence(
+    tool: str,
+    result: dict,
+    family: str = "metrics",
+    *,
+    source_provenance: str | None = None,
+    identifier: str = "N001",
+) -> dict:
+    from experiment.platform.backend.rca_skill import _evidence_source_provenance
+
     return {
+        "id": identifier,
         "family": family,
         "tool": tool,
         "status": "ok",
         "usable": True,
+        "fault_observation_count": 1,
+        "phases": ["fault"],
+        "source_provenance": source_provenance or _evidence_source_provenance(
+            tool, family, result=result
+        ),
         "text": rebuild.canonical(result),
     }
 
@@ -779,6 +1293,11 @@ def test_http_fi_new_series_requires_baseline_traffic_on_same_verified_edge():
     }
     index = {"N001": {"usable": True, "result": result}}
     assert rebuild._type_specific_evidence("http-status-code", "shipping", guide, index)
+    labels["response_flags"] = "-"
+    assert not rebuild._type_specific_evidence(
+        "http-status-code", "shipping", guide, index
+    )
+    labels["response_flags"] = "FI"
     result["phases"]["baseline"]["series"] = []
     assert not rebuild._type_specific_evidence("http-status-code", "shipping", guide, index)
     result["phases"]["baseline"]["series"] = baseline
@@ -987,6 +1506,82 @@ def test_model_json_uses_the_strict_output_schema(monkeypatch):
     assert captured["response_format"]["json_schema"]["name"] == "test_stage"
     schema = captured["response_format"]["json_schema"]["schema"]
     assert schema["additionalProperties"] is False
+
+
+def test_model_json_reduces_optional_history_before_enforcing_prompt_limit(monkeypatch):
+    class Output(rebuild.StrictModel):
+        answer: str
+
+    captured_context = {}
+
+    def fake_call(messages, tools, **kwargs):
+        request = json.loads(messages[1]["content"])
+        captured_context.update(request["context"])
+        return {"content": '{"answer":"valid"}'}
+
+    monkeypatch.setattr(rebuild, "MAX_PROMPT_CHARS", 5000)
+    monkeypatch.setattr(rebuild, "call_llm_tool_messages", fake_call)
+    context = {
+        "current_evidence": "fact-" + "x" * 300,
+        "historical_guidance": [
+            {"id": f"H{index}", "text": "old-" * 600}
+            for index in range(3)
+        ],
+    }
+
+    _, _, usage = rebuild._model_json(
+        "audit_training_b", Output, context,
+        services=[], fault_types=[], categories=[], evidence_ids=[],
+        max_tokens=50,
+    )
+
+    assert len(captured_context["historical_guidance"]) < 3
+    assert captured_context["current_evidence"] == context["current_evidence"]
+    assert usage["prompt_projection"]["historical_guidance_omitted_count"] > 0
+    assert len(context["historical_guidance"]) == 3
+
+
+def test_model_json_records_prompt_overflow_as_a_stage_failure(monkeypatch):
+    class Output(rebuild.StrictModel):
+        answer: str
+
+    monkeypatch.setattr(rebuild, "MAX_PROMPT_CHARS", 500)
+
+    with pytest.raises(
+        rebuild.ModelContractError, match="write_training_b prompt"
+    ) as error:
+        rebuild._model_json(
+            "write_training_b",
+            Output,
+            {"current_evidence": "x" * 1000},
+            services=[],
+            fault_types=[],
+            categories=[],
+            evidence_ids=[],
+            max_tokens=50,
+        )
+
+    assert error.value.stage == "write_training_b"
+    assert error.value.attempts == []
+
+
+def test_factual_review_rejects_pass_with_nonempty_violation_lists():
+    review = {
+        "result": "pass",
+        "unsupported_claims": ["Nao ha alegacoes sem suporte"],
+        "unsupported_evidence_references": [],
+        "scope_violations": [],
+    }
+
+    issues = rebuild._validate_factual_review(review)
+
+    assert issues and not rebuild._review_passes({
+        **review,
+        "target_matches": True,
+        "path_reaches_target": True,
+        "metric_confirmation": True,
+        "alternatives_explained": True,
+    })
 
 
 def test_model_json_defers_semantic_issues_explicitly_for_auditor(monkeypatch):
@@ -1540,9 +2135,6 @@ def test_host_derives_next_step_links_without_changing_observed_facts():
         step.observed_result == "Memoria passou de 19.25% a 55.0586%"
         for step in guide.investigation_steps
     )
-
-
-
 
 
 def test_training_guide_accepts_lifecycle_confirmation_for_container_kill():

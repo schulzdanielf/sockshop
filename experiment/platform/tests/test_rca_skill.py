@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Literal
 from datetime import datetime
+from typing import Any, Literal
 
 import pytest
 
@@ -41,14 +41,103 @@ def diagnosis(**overrides):
     return result
 
 
-def evidence(identifier, family, *, status="ok", count=2, fault_count=2):
-    return {
+def evidence(
+    identifier,
+    family,
+    *,
+    status="ok",
+    count=2,
+    fault_count=2,
+    source_provenance=None,
+    service=None,
+):
+    item = {
         "id": identifier,
         "family": family,
         "status": status,
         "observation_count": count,
         "fault_observation_count": fault_count,
+        "source_provenance": source_provenance
+        or {
+            "metrics": "prometheus_golden_signals",
+            "logs": "loki_logs",
+            "traces": "tempo_traces",
+        }.get(family, "unknown"),
     }
+    if service:
+        item["service"] = service
+    return item
+
+
+def http_istio_evidence(
+    identifier,
+    service,
+    caller,
+    *,
+    response_code="500",
+    response_flags="FI",
+):
+    item = evidence(
+        identifier,
+        "metrics",
+        source_provenance="prometheus_istio",
+        service=service,
+    )
+    item["result"] = {
+        "purpose": "http_status_rates",
+        "service": service,
+        "phases": {
+            "fault": {
+                "series": [
+                    {
+                        "labels": {
+                            "source_workload": caller,
+                            "source_workload_namespace": "sock-shop",
+                            "destination_workload": service,
+                            "destination_workload_namespace": "sock-shop",
+                            "response_code": response_code,
+                            "response_flags": response_flags,
+                        },
+                        "mean": 1.0,
+                        "max": 2.0,
+                    }
+                ],
+            },
+        },
+    }
+    return item
+
+
+def http_caller_evidence(identifier, family, provenance):
+    item = evidence(identifier, family, source_provenance=provenance, service="orders")
+    if family == "logs":
+        item["result"] = {
+            "service": "orders",
+            "phases": {
+                "fault": {
+                    "sample_lines": [
+                        {
+                            "message": "HTTP 500 from http://payment.sock-shop.svc.cluster.local/api",
+                        }
+                    ],
+                },
+            },
+        }
+    else:
+        item["result"] = {
+            "phases": {
+                "fault": {
+                    "error_spans": [
+                        {
+                            "service": "orders",
+                            "remote_service": "payment",
+                            "http_status_code": "500",
+                        }
+                    ],
+                },
+            },
+        }
+    return item
 
 
 def validate(
@@ -61,8 +150,8 @@ def validate(
     return rca_skill.validate_diagnosis(
         rca_skill.Diagnosis.model_validate(value),
         items,
-        {"front-end", "orders"},
-        {"network-latency", "pod-failure"},
+        {"front-end", "orders", "payment"},
+        {"http-error", "network-latency", "pod-failure"},
         restarted or [],
         possible_fault_types,
         require_best_guess,
@@ -96,6 +185,142 @@ def validate(
 )
 def test_confirmation_requires_independent_fault_telemetry(items, expected):
     assert validate(diagnosis(), items).status == expected
+
+
+@pytest.mark.parametrize(
+    ("family", "provenance"),
+    [("logs", "loki_logs"), ("traces", "tempo_traces")],
+)
+def test_http_istio_evidence_is_independent_from_caller_logs_or_traces(
+    family, provenance
+):
+    result = validate(
+        diagnosis(
+            primary_service="payment",
+            fault_type="http-status-code",
+        ),
+        [
+            http_istio_evidence("E001", "payment", "orders"),
+            http_caller_evidence("E006", family, provenance),
+        ],
+    )
+    assert result.status == "confirmed"
+
+
+@pytest.mark.parametrize(
+    ("response_flags", "rate_max"),
+    [("-", 2.0), ("FI", 0.0)],
+)
+def test_http_caller_error_requires_correlated_positive_fault_edge(
+    response_flags, rate_max
+):
+    metric = http_istio_evidence(
+        "E001",
+        "payment",
+        "orders",
+        response_flags=response_flags,
+    )
+    metric["result"]["phases"]["fault"]["series"][0].update(mean=0.0, max=rate_max)
+    result = validate(
+        diagnosis(primary_service="payment", fault_type="http-status-code"),
+        [
+            metric,
+            {
+                **evidence("E006", "logs", service="orders"),
+                "result": {"message": "HttpServerErrorException: 500"},
+            },
+        ],
+    )
+    assert result.status == "inconclusive"
+
+
+@pytest.mark.parametrize(
+    "caller_result",
+    [
+        {"message": "HTTP 500 from http://payment.sock-shop.svc/api"},
+        {
+            "service": "orders",
+            "phases": {
+                "fault": {
+                    "sample_lines": [
+                        {
+                            "message": "HTTP 500 from http://shipping.sock-shop.svc/api",
+                        }
+                    ],
+                },
+            },
+        },
+        {
+            "service": "orders",
+            "phases": {
+                "baseline": {
+                    "sample_lines": [
+                        {
+                            "message": "HTTP 500 from http://payment.sock-shop.svc/api",
+                        }
+                    ],
+                },
+            },
+        },
+    ],
+)
+def test_http_caller_evidence_must_match_fault_phase_and_edge(caller_result):
+    caller_item = {
+        **evidence("E006", "logs", service="orders"),
+        "result": caller_result,
+    }
+    if "baseline" in (caller_result.get("phases") or {}):
+        caller_item["fault_observation_count"] = 0
+    result = validate(
+        diagnosis(primary_service="payment", fault_type="http-status-code"),
+        [
+            http_istio_evidence("E001", "payment", "orders"),
+            caller_item,
+        ],
+    )
+    assert result.status == "inconclusive"
+
+
+def test_span_derived_metric_does_not_independently_corroborate_http_trace():
+    result = validate(
+        diagnosis(primary_service="orders", fault_type="http-status-code"),
+        [
+            evidence(
+                "E001",
+                "metrics",
+                source_provenance="span_derived",
+                service="orders",
+            ),
+            evidence(
+                "E006",
+                "traces",
+                source_provenance="tempo_traces",
+                service="orders",
+            ),
+        ],
+    )
+    assert result.status == "inconclusive"
+
+
+def test_unknown_metric_provenance_is_not_counted_and_is_reported():
+    result = validate(
+        diagnosis(),
+        [
+            evidence(
+                "E001",
+                "metrics",
+                source_provenance="unknown",
+                service="front-end",
+            ),
+            evidence("E006", "logs", service="front-end"),
+        ],
+    )
+
+    assert result.status == "inconclusive"
+    assert any(
+        "Proveniencia de uma metrica desconhecida" in item
+        for item in result.limitations
+    )
 
 
 def test_unknown_restart_reason_prevents_confirmation():
@@ -203,6 +428,7 @@ class FakeMCP:
             "prometheus_range_query",
             "loki_range_query",
             "tempo_service_graph_phases",
+            "tempo_search_traces",
             "tempo_analyze_trace",
             "get_cpu_saturation_top",
             "get_memory_saturation_top",
@@ -292,6 +518,11 @@ def run_executor(
     require_best_guess=False,
     max_additional_checks=0,
     additional_checks=0,
+    max_model_calls=None,
+    max_total_tokens=None,
+    timeout_seconds=None,
+    malformed_additional_attempts=0,
+    model_usage_tokens=None,
     archive_traces=None,
     evidence_source: Literal["live", "history"] = "live",
     model_id: str | None = None,
@@ -300,17 +531,53 @@ def run_executor(
     captured_model_kwargs: list[dict[str, Any]] | None = None,
 ):
     contexts = []
+    additional_model_attempts = 0
 
     def model(messages, tools, **kwargs):
+        nonlocal additional_model_attempts
         assert tools == [] and kwargs["tool_choice"] == "none"
         if captured_model_kwargs is not None:
             captured_model_kwargs.append(kwargs)
-        context = json.loads(messages[-1]["content"])
+        context = next(
+            json.loads(message["content"])
+            for message in reversed(messages)
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith('{"stage":')
+        )
         contexts.append(context)
+        if context["stage"] == "additional_mcp_check":
+            additional_model_attempts += 1
+            if additional_model_attempts <= malformed_additional_attempts:
+                response = {"content": "not JSON"}
+                if model_usage_tokens is not None:
+                    response["usage"] = {"total_tokens": model_usage_tokens}
+                return response
         if context["stage"] == "plan":
             value = {
                 "candidates": [candidate],
-                "hypotheses": ["Rede", "CPU"],
+                "hypotheses": [
+                    {
+                        "hypothesis_id": "H1",
+                        "service": "front-end",
+                        "category": "network-latency",
+                        "mechanism": "A chamada do cliente excede a latencia basal da aresta",
+                        "supporting_evidence": [],
+                        "contradicting_evidence": [],
+                        "unresolved_questions": [
+                            "A operacao tem amostras comparaveis?"
+                        ],
+                    },
+                    {
+                        "hypothesis_id": "H2",
+                        "service": "orders",
+                        "category": "http-error",
+                        "mechanism": "A dependencia retorna erro HTTP na janela fault",
+                        "supporting_evidence": [],
+                        "contradicting_evidence": [],
+                        "unresolved_questions": ["Ha log ou span do mesmo erro?"],
+                    },
+                ],
                 "reasoning": "Comparar sinais",
             }
         elif context["stage"] == "additional_mcp_check":
@@ -361,13 +628,19 @@ def run_executor(
                     else {}
                 ),
             )
-        return {"content": json.dumps(value)}
+        response = {"content": json.dumps(value)}
+        if model_usage_tokens is not None:
+            response["usage"] = {"total_tokens": model_usage_tokens}
+        return response
 
     result = rca_skill.answer_skill_rca(
         mcp_client=client,
         phases=PHASES,
         namespace="sock-shop",
         max_additional_checks=max_additional_checks,
+        max_model_calls=max_model_calls,
+        max_total_tokens=max_total_tokens,
+        timeout_seconds=timeout_seconds,
         llm=model,
         window_metadata=metadata,
         possible_fault_types=possible_fault_types,
@@ -379,6 +652,68 @@ def run_executor(
         seed=seed,
     )
     return result, contexts
+
+
+def test_skill_model_budget_records_measured_usage_and_limits():
+    result, _ = run_executor(
+        FakeMCP(),
+        max_model_calls=30,
+        max_total_tokens=300_000,
+        timeout_seconds=600,
+        model_usage_tokens=15,
+    )
+
+    assert result["status"] == "confirmed"
+    assert result["model_calls"] == result["budget"]["model_calls_used"] == 2
+    assert result["total_tokens"] == result["budget"]["total_tokens_used"] == 30
+    assert result["budget"]["max_model_calls"] == 30
+    assert result["budget"]["max_total_tokens"] == 300_000
+    assert result["budget"]["timeout_seconds"] == 600
+    assert result["budget"]["max_additional_checks"] == 0
+    assert result["budget"]["additional_checks_used"] == 0
+    assert result["budget"]["measured_token_usage_calls"] == 2
+    assert result["budget"]["estimated_token_usage_calls"] == 0
+    assert result["model_budget_rejections"] == []
+    assert all(
+        attempt["estimated_input_tokens"] > 0
+        and attempt["reserved_output_tokens"] > 0
+        for attempt in result["model_attempts"]
+    )
+
+
+def test_skill_model_token_budget_is_enforced():
+    result, _ = run_executor(
+        FakeMCP(),
+        max_model_calls=30,
+        max_total_tokens=8_000,
+        timeout_seconds=600,
+    )
+
+    assert result["status"] == "error"
+    assert "token budget exhausted" in result["error"]
+    assert result["total_tokens"] <= 8_000
+    assert result["budget"]["total_tokens_used"] <= 8_000
+    rejection = result["model_budget_rejections"][0]
+    assert rejection["reason"] == "token_budget"
+    assert rejection["estimated_total_tokens"] > rejection["token_limit"]
+
+
+def test_skill_model_call_budget_includes_retries():
+    result, contexts = run_executor(
+        FakeMCP(),
+        max_additional_checks=4,
+        additional_checks=4,
+        max_model_calls=6,
+        max_total_tokens=300_000,
+        timeout_seconds=600,
+        malformed_additional_attempts=1,
+    )
+
+    assert result["status"] == "error"
+    assert "model call budget exhausted" in result["error"]
+    assert result["model_calls"] == result["budget"]["model_calls_used"] == 6
+    assert len(contexts) == 6
+    assert result["budget"]["estimated_token_usage_calls"] == 6
 
 
 def test_model_generation_settings_are_forwarded_to_skill_calls():
@@ -456,13 +791,16 @@ def test_skill_additional_mcp_check_budget_is_capped_and_recorded():
     assert [context["stage"] for context in contexts].count(
         "additional_mcp_check"
     ) == rca_skill.MAX_ADDITIONAL_MCP_CHECKS
-    assert len(
-        [
-            call
-            for call in client.calls
-            if call[0] in {"get_cpu_saturation_top", "get_memory_saturation_top"}
-        ]
-    ) == rca_skill.MAX_ADDITIONAL_MCP_CHECKS
+    assert (
+        len(
+            [
+                call
+                for call in client.calls
+                if call[0] in {"get_cpu_saturation_top", "get_memory_saturation_top"}
+            ]
+        )
+        == rca_skill.MAX_ADDITIONAL_MCP_CHECKS
+    )
 
 
 def test_skill_additional_mcp_check_budget_can_stop_early():
@@ -476,9 +814,7 @@ def test_skill_additional_mcp_check_budget_can_stop_early():
     assert result["additional_checks"] == []
     assert not any(call["level"] == 5 for call in result["calls"])
     assert result["additional_check_stop_reason"] == "Nenhum check adicional necessário"
-    assert [context["stage"] for context in contexts].count(
-        "additional_mcp_check"
-    ) == 1
+    assert [context["stage"] for context in contexts].count("additional_mcp_check") == 1
 
 
 def test_historical_evidence_source_and_trace_query_budget_are_explicit():
@@ -494,8 +830,7 @@ def test_historical_evidence_source_and_trace_query_budget_are_explicit():
     assert result["evidence"]
     assert {item["source"] for item in result["evidence"]} == {"history"}
     trace_call = next(
-        call for call in result["calls"]
-        if call["tool"] == "tempo_service_graph_phases"
+        call for call in result["calls"] if call["tool"] == "tempo_service_graph_phases"
     )
     assert trace_call["arguments"]["limit"] == 10
 
@@ -563,10 +898,12 @@ def test_archive_trace_evidence_is_read_only_and_reaches_diagnosis_context():
     assert evidence["status"] == "ok"
     assert evidence["fault_observation_count"] == 1
     assert any(
-        item["tool"] == "history_archive_traces"
-        for item in contexts[-1]["evidence"]
+        item["tool"] == "history_archive_traces" for item in contexts[-1]["evidence"]
     )
-    assert result["evidence_bundle"]["coverage"]["history_archive_traces"]["source"] == "archive"
+    assert (
+        result["evidence_bundle"]["coverage"]["history_archive_traces"]["source"]
+        == "archive"
+    )
     assert any(
         item["kind"] == "archived_trace_span"
         for item in result["evidence_bundle"]["timeline"]
@@ -676,6 +1013,167 @@ def test_edge_latency_profiles_are_collected_before_planning():
     ]
     assert len(edge_evidence) == 3
     assert all(item["fault_observation_count"] == 1 for item in edge_evidence)
+    http_evidence = next(
+        item for item in result["evidence"] if item.get("kind") == "http"
+    )
+    assert http_evidence["source_provenance"] == "prometheus_istio"
+
+
+def test_edge_latency_directs_fault_trace_search_to_client_and_destination():
+    class DirectedTraceMCP(FakeMCP):
+        def __init__(self, *, validated_latency_candidate=True):
+            super().__init__()
+            self.validated_latency_candidate = validated_latency_candidate
+
+        def call_tool_json(self, name, arguments):
+            if name == "tempo_service_graph_phases":
+                self.calls.append((name, arguments))
+                return {
+                    "phases": {
+                        "fault": {
+                            "trace_count": 1,
+                            "failure_signatures": [],
+                            "latency_candidates": (
+                                [
+                                    {
+                                        "trace_id": "a" * 32,
+                                        "signature": "LATENCY_REGRESSION",
+                                        "affected_service": "orders",
+                                        "endpoint": "GET /orders",
+                                        "operations": ["front-end.GET /orders"],
+                                        "fault_duration_ms": 180,
+                                        "baseline_p95_ms": 100,
+                                        "latency_delta_ms": 80,
+                                        "baseline_sample_count": 4,
+                                    }
+                                ]
+                                if self.validated_latency_candidate
+                                else []
+                            ),
+                        },
+                    },
+                }
+            if name == "tempo_search_traces":
+                self.calls.append((name, arguments))
+                return {
+                    "traces": [
+                        {
+                            "traceID": "a" * 32,
+                            "rootTraceName": "GET /orders",
+                            "startTimeUnixNano": "1790935330000000000",
+                        }
+                    ]
+                }
+            if name == "tempo_analyze_trace":
+                self.calls.append((name, arguments))
+                return {
+                    "status": "ok",
+                    "trace_duration_ms": 180,
+                    "span_count": 2,
+                    "critical_path": [],
+                    "hot_spans": [],
+                    "error_spans": [],
+                    "failure_signatures": [],
+                    "dependency_map": [],
+                    "service_latency": [],
+                }
+            if name != "prometheus_range_query":
+                return super().call_tool_json(name, arguments)
+            self.calls.append((name, arguments))
+            query = arguments["query"]
+            if "last_terminated" in query:
+                return {"status": "success", "data": {"result": []}}
+            baseline_timestamp = int(
+                datetime.fromisoformat(
+                    "2026-10-02T10:01:25Z".replace("Z", "+00:00")
+                ).timestamp()
+            )
+            fault_timestamp = int(
+                datetime.fromisoformat(
+                    "2026-10-02T10:02:10Z".replace("Z", "+00:00")
+                ).timestamp()
+            )
+            labels = (
+                {"source_workload": "front-end", "destination_workload": "orders"}
+                if "istio_request_duration_milliseconds" in query
+                else {"client": "front-end", "server": "orders"}
+            )
+            return {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "metric": labels,
+                            "values": [
+                                [baseline_timestamp, "0.01"],
+                                [fault_timestamp, "0.15"],
+                            ],
+                        }
+                    ]
+                },
+            }
+
+    client = DirectedTraceMCP()
+    result, _ = run_executor(client)
+
+    search_call = next(
+        (
+            arguments
+            for name, arguments in client.calls
+            if name == "tempo_search_traces"
+        ),
+        None,
+    )
+    assert search_call is not None
+    assert search_call["start"] == PHASES["fault"]["start"]
+    assert search_call["end"] == PHASES["fault"]["end"]
+    assert search_call["limit"] == 5
+    assert 'resource.service.name = "front-end"' in search_call["query"]
+    assert "kind = client" in search_call["query"]
+    assert "http://orders" in search_call["query"]
+    search_evidence = next(
+        item for item in result["evidence"] if item["tool"] == "tempo_search_traces"
+    )
+    assert search_evidence["is_causal_evidence"] is False
+    trace_detail = next(
+        call for call in result["calls"] if call["tool"] == "tempo_analyze_trace"
+    )
+    assert trace_detail["phase"] == "fault"
+    assert trace_detail["service"] == "front-end"
+    assert trace_detail["result"]["source_service"] == "front-end"
+    assert trace_detail["result"]["destination_service"] == "orders"
+    assert {
+        profile["metric"]: profile["unit"]
+        for profile in trace_detail["result"]["metric_profiles"]
+    } == {
+        "edge_latency_istio_mean_ms": "ms",
+        "edge_latency_service_graph_client_p90_s": "s",
+        "edge_latency_service_graph_server_p90_s": "s",
+    }
+    assert trace_detail["result"]["baseline_p95_ms"] == 100
+
+    unvalidated_client = DirectedTraceMCP(validated_latency_candidate=False)
+    unvalidated_result, _ = run_executor(unvalidated_client)
+    assert not any(
+        name == "tempo_analyze_trace" for name, _ in unvalidated_client.calls
+    )
+    assert any(
+        "nao foram aprofundados" in item
+        for item in unvalidated_result["diagnosis"]["limitations"]
+    )
+
+
+def test_plan_hypotheses_are_structured_and_constrained_to_the_system_card():
+    _, contexts = run_executor(FakeMCP())
+    plan_context = contexts[0]
+    hypothesis_schema = plan_context["output_schema"]["$defs"]["CausalHypothesis"]
+    card = rca_skill.load_system_card("sock-shop")
+    assert hypothesis_schema["properties"]["category"]["enum"] == sorted(
+        card["allowed_fault_categories"]
+    )
+    service_schema = hypothesis_schema["properties"]["service"]["anyOf"]
+    assert next(item for item in service_schema if item.get("type") == "string")["enum"]
+    assert "IDs exatos" in plan_context["context"]["hypothesis_contract"]
 
 
 def test_no_logs_or_traces_cannot_confirm():

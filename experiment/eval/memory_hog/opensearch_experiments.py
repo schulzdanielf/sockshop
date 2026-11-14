@@ -394,6 +394,7 @@ class OpenSearchExperimentIndex:
                 )
             if self.schema_version == 4:
                 properties["b_procedural_status"] = {"type": "keyword"}
+                properties["review_status"] = {"type": "keyword"}
             created = self._request(
                 "PUT",
                 f"/{self.index_name}",
@@ -622,6 +623,8 @@ class OpenSearchExperimentIndex:
             }
             if self.schema_version == 4:
                 document["b_procedural_status"] = pair["b_procedural_status"]
+                if isinstance(pair.get("review_status"), str):
+                    document["review_status"] = pair["review_status"]
             if self.schema_version >= 2:
                 document.update(incident.retrieval_fields())
             document["source_document_sha256"] = digest(document)
@@ -728,6 +731,7 @@ class OpenSearchExperimentIndex:
         ]
         if self.schema_version == 4:
             source_fields.append("b_procedural_status")
+            source_fields.append("review_status")
         response = self._request(
             "POST",
             f"/{self.index_name}/_search",
@@ -1265,6 +1269,11 @@ class OpenSearchExperimentIndex:
                     "effect_validated": document["effect_validated"],
                     "guide_status": document["guide_status"],
                     "causal_status": document["causal_status"],
+                    **(
+                        {"review_status": document["review_status"]}
+                        if isinstance(document.get("review_status"), str)
+                        else {}
+                    ),
                     **(
                         {"b_procedural_status": document["b_procedural_status"]}
                         if self.schema_version == 4

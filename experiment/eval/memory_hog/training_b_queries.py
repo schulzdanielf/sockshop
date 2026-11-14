@@ -25,7 +25,12 @@ from experiment.platform.backend.rca_knowledge import (
     prepare_check,
     write_once,
 )
-from experiment.platform.backend.rca_skill import TOOL_ERRORS, _observation_count, _sanitize
+from experiment.platform.backend.rca_skill import (
+    TOOL_ERRORS,
+    _evidence_source_provenance,
+    _observation_count,
+    _sanitize,
+)
 
 HISTORICAL_QUERY_TIMEOUT_SECONDS = 240
 
@@ -174,6 +179,10 @@ class HistoricalQueries:
             fault_count = count if phase == "fault" else 0
         item = {
             "id": identifier, "tool": tool, "family": family, "source": "history",
+            "kind": kind,
+            "source_provenance": _evidence_source_provenance(
+                tool, family, kind, result
+            ),
             "status": result.get("status", "ok" if count else "no_data"),
             "observation_count": count, "fault_observation_count": fault_count,
             "arguments": arguments, "digest": result, "service": service,

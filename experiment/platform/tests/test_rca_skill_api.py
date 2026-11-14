@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,9 +58,7 @@ def result(status="confirmed"):
     }
 
 
-def test_exploratory_base_api_pins_legacy_model_compatibility(
-    platform, monkeypatch
-):
+def test_exploratory_base_api_pins_legacy_model_compatibility(platform, monkeypatch):
     client, _, _ = platform
     requested = {}
     source_skill = "a" * 64
@@ -132,6 +131,10 @@ def test_api_uses_pinned_run_config_and_preserves_attempts(platform, monkeypatch
             "possible_fault_types": ["container-kill", "cpu-hog"],
             "require_best_guess": True,
             "max_additional_checks": 2,
+            "max_model_calls": 20,
+            "max_total_tokens": 120_000,
+            "timeout_seconds": 300,
+            "resource_signature_policy": "cpu-memory-v1",
         },
     ).json()
     second = client.post("/api/runs/run-test/skill-rca").json()
@@ -144,9 +147,22 @@ def test_api_uses_pinned_run_config_and_preserves_attempts(platform, monkeypatch
     assert calls[0]["possible_fault_types"] == ["container-kill", "cpu-hog"]
     assert calls[0]["require_best_guess"] is True
     assert calls[0]["max_additional_checks"] == 2
+    assert calls[0]["max_model_calls"] == 20
+    assert calls[0]["max_total_tokens"] == 120_000
+    assert calls[0]["timeout_seconds"] == 300
+    assert calls[0]["resource_signature_policy"] == "cpu-memory-v1"
+    assert first["resource_signature"]["policy"] == "cpu-memory-v1"
+    assert len(first["resource_signature"]["text_sha256"]) == 64
+    assert second["resource_signature"] == {
+        "policy": "none",
+        "text_sha256": None,
+    }
     assert calls[1]["possible_fault_types"] == []
     assert calls[1]["require_best_guess"] is False
     assert calls[1]["max_additional_checks"] == 4
+    assert calls[1]["max_model_calls"] == 30
+    assert calls[1]["max_total_tokens"] == 200_000
+    assert calls[1]["timeout_seconds"] == 600
     assert mcp_endpoints == [
         (api.DEFAULT_HISTORICAL_MCP_SSE_URL, 30),
         (api.DEFAULT_HISTORICAL_MCP_SSE_URL, 30),
@@ -158,6 +174,17 @@ def test_api_uses_pinned_run_config_and_preserves_attempts(platform, monkeypatch
     assert storage.get_artifact(run.run_id, "rca_investigation") is None
     assert "/api/runs/{run_id}/rca" in client.get("/openapi.json").json()["paths"]
     assert first["history_archive"]["status"] == "not_configured"
+
+
+def test_skill_rca_rejects_out_of_range_model_budgets(platform):
+    client, _, _ = platform
+
+    response = client.post(
+        "/api/runs/run-test/skill-rca",
+        json={"max_model_calls": 31, "max_total_tokens": 7_999},
+    )
+
+    assert response.status_code == 422
 
 
 def test_legacy_rca_queries_history_instead_of_frozen_snapshot(platform, monkeypatch):
@@ -233,7 +260,9 @@ def test_skill_rca_uses_historical_mcp_timeout_and_evidence_source(
     assert response.json()["observability_source"] == "history"
 
 
-def test_api_reads_archive_by_run_id_and_allows_campaign_override(platform, monkeypatch):
+def test_api_reads_archive_by_run_id_and_allows_campaign_override(
+    platform, monkeypatch
+):
     _, storage, _ = platform
     requested = []
     archive = {
@@ -242,8 +271,7 @@ def test_api_reads_archive_by_run_id_and_allows_campaign_override(platform, monk
         "campaign_id": "exploratory-rag-20261028T191703038725Z",
         "run_id": "run-test",
         "archive_key": (
-            "exploratory-rag-20261028T191703038725Z/"
-            "run-test/source-bundle.json.gz"
+            "exploratory-rag-20261028T191703038725Z/" "run-test/source-bundle.json.gz"
         ),
         "bundle_sha256": "a" * 64,
         "trace_count": 1,
@@ -286,10 +314,15 @@ def test_api_reads_archive_by_run_id_and_allows_campaign_override(platform, monk
         "run_id": "run-test",
         "archive_key": archive["archive_key"],
     }
-    assert storage.get_artifact("run-test", response.json()["artifact_path"].split("/")[-1].removesuffix(".json"))
+    assert storage.get_artifact(
+        "run-test",
+        response.json()["artifact_path"].split("/")[-1].removesuffix(".json"),
+    )
 
 
-def test_dual_write_history_validation_reads_back_from_historical_mcp(platform, monkeypatch):
+def test_dual_write_history_validation_reads_back_from_historical_mcp(
+    platform, monkeypatch
+):
     from dataclasses import replace
 
     client, storage, run = platform
@@ -467,8 +500,11 @@ def test_api_rejects_unknown_and_running_runs(platform):
 
 def test_knowledge_api_enforces_pinned_split_and_rejects_injected_labels(platform):
     client, _, _ = platform
-    body = {"corpus_id": "corpus", "mode": "annotate",
-            "possible_fault_types": ["network-latency"]}
+    body = {
+        "corpus_id": "corpus",
+        "mode": "annotate",
+        "possible_fault_types": ["network-latency"],
+    }
     assert client.post("/api/runs/run-test/skill-rag", json=body).status_code == 403
     headers = {"X-User-Role": "admin"}
     response = client.post("/api/runs/run-test/skill-rag", json=body, headers=headers)
@@ -476,7 +512,8 @@ def test_knowledge_api_enforces_pinned_split_and_rejects_injected_labels(platfor
     assert "pinned split" in response.json()["detail"]
     response = client.post(
         "/api/runs/run-test/skill-rag",
-        json={**body, "labels": {"service": "orders"}}, headers=headers,
+        json={**body, "labels": {"service": "orders"}},
+        headers=headers,
     )
     assert response.status_code == 422
 
@@ -605,6 +642,175 @@ def test_external_test_corpus_evaluation_is_scoped_and_checks_run_overlap(
     assert len(calls) == 2
 
 
+def _write_supplemental_evaluation_package(
+    root: Path, evaluation_id: str, corpus_id: str, base_sha256: str, run_id: str
+) -> None:
+    directory = root / evaluation_id
+    directory.mkdir(parents=True)
+    cohort = {
+        "test_run_ids": [run_id],
+        "training_run_ids": ["run-training"],
+        "supplemental_test_run_ids": [run_id],
+        "source_cohort_sha256": "d" * 64,
+        "runs": [
+            {
+                "run_id": run_id,
+                "status": "completed",
+                "cell": {"cell_id": "supplemental-cell", "phase": "test"},
+            }
+        ],
+    }
+    cohort_bytes = (json.dumps(cohort, indent=2) + "\n").encode()
+    (directory / "test_cohort.json").write_bytes(cohort_bytes)
+
+    evaluation = {
+        "evaluation_id": evaluation_id,
+        "external_test_evaluation_id": evaluation_id,
+        "protocol": "supplemental_test_cohort_v1_exploratory",
+        "corpus_id": corpus_id,
+        "corpus_sha256": base_sha256,
+        "external_test_base_sha256": base_sha256,
+        "test_case_count": 1,
+        "test_run_ids_overlap_training": False,
+        "source_cohort_sha256": cohort["source_cohort_sha256"],
+        "new_supplemental_test_run_ids": [run_id],
+    }
+    evaluation["sha256"] = api.knowledge_digest(evaluation)
+    (directory / "evaluation_manifest.json").write_text(
+        json.dumps(evaluation, indent=2) + "\n", encoding="utf-8"
+    )
+
+    sources = ("metrics", "logs", "traces")
+    phases = ("baseline", "fault", "post")
+    precollection = {
+        "evaluation_id": evaluation_id,
+        "status": "complete",
+        "case_count": 1,
+        "queries_per_case": len(sources) * len(phases),
+        "query_count": len(sources) * len(phases),
+        "errors": [],
+        "cohort_sha256": hashlib.sha256(cohort_bytes).hexdigest(),
+        "case_file_sha256": {"supplemental-cell": "c" * 64},
+        "coverage_by_source_phase": {
+            source: {
+                phase: {"errors": 0, "no_data": 0, "ok": 1} for phase in phases
+            }
+            for source in sources
+        },
+    }
+    precollection["sha256"] = api.knowledge_digest(precollection)
+    (directory / "precollection_manifest.json").write_text(
+        json.dumps(precollection, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def test_unpinned_supplemental_external_run_requires_cohort_membership(
+    platform, monkeypatch, tmp_path
+):
+    from contextlib import nullcontext
+    from dataclasses import replace
+
+    client, storage, run = platform
+    spec = storage.get_experiment("test", 1).spec
+    spec["experiment"]["id"] = "supplemental"
+    spec["knowledge_campaign"] = None
+    version = storage.create_experiment("supplemental", spec)
+    supplemental_run = replace(
+        run,
+        run_id="run-supplemental",
+        experiment_id="supplemental",
+        experiment_version=version.version,
+    )
+    outsider_run = replace(supplemental_run, run_id="run-outsider")
+    storage.create_run(supplemental_run)
+    storage.create_run(outsider_run)
+
+    class Store:
+        def __init__(self, *_):
+            pass
+
+        def load_exploratory_base(self, **_kwargs):
+            return {
+                "sha256": "a" * 64,
+                "training_run_ids": ["run-training"],
+            }
+
+        def locked(self):
+            return nullcontext()
+
+    calls = []
+    monkeypatch.setattr(api, "KnowledgeStore", Store)
+    monkeypatch.setattr(
+        api,
+        "investigate_knowledge",
+        lambda **kwargs: calls.append(kwargs)
+        or {"status": "inconclusive", "evidence": []},
+    )
+
+    evaluation_id = "test-base-v6-supplemental-eval"
+    monkeypatch.setattr(api, "KNOWLEDGE_EVALUATION_ROOT", tmp_path / "evaluations")
+    _write_supplemental_evaluation_package(
+        api.KNOWLEDGE_EVALUATION_ROOT,
+        evaluation_id,
+        "supplemental-corpus",
+        "a" * 64,
+        "run-supplemental",
+    )
+    body = {
+        "corpus_id": "supplemental-corpus",
+        "mode": "exploratory_rag",
+        "external_test_evaluation_id": evaluation_id,
+        "external_test_base_sha256": "a" * 64,
+        "retrieval_backend": "opensearch",
+        "opensearch_base_sha256": "a" * 64,
+        "opensearch_source_skill_sha256": "b" * 64,
+        "opensearch_source_model": api.QWEN35_MODEL_ID,
+        "opensearch_current_model": api.QWEN35_MODEL_ID,
+        "retriever_version": api.OPENSEARCH_RETRIEVER_V6,
+    }
+    headers = {"X-User-Role": "admin"}
+
+    accepted = client.post(
+        "/api/runs/run-supplemental/skill-rag",
+        json=body,
+        headers=headers,
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert len(calls) == 1
+
+    rejected = client.post(
+        "/api/runs/run-outsider/skill-rag",
+        json=body,
+        headers=headers,
+    )
+    assert rejected.status_code == 409
+    assert "not a member" in rejected.json()["detail"]
+    assert len(calls) == 1
+
+    training_spec = storage.get_experiment("test", 1).spec
+    training_spec["experiment"]["id"] = "pinned-training"
+    training_spec["knowledge_campaign"] = {
+        "corpus_id": "supplemental-corpus",
+        "split": "train",
+    }
+    training_version = storage.create_experiment("pinned-training", training_spec)
+    pinned_training_run = replace(
+        run,
+        run_id="run-pinned-training",
+        experiment_id="pinned-training",
+        experiment_version=training_version.version,
+    )
+    storage.create_run(pinned_training_run)
+    pinned_training = client.post(
+        "/api/runs/run-pinned-training/skill-rag",
+        json=body,
+        headers=headers,
+    )
+    assert pinned_training.status_code == 409
+    assert "non-test split" in pinned_training.json()["detail"]
+    assert len(calls) == 1
+
+
 def test_rag_strategy_exposes_v6_for_new_procedural_evaluations(platform):
     client = platform[0]
     response = client.get("/api/skill-rag/strategy")
@@ -615,7 +821,9 @@ def test_rag_strategy_exposes_v6_for_new_procedural_evaluations(platform):
     assert strategy["recommended_evaluation_min_score"] == 0
 
 
-def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, monkeypatch):
+def test_knowledge_api_training_freeze_test_and_idempotent_results(
+    platform, monkeypatch
+):
     from dataclasses import replace
 
     from experiment.platform.tests.test_rca_knowledge import Model
@@ -629,9 +837,12 @@ def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, mon
     )
     version = storage.create_experiment("test", spec)
     run = replace(run, run_id="run-train", experiment_version=version.version)
-    run.summary = {"controlled_gates": {
-        "intervention_confirmed_on_target": True, "mechanism_observed": {"passed": True},
-    }}
+    run.summary = {
+        "controlled_gates": {
+            "intervention_confirmed_on_target": True,
+            "mechanism_observed": {"passed": True},
+        }
+    }
     storage.create_run(run)
     model = Model(query=True)
     monkeypatch.setattr(api, "call_llm_tool_messages", model)
@@ -643,8 +854,11 @@ def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, mon
 
     monkeypatch.setattr(api, "MCPToolClient", create_mcp_client)
     headers = {"X-User-Role": "admin"}
-    body = {"corpus_id": "corpus", "mode": "annotate",
-            "possible_fault_types": ["network-latency"]}
+    body = {
+        "corpus_id": "corpus",
+        "mode": "annotate",
+        "possible_fault_types": ["network-latency"],
+    }
     response = client.post("/api/runs/run-train/skill-rag", json=body, headers=headers)
     assert response.status_code == 200, response.text
     training = response.json()
@@ -655,7 +869,8 @@ def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, mon
     assert len(model.payloads) == calls
     freeze = client.post(
         "/api/skill-rag/corpus/freeze",
-        json={"training_run_ids": ["run-train"]}, headers=headers,
+        json={"training_run_ids": ["run-train"]},
+        headers=headers,
     )
     assert freeze.status_code == 200, freeze.text
     assert freeze.json()["eligible_count"] == 1
@@ -669,13 +884,18 @@ def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, mon
     }
     version = storage.create_experiment("test", spec)
     test = replace(
-        run, run_id="run-eval", experiment_id="test-eval", experiment_version=version.version,
+        run,
+        run_id="run-eval",
+        experiment_id="test-eval",
+        experiment_version=version.version,
     )
     storage.create_run(test)
     test_model = Model(query=True)
     monkeypatch.setattr(api, "call_llm_tool_messages", test_model)
     response = client.post(
-        "/api/runs/run-eval/skill-rag", json={**body, "mode": "rag"}, headers=headers,
+        "/api/runs/run-eval/skill-rag",
+        json={**body, "mode": "rag"},
+        headers=headers,
     )
     assert response.status_code == 200, response.text
     result = response.json()
@@ -695,9 +915,7 @@ def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, mon
     stale_result["evidence"] = [
         {**item, "source": "live"} for item in result["evidence"]
     ]
-    storage.save_artifact(
-        "run-eval", "skill_knowledge_corpus_rag", stale_result
-    )
+    storage.save_artifact("run-eval", "skill_knowledge_corpus_rag", stale_result)
     mcp_call_count = len(mcp_clients)
     refreshed = client.post(
         "/api/runs/run-eval/skill-rag",
@@ -708,12 +926,19 @@ def test_knowledge_api_training_freeze_test_and_idempotent_results(platform, mon
     assert refreshed.json().get("cached") is not True
     assert {item["source"] for item in refreshed.json()["evidence"]} == {"history"}
     assert len(mcp_clients) > mcp_call_count
-    assert client.post(
-        "/api/runs/run-eval/skill-rag", json=body, headers=headers,
-    ).status_code == 409
+    assert (
+        client.post(
+            "/api/runs/run-eval/skill-rag",
+            json=body,
+            headers=headers,
+        ).status_code
+        == 409
+    )
 
 
-def test_failed_controlled_run_uses_persisted_baseline_and_fault_windows(platform, monkeypatch):
+def test_failed_controlled_run_uses_persisted_baseline_and_fault_windows(
+    platform, monkeypatch
+):
     client, storage, run = platform
     controlled_window = {
         "timezone": "UTC",
@@ -799,7 +1024,9 @@ def test_multiagent_plan_is_read_only_and_excludes_ground_truth(platform, monkey
     assert "/api/runs/{run_id}/rca" in paths
 
 
-def test_multiagent_plan_rejects_missing_running_and_unusable_runs(platform, monkeypatch):
+def test_multiagent_plan_rejects_missing_running_and_unusable_runs(
+    platform, monkeypatch
+):
     client, storage, run = platform
     assert client.get("/api/runs/missing/multiagent-rca/plan").status_code == 404
     monkeypatch.setattr(api, "load_system_card", lambda namespace: {})
@@ -825,12 +1052,14 @@ def test_controlled_campaign_capabilities_endpoint_exposes_protocol(platform):
     response = client.get("/api/controlled-campaign/capabilities")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "protocol_version": api.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION,
-    }
+    assert response.json() == api.controlled_backend_capabilities()
+    assert len(response.json()["implementation_sha256"]) == 64
+    assert response.json()["memory_stressor_process_signature"] == "stress-ng --vm-bytes"
 
 
-def test_multiagent_execution_persists_immutable_attempt_and_excludes_ground_truth(platform, monkeypatch):
+def test_multiagent_execution_persists_immutable_attempt_and_excludes_ground_truth(
+    platform, monkeypatch
+):
     client, storage, run = platform
     captured = []
     mcp_endpoints = []
@@ -852,7 +1081,14 @@ def test_multiagent_execution_persists_immutable_attempt_and_excludes_ground_tru
             "calls": [],
             "specialists": [],
             "budget": {"model_calls_used": 5},
-            "followup_rounds": [{"round": 1, "action": "stop", "reason": "Sem novo check", "status": "stopped"}],
+            "followup_rounds": [
+                {
+                    "round": 1,
+                    "action": "stop",
+                    "reason": "Sem novo check",
+                    "status": "stopped",
+                }
+            ],
             "stop_reason": "coordinator_stop",
         }
 
@@ -886,7 +1122,10 @@ def test_multiagent_execution_persists_immutable_attempt_and_excludes_ground_tru
     assert "must-not-reach-model" not in repr(captured[0]["context"])
     assert "chaos_profile" not in repr(captured[0]["context"])
     assert len(storage.list_events(run.run_id)) == 2
-    assert all(event.event_type == "multiagent_rca_completed" for event in storage.list_events(run.run_id))
+    assert all(
+        event.event_type == "multiagent_rca_completed"
+        for event in storage.list_events(run.run_id)
+    )
     paths = client.get("/openapi.json").json()["paths"]
     assert "/api/runs/{run_id}/multiagent-rca" in paths
 

@@ -72,8 +72,21 @@ def test_knowledge_browser_lists_and_returns_a_b_pairs(knowledge_client):
     assert data["mode"] == "exploratory"
     assert data["pairs"][0]["a"]["symptoms"][0]["description"] == "CPU increased"
     assert data["pairs"][0]["b"]["recommended_checks"] == ["Check CPU"]
+    assert data["pairs"][0]["labels"] == {
+        "service": "carts",
+        "fault_type": "cpu-hog",
+    }
     assert data["pairs"][0]["b_eligible"] is None
     assert "index" not in data
+
+
+def test_frontend_assets_are_revalidated_after_updates(knowledge_client):
+    client, _ = knowledge_client
+
+    response = client.get("/app.js")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
 
 
 def test_knowledge_browser_identifies_latest_evaluation_for_corpus(

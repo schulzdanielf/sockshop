@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import statistics
 import subprocess
@@ -10,6 +11,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .domain import RunStatus, utc_now_iso
@@ -29,9 +31,38 @@ ACTIVE_SECONDS = {
     "container-kill": 0, "http-status-code": 120,
 }
 CONTROLLED_CAMPAIGN_PROTOCOL_VERSION = 6
+CONTROLLED_MEASUREMENT_POLICY = {
+    "version": "controlled-measurement-v2",
+    "rate_lookback_seconds": 60,
+    "cpu_elapsed_clock": "monotonic",
+    "max_clock_drift_seconds": 1,
+    "stability_thresholds_changed": False,
+}
+SUPPLEMENTAL_PREPARATION_POLICY = {
+    "version": "controlled-supplemental-preparation-v1",
+    "warmup_min_seconds": 180,
+    "stabilization_window_seconds": 60,
+    "stable_windows_required": 2,
+    "preparation_timeout_seconds": 600,
+    "baseline_seconds": 180,
+    "health_check_interval_seconds": 15,
+}
 CONTAINER_KILL_RESTART_TIMEOUT_SECONDS = 120
 CONTAINER_KILL_POLL_SECONDS = 2
 INJECTOR_IMAGE = "litmuschaos.docker.scarf.sh/litmuschaos/go-runner:3.28.0"
+MEMORY_STRESSOR_PROCESS_PATTERN = "*stress-ng*--vm-bytes*"
+MEMORY_STRESSOR_PROCESS_SIGNATURE = "stress-ng --vm-bytes"
+# Capture at import, not per request: changed files do not update a running API.
+_IMPLEMENTATION_SHA256 = hashlib.sha256(b"\0".join(
+    path.read_bytes()
+    for path in (
+        Path(__file__),
+        Path(__file__).with_name("engine.py"),
+        Path(__file__).with_name("plugins") / "litmus_plugin.py",
+        Path(__file__).with_name("plugins") / "locust_plugin.py",
+        Path(__file__).resolve().parents[2] / "eval/memory_hog/resource_intensity.py",
+    )
+)).hexdigest()
 CGROUP_RESOURCE_KEYS = frozenset({
     "cpu_cores", "cpu_quota_cores", "memory_bytes", "memory_usage_bytes",
     "memory_limit_bytes", "oom_events", "oom_kill_events",
@@ -50,6 +81,45 @@ class GateBlocked(ValueError):
     """No intervention may be submitted for this combination."""
 
 
+def controlled_backend_capabilities() -> dict[str, Any]:
+    return {
+        "protocol_version": CONTROLLED_CAMPAIGN_PROTOCOL_VERSION,
+        "implementation_sha256": _IMPLEMENTATION_SHA256,
+        "measurement_policy": dict(CONTROLLED_MEASUREMENT_POLICY),
+        "memory_stressor_process_signature": MEMORY_STRESSOR_PROCESS_SIGNATURE,
+    }
+
+
+def validate_cgroup_timing(readings: list[dict[str, Any]]) -> None:
+    max_drift = CONTROLLED_MEASUREMENT_POLICY["max_clock_drift_seconds"]
+    for reading in readings:
+        duration = reading.get("read_duration_seconds", 0)
+        if not math.isfinite(duration) or duration < 0:
+            raise GateBlocked("invalid cgroup timing: negative or non-finite read duration")
+        wall_duration = reading.get("wall_clock_read_duration_seconds", duration)
+        drift = abs(wall_duration - duration)
+        if drift > max_drift:
+            raise GateBlocked(
+                "invalid cgroup timing: wall clock changed during read "
+                f"(wall={wall_duration:.6f}s, monotonic={duration:.6f}s, "
+                f"drift={drift:.6f}s, limit={max_drift:.3f}s)"
+            )
+    for before, after in zip(readings, readings[1:]):
+        wall_elapsed = after["timestamp"] - before["timestamp"]
+        if wall_elapsed <= 0:
+            raise GateBlocked("invalid cgroup timing: timestamps did not increase")
+        if "monotonic_timestamp" in before and "monotonic_timestamp" in after:
+            elapsed = after["monotonic_timestamp"] - before["monotonic_timestamp"]
+            drift = abs(wall_elapsed - elapsed)
+            if elapsed <= 0 or drift > max_drift:
+                raise GateBlocked(
+                    "invalid cgroup timing: wall clock changed between reads "
+                    f"(wall_elapsed={wall_elapsed:.6f}s, "
+                    f"monotonic_elapsed={elapsed:.6f}s, drift={drift:.6f}s, "
+                    f"limit={max_drift:.3f}s)"
+                )
+
+
 def controlled_time_budget(policy: dict[str, Any]) -> dict[str, Any]:
     saved = policy.get("time_budget")
     if saved is not None:
@@ -65,13 +135,48 @@ def controlled_time_budget(policy: dict[str, Any]) -> dict[str, Any]:
     return {"version": 0, "load_seconds": 1800, "poll_seconds": 1800}
 
 
+def supplemental_preparation_policy(policy: dict[str, Any]) -> dict[str, Any] | None:
+    configured = policy.get("preparation_policy")
+    if configured is None:
+        return None
+    if configured != SUPPLEMENTAL_PREPARATION_POLICY:
+        raise GateBlocked("unsupported or modified supplemental preparation policy")
+    return configured
+
+
+def recovery_timeout_seconds(policy: dict[str, Any], service: str) -> int:
+    overrides = policy.get("recovery_timeout_by_service") or {}
+    if not isinstance(overrides, dict):
+        raise GateBlocked("recovery_timeout_by_service must be a mapping")
+    timeout = overrides.get(service, policy.get("recovery_timeout_seconds", 300))
+    if type(timeout) is not int or not 1 <= timeout <= 1800:
+        raise GateBlocked(f"invalid experimental recovery timeout for {service}")
+    return timeout
+
+
 def build_time_budget(policy: dict[str, Any]) -> dict[str, Any]:
+    preparation = supplemental_preparation_policy(policy)
+    recovery_timeouts = [
+        recovery_timeout_seconds(policy, "default"),
+        *(
+            int(value)
+            for value in (policy.get("recovery_timeout_by_service") or {}).values()
+        ),
+    ]
     stages = {
-        "warmup": 60, "stabilization_waits": 9 * 15, "baseline": 90,
+        "warmup": (
+            preparation["warmup_min_seconds"] if preparation else 60
+        ),
+        "stabilization_waits": (
+            preparation["preparation_timeout_seconds"]
+            - preparation["warmup_min_seconds"]
+            if preparation else 9 * 15
+        ),
+        "baseline": preparation["baseline_seconds"] if preparation else 90,
         "workflow": int(policy["workflow_timeout_seconds"]),
         "restart_confirmation": CONTAINER_KILL_RESTART_TIMEOUT_SECONDS,
         "active_intervention": max(ACTIVE_SECONDS.values()), "post_observation": 120,
-        "experimental_recovery": int(policy["recovery_timeout_seconds"]),
+        "experimental_recovery": max(recovery_timeouts),
         "operational_recovery": int((policy.get("resilience") or {}).get("operational_timeout_seconds", 0)),
         "late_operational_recovery": int(
             (policy.get("resilience") or {}).get("late_operational_timeout_seconds", 0)
@@ -86,16 +191,54 @@ def build_time_budget(policy: dict[str, Any]) -> dict[str, Any]:
     }})
 
 
-def stability_metrics(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+DEFAULT_STABILITY_RELATIVE_LIMIT = .20
+
+
+def stability_metrics(
+    data: dict[str, Any], *, include_target_edge: bool = False,
+    default_relative_limit: float = DEFAULT_STABILITY_RELATIVE_LIMIT,
+    relative_limit_overrides: dict[str, float] | None = None,
+) -> dict[str, dict[str, Any]]:
     checks = {}
-    for metric, floor in (("traffic", .1), ("cpu_cores", .02),
-                          ("memory_bytes", 8 * 2**20), ("latency_ms", 20)):
+    metrics = [
+        ("traffic", .1), ("cpu_cores", .02),
+        ("memory_bytes", 8 * 2**20), ("latency_ms", 20),
+    ]
+    if include_target_edge:
+        metrics.extend((
+            ("target_edge_requests", .1),
+            ("target_edge_latency_ms", 20),
+        ))
+    if (
+        type(default_relative_limit) not in (int, float)
+        or not math.isfinite(default_relative_limit)
+        or not 0 < default_relative_limit <= 1
+    ):
+        raise GateBlocked("default stability relative limit must be finite and in (0, 1]")
+    overrides = (
+        {} if relative_limit_overrides is None else relative_limit_overrides
+    )
+    metric_names = {metric for metric, _ in metrics}
+    if not isinstance(overrides, dict) or not set(overrides).issubset(metric_names):
+        raise GateBlocked("invalid stability relative-limit metric override")
+    if any(
+        type(relative_limit) not in (int, float)
+        or not math.isfinite(relative_limit)
+        or not 0 < relative_limit <= 1
+        for relative_limit in overrides.values()
+    ):
+        raise GateBlocked("stability relative-limit overrides must be finite and in (0, 1]")
+    for metric, floor in metrics:
         values = [value for _, value in samples(data[metric])]
         if not values:
             raise GateBlocked(f"no {metric} samples for stabilization")
         variation = statistics.pstdev(values)
-        limit = max(abs(statistics.fmean(values)) * .20, floor)
-        checks[metric] = {"stddev": variation, "limit": limit, "passed": variation <= limit}
+        relative_limit = overrides.get(metric, default_relative_limit)
+        limit = max(abs(statistics.fmean(values)) * relative_limit, floor)
+        checks[metric] = {
+            "stddev": variation, "relative_limit": relative_limit,
+            "floor": floor, "limit": limit, "passed": variation <= limit,
+        }
     return checks
 
 
@@ -165,6 +308,21 @@ def validate_workflow_template(
         or [item.get("name") for item in engines[0]["spec"].get("experiments", [])] != [f"pod-{fault}"]
     ):
         raise GateBlocked("reviewed template does not select exactly the intended service/intervention")
+    if fault == "memory-hog":
+        experiment = engines[0]["spec"]["experiments"][0]
+        env = {
+            item.get("name"): item.get("value")
+            for item in experiment.get("spec", {}).get("components", {}).get("env", [])
+        }
+        cleanup_command = env.get("CHAOS_KILL_COMMAND")
+        if (
+            not isinstance(cleanup_command, str)
+            or "[s]tress-ng" not in cleanup_command
+            or "--vm-bytes" not in cleanup_command
+        ):
+            raise GateBlocked(
+                "memory-hog cleanup must target the Litmus stress-ng --vm-bytes worker"
+            )
     return {"runner": definitions, "workflow": images}
 
 
@@ -367,6 +525,7 @@ class ControlledRun:
             "schema_version": 1, "status": "preparing", "gates": {},
             "timestamps": {}, "limitations": [], "observations": [],
             "planned": spec["timeline"], "fault": self.fault, "service": self.service,
+            "measurement_policy": dict(CONTROLLED_MEASUREMENT_POLICY),
         }
         self.paths: dict[str, str] = {}
         self.chaos_handle: dict[str, Any] | None = None
@@ -438,19 +597,19 @@ class ControlledRun:
             status = self.application_container_status()
             if not status["running"] or status["container_id"] != container_id:
                 raise GateBlocked("container identity changed before startup cgroup read")
-        started = time.time()
-        started_at = utc_now_iso()
         command = [
                 "kubectl", "-n", self.namespace, "exec", self.target["pod"],
                 "-c", self.service, "--", "sh", "-c", CGROUP_READ_COMMAND,
         ]
         result = None
         for attempt in range(2):
+            started = time.time()
+            monotonic_started = time.monotonic()
+            started_at = utc_now_iso()
             try:
                 result = subprocess.run(
                     command, capture_output=True, text=True, check=False, timeout=30,
                 )
-                break
             except subprocess.TimeoutExpired as exc:
                 failure = {
                     "at": utc_now_iso(), "attempt": attempt + 1, "timeout_seconds": 30,
@@ -466,9 +625,31 @@ class ControlledRun:
                     raise GateBlocked(
                         "cgroup v2 sampling timed out twice; explicit collection errors prevent baseline use"
                     ) from exc
+                continue
+            if (
+                attempt == 0 and result.returncode and not result.stdout.strip()
+                and result.stderr.strip() == "error: error stream protocol error: unknown error"
+            ):
+                with self.telemetry_lock:
+                    self.report.setdefault("telemetry", {}).setdefault(
+                        "cgroup_v2_read_retries", [],
+                    ).append({
+                        "at": utc_now_iso(), "attempt": 1,
+                        "error": result.stderr.strip(),
+                        "reason": "transient_exec_stream_error_before_any_cgroup_output",
+                    })
+                    self.checkpoint()
+                status = self.application_container_status()
+                if not status["running"] or status["container_id"] != container_id:
+                    error = "container identity changed before cgroup transport retry"
+                    self.record_cgroup_read_failure(error, container_id)
+                    raise GateBlocked(error)
+                continue
+            break
         if result is None:
             raise RuntimeError("cgroup v2 sampling ended without a command result")
         completed_at = utc_now_iso()
+        monotonic_finished = time.monotonic()
         finished = time.time()
         if result.returncode:
             error = result.stderr.strip() or result.stdout.strip()
@@ -490,10 +671,17 @@ class ControlledRun:
             "container_id": container_id,
             "read_started_at": started_at,
             "read_completed_at": completed_at,
-            "read_duration_seconds": finished - started,
+            "read_duration_seconds": monotonic_finished - monotonic_started,
+            "wall_clock_read_duration_seconds": finished - started,
+            "monotonic_timestamp": (monotonic_started + monotonic_finished) / 2,
             "raw": values["raw"],
         }
         with self.telemetry_lock:
+            try:
+                validate_cgroup_timing(self.cgroup_samples[-1:] + [sample])
+            except GateBlocked as exc:
+                self.record_cgroup_read_failure(str(exc), container_id)
+                raise
             self.cgroup_samples.append(sample)
             self.update_cgroup_telemetry()
         return sample
@@ -598,6 +786,7 @@ class ControlledRun:
         in_window = [sample for sample in snapshot if start_ts <= sample["timestamp"] <= end_ts]
         previous = [sample for sample in snapshot if sample["timestamp"] < start_ts]
         selected = ([previous[-1]] if previous else []) + in_window
+        validate_cgroup_timing(selected)
         values: dict[str, list[tuple[float, float]]] = {
             key: [] for key in CGROUP_RESOURCE_KEYS
         }
@@ -614,7 +803,11 @@ class ControlledRun:
             values["oom_kill_events"].append((timestamp, sample["oom_kill_events"]))
         for before, after in zip(selected, selected[1:]):
             timestamp = after["timestamp"]
-            elapsed = timestamp - before["timestamp"]
+            elapsed = (
+                after["monotonic_timestamp"] - before["monotonic_timestamp"]
+                if "monotonic_timestamp" in before and "monotonic_timestamp" in after
+                else timestamp - before["timestamp"]
+            )
             if timestamp < start_ts or elapsed <= 0:
                 continue
             if before.get("container_id") != after.get("container_id"):
@@ -926,15 +1119,28 @@ class ControlledRun:
     def queries(self) -> dict[str, str]:
         selector = f'namespace="{self.namespace}",pod="{self.target["pod"]}",container="{self.service}"'
         mesh = f'destination_workload_namespace="{self.namespace}",destination_workload="{self.service}",reporter="destination"'
-        traffic_rate = f"sum(rate(istio_requests_total{{{mesh}}}[30s]))"
-        server_5xx_rate = f'sum(rate(istio_requests_total{{{mesh},response_code=~"5.."}}[30s]))'
-        if self.fault == "http-status-code" and self.service == "front-end":
+        traffic_rate = f"sum(rate(istio_requests_total{{{mesh}}}[1m]))"
+        server_5xx_rate = f'sum(rate(istio_requests_total{{{mesh},response_code=~"5.."}}[1m]))'
+        external_front_end_network = (
+            self.fault == "network-latency" and self.service == "front-end"
+        )
+        if (
+            self.fault == "http-status-code" and self.service == "front-end"
+        ) or external_front_end_network:
             target_reporter = "destination"
         else:
             target_reporter = "source"
+        if external_front_end_network:
+            self.report["target_edge_selection"] = {
+                "reporter": "destination",
+                "source_workload": "unknown",
+                "reason": "Locust traffic enters front-end from outside the service mesh",
+            }
         target_edge = istio_expression(
             "istio_requests_total", self.namespace, service=self.service,
-            reporter=target_reporter, lookback="30s",
+            reporter=target_reporter,
+            source_workload_unknown=external_front_end_network,
+            lookback="1m",
         )
         target_edge_requests = (
             f"sum({target_edge})"
@@ -942,26 +1148,30 @@ class ControlledRun:
         target_edge_5xx = (
             "sum(" + istio_expression(
                 "istio_requests_total", self.namespace, service=self.service,
-                reporter=target_reporter, codes="5..", lookback="30s",
+                reporter=target_reporter,
+                source_workload_unknown=external_front_end_network,
+                codes="5..", lookback="1m",
             ) + ")"
         )
         target_edge_latency = (
             "histogram_quantile(0.95,sum by(le)(" + istio_expression(
                 "istio_request_duration_milliseconds_bucket", self.namespace,
-                service=self.service, reporter=target_reporter, lookback="30s",
+                service=self.service, reporter=target_reporter,
+                source_workload_unknown=external_front_end_network,
+                lookback="1m",
             ) + "))"
         )
         queries = {
-            "cpu_cores": f"sum(rate(container_cpu_usage_seconds_total{{{selector}}}[30s]))",
+            "cpu_cores": f"sum(rate(container_cpu_usage_seconds_total{{{selector}}}[1m]))",
             "memory_bytes": f"sum(container_memory_working_set_bytes{{{selector}}})",
-            "throttled_seconds_per_second": f"sum(rate(container_cpu_cfs_throttled_seconds_total{{{selector}}}[30s]))",
+            "throttled_seconds_per_second": f"sum(rate(container_cpu_cfs_throttled_seconds_total{{{selector}}}[1m]))",
             "traffic": traffic_rate,
             "errors_5xx_rate": server_5xx_rate,
             "errors_percent": (
                 f"100 * (({server_5xx_rate}) or (({traffic_rate}) * 0)) "
                 f"/ clamp_min(({traffic_rate}), 1e-9)"
             ),
-            "latency_ms": f"histogram_quantile(0.95,sum by(le)(rate(istio_request_duration_milliseconds_bucket{{{mesh}}}[30s])))",
+            "latency_ms": f"histogram_quantile(0.95,sum by(le)(rate(istio_request_duration_milliseconds_bucket{{{mesh}}}[1m])))",
             "oom_events": f'sum(container_oom_events_total{{{selector}}})',
             "memory_usage_bytes": f"sum(container_memory_usage_bytes{{{selector}}})",
             "cpu_quota_cores": f"sum(container_spec_cpu_quota{{{selector}}} / container_spec_cpu_period{{{selector}}})",
@@ -973,7 +1183,7 @@ class ControlledRun:
         for service in ("orders", "payment", "shipping"):
             queries[f"checkout_{service}"] = (
                 f'sum(rate(istio_requests_total{{destination_workload_namespace="{self.namespace}",'
-                f'destination_workload="{service}",reporter="destination"}}[30s]))'
+                f'destination_workload="{service}",reporter="destination"}}[1m]))'
             )
         queries["target_edge_requests"] = target_edge_requests
         queries["target_edge_5xx"] = target_edge_5xx
@@ -1087,7 +1297,8 @@ class ControlledRun:
         ):
             raise GateBlocked("no scrape target metadata")
         self.report["telemetry"] = {
-            "requested_query_step_seconds": 5, "rate_lookback_seconds": 30,
+            "requested_query_step_seconds": 5,
+            "rate_lookback_seconds": CONTROLLED_MEASUREMENT_POLICY["rate_lookback_seconds"],
             "metadata_source": "same_mcp_prometheus_client_as_metric_queries",
             "resource_metrics": {
                 "source": "cgroup v2 read inside the selected application container",
@@ -1101,9 +1312,20 @@ class ControlledRun:
                 }
                 for target in active if isinstance(target, dict)
             ],
+            "sample_age_history_campaign_id": config.get("history_campaign_id"),
             "limitation": "5s query step does not change exporter/scrape frequency; repeated interpolated samples are not independent",
         }
-        query = f'time() - timestamp(container_memory_working_set_bytes{{namespace="{self.namespace}",pod="{self.target["pod"]}"}})'
+        history_campaign_id = config.get("history_campaign_id")
+        campaign_selector = (
+            f",history_campaign={json.dumps(history_campaign_id)}"
+            if isinstance(history_campaign_id, str) and history_campaign_id
+            else ""
+        )
+        query = (
+            "time() - timestamp(container_memory_working_set_bytes"
+            f'{{namespace="{self.namespace}",pod="{self.target["pod"]}"'
+            f"{campaign_selector}}})"
+        )
         lag = client.call_tool_json("prometheus_instant_query", {"query": query})
         self.report["telemetry"]["sample_age_raw"] = lag
         result = (lag.get("data") or {}).get("result") or []
@@ -1443,6 +1665,62 @@ class ControlledRun:
                 )
             self.wait(CONTAINER_KILL_POLL_SECONDS)
 
+    def observe_memory_stressor(self) -> None:
+        status = self.application_container_status()
+        if status["container_id"] != self.target["container_id"]:
+            raise RuntimeError("application container changed while observing memory stressor")
+        command = (
+            'self_pid=$$; '
+            'for file in /proc/[0-9]*/cmdline; do '
+            '[ -r "$file" ] || continue; '
+            'pid=${file#/proc/}; pid=${pid%/cmdline}; '
+            '[ "$pid" = "$self_pid" ] && continue; '
+            'args=$(tr "\\000" " " < "$file" 2>/dev/null) || continue; '
+            f'case "$args" in {MEMORY_STRESSOR_PROCESS_PATTERN}) '
+            'printf "%s\\n" "$pid";; esac; '
+            'done'
+        )
+        result = subprocess.run(
+            [
+                "kubectl", "-n", self.namespace, "exec", self.target["pod"],
+                "-c", self.service, "--", "sh", "-c", command,
+            ],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"cannot read memory stressor process markers: {result.stderr.strip()}"
+            )
+        pids = sorted({
+            line.strip() for line in result.stdout.splitlines()
+            if line.strip().isdigit()
+        })
+        observed_at = utc_now_iso()
+        window = self.report.setdefault("memory_stressor_window", {
+            "marker": "target_container_process_command_line",
+            "process_signature": MEMORY_STRESSOR_PROCESS_SIGNATURE,
+            "first_observed_at": None,
+            "last_observed_at": None,
+            "first_absent_at": None,
+            "continuous_at_poll_observations": True,
+            "observations": 0,
+            "pids": [],
+        })
+        window["observations"] += 1
+        if pids:
+            if window["first_absent_at"] is not None:
+                window["continuous_at_poll_observations"] = False
+            window["first_observed_at"] = (
+                window["first_observed_at"] or observed_at
+            )
+            window["last_observed_at"] = observed_at
+            window["pids"] = pids
+        elif (
+            window["first_observed_at"] is not None
+            and window["first_absent_at"] is None
+        ):
+            window["first_absent_at"] = observed_at
+
     def intervene(self) -> tuple[str, str, str]:
         if self.fault == "container-kill":
             return self.intervene_container_kill()
@@ -1508,6 +1786,8 @@ class ControlledRun:
             self.save("chaosengines_observed", engines)
             self.engine_uids.update(item["metadata"]["uid"] for item in engines["items"])
             self.save("injector_pods", kubectl("-n", "litmus", "get", "pods", "-o", "json"))
+            if self.fault == "memory-hog":
+                self.observe_memory_stressor()
             if self.fault == "network-latency":
                 rules = self.qdisc()
                 if any(item.get("kind") == "netem" for item in rules):
@@ -1528,10 +1808,16 @@ class ControlledRun:
                     }
                     if not valid:
                         raise RuntimeError("netem applied but configured delay not verified from actual rule")
-                    self.report["timestamps"].setdefault("network_rule_first_observed", {
-                        "at": utc_now_iso(), "source": "tc_qdisc_readback",
-                        "limitation": "polling timestamp brackets application, not exact tc install instant",
+                    observed_at = utc_now_iso()
+                    timestamps = self.report["timestamps"]
+                    timestamps.setdefault("network_rule_first_observed", {
+                        "at": observed_at, "source": "tc_qdisc_readback",
+                        "limitation": "first positive readback; actual installation is earlier or equal",
                     })
+                    timestamps["network_rule_last_observed"] = {
+                        "at": observed_at, "source": "tc_qdisc_readback",
+                        "limitation": "last positive readback; actual removal is later or equal",
+                    }
             if self.fault == "memory-hog":
                 try:
                     if self.cgroup_sampling_enabled:
@@ -1560,6 +1846,55 @@ class ControlledRun:
         else:
             raise RuntimeError("workflow timeout; no further intervention allowed")
         self.cleanup()
+        if self.fault == "memory-hog":
+            marker = self.report.get("memory_stressor_window") or {}
+            start = marker.get("first_observed_at")
+            end = marker.get("last_observed_at")
+            duration = (
+                datetime.fromisoformat(end.replace("Z", "+00:00"))
+                - datetime.fromisoformat(start.replace("Z", "+00:00"))
+            ).total_seconds() if start and end else 0
+            self.report["timestamps"]["intervention_estimate"] = {
+                "start": start,
+                "end": end,
+                "source": "target_container_process_observation_interval",
+                "duration_verified": False,
+                "observed_presence_seconds": duration,
+                "configured_seconds": ACTIVE_SECONDS[self.fault],
+                "limitation": (
+                    "5s process polling provides a conservative observed-presence interval, "
+                    "not exact process start or exit timestamps"
+                ),
+            }
+            if not start or not end:
+                raise RuntimeError(
+                    "memory stressor process start/end was not observed; refusing an estimated fault window"
+                )
+            if marker.get("continuous_at_poll_observations") is not True:
+                raise RuntimeError(
+                    "memory stressor process disappeared and reappeared; refusing a continuous fault window"
+                )
+            return start, end, "target_container_process_observation_interval"
+        if self.fault == "network-latency":
+            first = self.report["timestamps"].get("network_rule_first_observed", {})
+            last = self.report["timestamps"].get("network_rule_last_observed", {})
+            start, end = first.get("at"), last.get("at")
+            if not start or not end:
+                raise RuntimeError(
+                    "netem active interval was not bracketed by qdisc readback"
+                )
+            self.report["timestamps"]["intervention_estimate"] = {
+                "start": start,
+                "end": end,
+                "source": "tc_qdisc_positive_readback_interval",
+                "duration_verified": False,
+                "configured_seconds": ACTIVE_SECONDS[self.fault],
+                "limitation": (
+                    "the interval is bounded by the first and last positive qdisc polls; "
+                    "actual install/removal can occur between polls"
+                ),
+            }
+            return start, end, "tc_qdisc_positive_readback_interval"
         status = self.report["workflow"]
         anchor = status.get("chaos_result_created_at")
         if not anchor:
@@ -1736,6 +2071,32 @@ class ControlledRun:
             self.report["gates"]["intervention_confirmed_on_target"] = (
                 self.report.get("network_rule_validation", {}).get("passed")
             )
+        if self.fault == "memory-hog":
+            marker = self.report.get("memory_stressor_window") or {}
+            start_at = marker.get("first_observed_at")
+            end_at = marker.get("last_observed_at")
+            observed_seconds = (
+                datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+                - datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+            ).total_seconds() if start_at and end_at else 0
+            required_seconds = 30 + float(self.policy.get("sustained_seconds", 60))
+            confirmed = bool(
+                marker.get("continuous_at_poll_observations") is True
+                and observed_seconds >= required_seconds
+            )
+            self.report["gates"]["intervention_confirmed_on_target"] = confirmed
+            if not confirmed:
+                self.report["gates"]["mechanism_observed"] = {
+                    "status": "memory_stressor_window_not_confirmed",
+                    "passed": False,
+                    "observed_process_seconds": observed_seconds,
+                    "required_observed_process_seconds": required_seconds,
+                    "marker": marker.get("marker"),
+                    "continuous_at_poll_observations": marker.get(
+                        "continuous_at_poll_observations"
+                    ),
+                }
+                return
         key = {"cpu-hog": "cpu_cores", "memory-hog": "memory_bytes",
                "network-latency": "target_edge_latency_ms"}.get(self.fault)
         if not key:
@@ -2063,7 +2424,13 @@ class ControlledRun:
             self.container_kill_observation_started = True
         post_start = utc_now_iso()
         self.wait(120)
-        deadline = time.monotonic() + int(self.policy.get("recovery_timeout_seconds", 300))
+        recovery_timeout = recovery_timeout_seconds(self.policy, self.service)
+        self.report["recovery_policy"] = {
+            "experimental_timeout_seconds": recovery_timeout,
+            "post_observation_seconds": 120,
+            "service": self.service,
+        }
+        deadline = time.monotonic() + recovery_timeout
         while True:
             check = self.recovery_check()
             self.report["gates"]["recovery"] = check
@@ -2114,9 +2481,22 @@ class ControlledRun:
             self.engine._event(self.run_id, "run_started", {"at": utc_now_iso(), "controlled": True})
             self.load_handle = self.engine.load.start_load(self.context, load)
             self.engine._runtime_handles[self.run_id]["load"] = self.load_handle
+            preparation = supplemental_preparation_policy(self.policy)
             warm_start = self.mark("warmup_started")
             origin = datetime.fromisoformat(warm_start)
-            nominal_submission = 60 + 90
+            warmup_seconds = (
+                preparation["warmup_min_seconds"] if preparation else 60
+            )
+            baseline_seconds = preparation["baseline_seconds"] if preparation else 90
+            nominal_submission = (
+                warmup_seconds
+                + (
+                    preparation["stable_windows_required"]
+                    * preparation["stabilization_window_seconds"]
+                    if preparation else 0
+                )
+                + baseline_seconds
+            )
             nominal_removal = nominal_submission + ACTIVE_SECONDS[self.fault]
             self.report["planned_timestamps"] = {
                 "source": "nominal_minimum_schedule_from_load_start",
@@ -2124,7 +2504,8 @@ class ControlledRun:
                 **{
                     name: (origin + timedelta(seconds=seconds)).isoformat()
                     for name, seconds in {
-                        "baseline_start": 60, "submission": nominal_submission,
+                        "baseline_start": nominal_submission - baseline_seconds,
+                        "submission": nominal_submission,
                         "intervention_end_excluding_overhead": nominal_removal,
                         "post_observation_end": nominal_removal + 120,
                         "cooldown_end_after_nominal_recovery": nominal_removal + 150,
@@ -2132,37 +2513,130 @@ class ControlledRun:
                 },
             }
             self.checkpoint()
-            self.wait(60)
+            preparation_started = time.monotonic()
+            self.wait(warmup_seconds)
             stable = False
-            for attempt in range(9):
-                end = utc_now_iso()
-                start = (datetime.fromisoformat(end) - timedelta(seconds=30)).isoformat()
-                summary = self.collect(f"stabilization_{attempt}", start, end)
-                try:
-                    self.require_coverage(summary, 30)
-                    checks = stability_metrics(self.raw[f"stabilization_{attempt}"]["data"])
-                    stable_metrics = all(check["passed"] for check in checks.values())
-                    health = self.health()
+            if preparation:
+                deadline = (
+                    preparation_started
+                    + preparation["preparation_timeout_seconds"]
+                )
+                stable_windows = 0
+                attempt = 0
+                while stable_windows < preparation["stable_windows_required"]:
+                    if (
+                        time.monotonic()
+                        + preparation["stabilization_window_seconds"]
+                        > deadline
+                    ):
+                        break
+                    start = utc_now_iso()
+                    window_started = time.monotonic()
+                    health_checks = []
+                    while (
+                        time.monotonic() - window_started
+                        < preparation["stabilization_window_seconds"]
+                    ):
+                        wait_seconds = min(
+                            preparation["health_check_interval_seconds"],
+                            preparation["stabilization_window_seconds"]
+                            - (time.monotonic() - window_started),
+                        )
+                        self.wait(max(1, int(math.ceil(wait_seconds))))
+                        health = self.health()
+                        health_checks.append({
+                            "at": utc_now_iso(),
+                            "healthy": health["healthy"],
+                            "health": health,
+                        })
+                        if not health["healthy"]:
+                            raise GateBlocked(
+                                "application health failed during stabilization"
+                            )
+                    end = utc_now_iso()
+                    summary = self.collect(
+                        f"stabilization_{attempt}", start, end,
+                    )
+                    try:
+                        self.require_coverage(
+                            summary,
+                            preparation["stabilization_window_seconds"],
+                        )
+                        checks = stability_metrics(
+                            self.raw[f"stabilization_{attempt}"]["data"],
+                            include_target_edge=self.fault == "network-latency",
+                        )
+                        stable_metrics = all(
+                            check["passed"] for check in checks.values()
+                        )
+                    except GateBlocked as exc:
+                        self.report["limitations"].append(str(exc))
+                        checks = {"coverage": {"passed": False, "error": str(exc)}}
+                        stable_metrics = False
+                    passed = bool(stable_metrics and health_checks)
+                    stable_windows = stable_windows + 1 if passed else 0
                     self.report.setdefault("stabilization_checks", []).append({
-                        "attempt": attempt, "start": start, "end": end,
-                        "metrics": checks, "health": health,
-                        "passed": bool(stable_metrics and health["healthy"]),
+                        "attempt": attempt,
+                        "start": start,
+                        "end": end,
+                        "window_seconds": preparation["stabilization_window_seconds"],
+                        "non_overlapping": True,
+                        "consecutive_passes": stable_windows,
+                        "metrics": checks,
+                        "health_checks": health_checks,
+                        "passed": passed,
                     })
                     self.checkpoint()
-                    if stable_metrics and health["healthy"]:
-                        stable = True
-                        break
-                except GateBlocked as exc:
-                    self.report["limitations"].append(str(exc))
-                self.wait(15)
-            if not stable:
-                raise GateBlocked("load did not stabilize after minimum 60s warmup")
+                    attempt += 1
+                stable = (
+                    stable_windows >= preparation["stable_windows_required"]
+                )
+                if not stable:
+                    raise GateBlocked(
+                        "two consecutive 60s stabilization windows did not pass "
+                        "within the 600s preparation deadline"
+                    )
+            else:
+                stable = False
+                for attempt in range(9):
+                    end = utc_now_iso()
+                    start = (
+                        datetime.fromisoformat(end) - timedelta(seconds=30)
+                    ).isoformat()
+                    summary = self.collect(
+                        f"stabilization_{attempt}", start, end,
+                    )
+                    try:
+                        self.require_coverage(summary, 30)
+                        checks = stability_metrics(
+                            self.raw[f"stabilization_{attempt}"]["data"],
+                        )
+                        stable_metrics = all(
+                            check["passed"] for check in checks.values()
+                        )
+                        health = self.health()
+                        self.report.setdefault("stabilization_checks", []).append({
+                            "attempt": attempt, "start": start, "end": end,
+                            "metrics": checks, "health": health,
+                            "passed": bool(stable_metrics and health["healthy"]),
+                        })
+                        self.checkpoint()
+                        if stable_metrics and health["healthy"]:
+                            stable = True
+                            break
+                    except GateBlocked as exc:
+                        self.report["limitations"].append(str(exc))
+                    self.wait(15)
+                if not stable:
+                    raise GateBlocked(
+                        "load did not stabilize after minimum 60s warmup"
+                    )
             self.mark("warmup_completed")
             baseline_start = self.mark("baseline_started")
-            self.wait(90)
+            self.wait(baseline_seconds)
             baseline_end = self.mark("baseline_completed")
             self.baseline = self.collect("baseline", baseline_start, baseline_end)
-            self.require_coverage(self.baseline, 90)
+            self.require_coverage(self.baseline, baseline_seconds)
             self.report["gates"]["telemetry_coverage"] = self.baseline
             self.prepare_intervention()
             current = self.pods()

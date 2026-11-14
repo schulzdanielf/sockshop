@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 import copy
@@ -11,6 +12,19 @@ import yaml
 from experiment.platform.backend import controlled_experiment as controlled
 from experiment.platform.backend.domain import ExperimentVersion, RunRecord, RunStatus
 from experiment.platform.backend.engine import OrchestratorEngine
+
+
+def test_backend_capabilities_use_imported_fingerprint_not_current_files(monkeypatch):
+    expected = controlled.controlled_backend_capabilities()
+
+    def forbid_disk_read(*args, **kwargs):
+        pytest.fail("capabilities must identify imported code, not re-read changed files")
+
+    monkeypatch.setattr(controlled.Path, "read_bytes", forbid_disk_read)
+    observed = controlled.controlled_backend_capabilities()
+    observed["measurement_policy"]["max_clock_drift_seconds"] = 999
+
+    assert controlled.controlled_backend_capabilities() == expected
 
 
 def test_memory_budget_uses_working_set_p95_margin_and_one_worker():
@@ -176,6 +190,62 @@ def test_empty_metrics_remain_no_data():
     }
 
 
+def test_stability_relative_limit_override_is_scoped_and_preserves_floor():
+    def metric(values):
+        return {
+            "status": "success",
+            "data": {"result": [{
+                "values": [[index, str(value)] for index, value in enumerate(values)],
+            }]},
+        }
+
+    data = {
+        "traffic": metric([10, 10]),
+        "cpu_cores": metric([.1, .1]),
+        "memory_bytes": metric([100, 100]),
+        "latency_ms": metric([75, 125]),
+    }
+
+    current = controlled.stability_metrics(data)
+    prospective = controlled.stability_metrics(
+        data, relative_limit_overrides={"latency_ms": .25},
+    )
+    all_stability = controlled.stability_metrics(
+        data, default_relative_limit=.25,
+    )
+
+    assert current["latency_ms"]["relative_limit"] == .20
+    assert current["latency_ms"]["limit"] == 20
+    assert current["latency_ms"]["passed"] is False
+    assert prospective["latency_ms"]["relative_limit"] == .25
+    assert prospective["latency_ms"]["limit"] == 25
+    assert prospective["latency_ms"]["passed"] is True
+    assert prospective["traffic"]["relative_limit"] == .20
+    assert prospective["traffic"]["limit"] == current["traffic"]["limit"]
+    assert all_stability["traffic"]["relative_limit"] == .25
+    assert all_stability["latency_ms"]["relative_limit"] == .25
+    assert all_stability["latency_ms"]["passed"] is True
+    assert all_stability["latency_ms"]["floor"] == current["latency_ms"]["floor"]
+
+
+@pytest.mark.parametrize("overrides", [
+    {"unknown_metric": .25},
+    {"latency_ms": 0},
+    {"latency_ms": 1.01},
+    {"latency_ms": True},
+    {"latency_ms": float("nan")},
+])
+def test_stability_metrics_rejects_invalid_relative_limit_overrides(overrides):
+    with pytest.raises(controlled.GateBlocked, match="stability relative-limit"):
+        controlled.stability_metrics({}, relative_limit_overrides=overrides)
+
+
+@pytest.mark.parametrize("relative_limit", [0, 1.01, True, float("nan")])
+def test_stability_metrics_rejects_invalid_default_relative_limit(relative_limit):
+    with pytest.raises(controlled.GateBlocked, match="default stability relative limit"):
+        controlled.stability_metrics({}, default_relative_limit=relative_limit)
+
+
 def test_parse_cgroup_v2_captures_limits_usage_throttling_and_oom_counters():
     parsed = controlled.parse_cgroup_v2(
         "__cpu_max__\n30000 100000\n"
@@ -231,6 +301,80 @@ def test_cgroup_series_use_container_counter_deltas_and_keep_raw_samples():
     assert controlled.samples(payloads["throttled_periods_per_second"]) == [(105, 1), (110, 1)]
     assert telemetry["sample_count"] == 2
     assert telemetry["cpu_predecessor_sample"]["timestamp"] == 100
+
+
+def test_cpu_rate_uses_monotonic_elapsed_instead_of_adjusted_wall_clock():
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec("cpu-hog"))
+    common = {
+        "cpu_quota_cores": .3, "memory_usage_bytes": 100, "memory_limit_bytes": 1000,
+        "oom_events": 0, "oom_kill_events": 0, "nr_throttled": 0, "throttled_usec": 0,
+    }
+    run.cgroup_samples = [
+        {**common, "timestamp": 100, "monotonic_timestamp": 10, "cpu_usage_usec": 1_000_000},
+        {**common, "timestamp": 104.5, "monotonic_timestamp": 15, "cpu_usage_usec": 2_000_000},
+    ]
+    payloads, _ = run.cgroup_payloads(
+        datetime.fromtimestamp(100, timezone.utc).isoformat(),
+        datetime.fromtimestamp(105, timezone.utc).isoformat(),
+    )
+    assert controlled.samples(payloads["cpu_cores"]) == [(104.5, .2)]
+
+
+@pytest.mark.parametrize("readings", [
+    [{"timestamp": 100, "read_duration_seconds": -8.55}],
+    [{"timestamp": 105}, {"timestamp": 100}],
+    [{"timestamp": 100, "monotonic_timestamp": 10},
+     {"timestamp": 101, "monotonic_timestamp": 15}],
+    [{"timestamp": 100, "read_duration_seconds": .2,
+      "wall_clock_read_duration_seconds": -8.55}],
+])
+def test_invalid_cgroup_timing_never_becomes_a_cpu_peak(readings):
+    with pytest.raises(controlled.GateBlocked, match="invalid cgroup timing"):
+        controlled.validate_cgroup_timing(readings)
+
+
+def test_invalid_cgroup_interval_reports_measured_clock_drift():
+    readings = [
+        {"timestamp": 100, "monotonic_timestamp": 10},
+        {"timestamp": 102, "monotonic_timestamp": 15},
+    ]
+
+    with pytest.raises(
+        controlled.GateBlocked,
+        match=r"wall_elapsed=2\.000000s, monotonic_elapsed=5\.000000s, "
+              r"drift=3\.000000s, limit=1\.000s",
+    ):
+        controlled.validate_cgroup_timing(readings)
+
+
+def test_controlled_queries_use_sixty_second_lookback_for_all_rates():
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec("network-latency"))
+    run.target = {"pod": "orders-pod"}
+    for query in run.queries().values():
+        if "rate(" in query:
+            assert "[1m]" in query
+            assert "[30s]" not in query
+    assert run.report["measurement_policy"]["rate_lookback_seconds"] == 60
+
+
+def test_cgroup_sampler_records_clock_jump_and_does_not_emit_cpu_sample(monkeypatch):
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec("cpu-hog"))
+    run.target = {"pod": "orders-pod", "container_id": "original"}
+    run.record_cgroup_read_failure = Mock()
+    monkeypatch.setattr(controlled.time, "time", Mock(side_effect=[100, 91.5]))
+    monkeypatch.setattr(controlled.time, "monotonic", Mock(side_effect=[10, 10.2]))
+    monkeypatch.setattr(controlled.subprocess, "run", Mock(return_value=SimpleNamespace(
+        returncode=0, stderr="", stdout=(
+            "__cpu_max__\n30000 100000\n"
+            "__cpu_stat__\nusage_usec 5000\nnr_throttled 3\nthrottled_usec 1000\n"
+            "__memory_current__\n1048576\n__memory_max__\n268435456\n"
+            "__memory_events__\noom 0\noom_kill 0\n"
+        ),
+    )))
+    with pytest.raises(controlled.GateBlocked, match="wall clock changed during read"):
+        run.sample_cgroup()
+    run.record_cgroup_read_failure.assert_called_once()
+    assert run.cgroup_samples == []
 
 
 def test_collect_uses_cgroup_for_container_resources_and_prometheus_for_red():
@@ -325,6 +469,119 @@ def test_front_end_http_target_edge_uses_destination_reporter_for_external_load(
         assert 'destination_workload="front-end"' in queries[key]
         assert 'reporter="destination"' in queries[key]
         assert 'source_workload!="unknown"' not in queries[key]
+
+
+def test_front_end_network_target_edge_uses_external_ingress_reporter():
+    spec = make_spec("network-latency")
+    spec["controlled_campaign"]["service"] = "front-end"
+    run = controlled.ControlledRun(Mock(), "run-front-end", spec)
+    run.target = {"pod": "front-end-pod"}
+
+    queries = run.queries()
+
+    for key in ("target_edge_requests", "target_edge_5xx", "target_edge_latency_ms"):
+        assert 'destination_workload="front-end"' in queries[key]
+        assert 'reporter="destination"' in queries[key]
+        assert 'source_workload="unknown"' in queries[key]
+        assert 'source_workload!="unknown"' not in queries[key]
+    assert run.report["target_edge_selection"]["source_workload"] == "unknown"
+
+
+def test_supplemental_preparation_policy_expands_deadline_and_orders_recovery_budget():
+    policy = {
+        "workflow_timeout_seconds": 600,
+        "recovery_timeout_seconds": 300,
+        "recovery_timeout_by_service": {"orders": 600},
+        "preparation_policy": controlled.SUPPLEMENTAL_PREPARATION_POLICY.copy(),
+    }
+
+    budget = controlled.build_time_budget(policy)
+
+    assert budget["stages"]["warmup"] == 180
+    assert budget["stages"]["stabilization_waits"] == 420
+    assert budget["stages"]["baseline"] == 180
+    assert budget["stages"]["experimental_recovery"] == 600
+    assert controlled.recovery_timeout_seconds(policy, "orders") == 600
+    assert controlled.recovery_timeout_seconds(policy, "front-end") == 300
+
+
+def test_memory_stressor_marker_reads_exact_target_container_process(monkeypatch):
+    run = controlled.ControlledRun(
+        Mock(), "run-memory", make_spec("memory-hog"),
+    )
+    run.target = {"pod": "front-end-pod", "container_id": "docker://original"}
+    run.application_container_status = Mock(return_value={
+        "container_id": "docker://original",
+    })
+    subprocess_run = Mock(return_value=type("Result", (), {
+        "returncode": 0, "stdout": "123\n", "stderr": "",
+    })())
+    monkeypatch.setattr(controlled.subprocess, "run", subprocess_run)
+
+    run.observe_memory_stressor()
+
+    marker = run.report["memory_stressor_window"]
+    assert marker["first_observed_at"] == marker["last_observed_at"]
+    assert marker["pids"] == ["123"]
+    assert marker["continuous_at_poll_observations"] is True
+    assert marker["process_signature"] == "stress-ng --vm-bytes"
+    command = subprocess_run.call_args.args[0][-1]
+    assert controlled.MEMORY_STRESSOR_PROCESS_PATTERN in command
+    assert controlled.fnmatchcase(
+        "stress-ng --vm 1 --vm-bytes 555M --timeout 180s",
+        controlled.MEMORY_STRESSOR_PROCESS_PATTERN,
+    )
+    assert not controlled.fnmatchcase(
+        "stress-ng --cpu 1 --cpu-load 100", controlled.MEMORY_STRESSOR_PROCESS_PATTERN,
+    )
+
+
+def test_catalogue_memory_hog_template_matches_stressor_observer():
+    manifest_path = (
+        Path(__file__).resolve().parents[3]
+        / "deploy/kubernetes/manifests-chaos/catalogue-memory-hog.yaml"
+    )
+    workflow = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+
+    controlled.validate_workflow_template(workflow, "sock-shop", "catalogue", "memory-hog")
+
+
+def test_memory_hog_preflight_rejects_stale_cleanup_process_signature():
+    manifest_path = (
+        Path(__file__).resolve().parents[3]
+        / "deploy/kubernetes/manifests-chaos/catalogue-memory-hog.yaml"
+    )
+    workflow = copy.deepcopy(yaml.safe_load(manifest_path.read_text(encoding="utf-8")))
+    for template in workflow["spec"]["templates"]:
+        for artifact in template.get("inputs", {}).get("artifacts", []):
+            data = artifact.get("raw", {}).get("data", "")
+            if "kind: ChaosEngine" not in data:
+                continue
+            engine = yaml.safe_load(data)
+            env = engine["spec"]["experiments"][0]["spec"]["components"]["env"]
+            cleanup = next(item for item in env if item["name"] == "CHAOS_KILL_COMMAND")
+            cleanup["value"] = "kill -9 $(ps afx | grep '[dd] if /dev/zero')"
+            artifact["raw"]["data"] = yaml.safe_dump(engine)
+
+    with pytest.raises(controlled.GateBlocked, match="stress-ng --vm-bytes"):
+        controlled.validate_workflow_template(workflow, "sock-shop", "catalogue", "memory-hog")
+
+
+def test_memory_stressor_gap_cannot_confirm_intervention():
+    run = controlled.ControlledRun(
+        Mock(), "run-memory", make_spec("memory-hog"),
+    )
+    run.report["memory_stressor_window"] = {
+        "marker": "target_container_process_command_line",
+        "first_observed_at": "2026-11-08T10:00:00+00:00",
+        "last_observed_at": "2026-11-08T10:03:00+00:00",
+        "continuous_at_poll_observations": False,
+    }
+
+    run.evaluate_effect({}, "2026-11-08T10:00:00+00:00")
+
+    assert run.report["gates"]["intervention_confirmed_on_target"] is False
+    assert run.report["gates"]["mechanism_observed"]["passed"] is False
 
 
 def test_network_effect_uses_caller_side_latency_and_reports_degradation_onset():
@@ -439,6 +696,60 @@ def test_cgroup_sampler_retries_one_recorded_read_timeout(monkeypatch):
     assert retries[0]["attempt"] == 1
     assert retries[0]["timeout_seconds"] == 30
     assert "timed out" in retries[0]["error"]
+
+
+@pytest.mark.parametrize("outcome", ["success", "repeated_transport_error", "container_changed"])
+def test_cgroup_sampler_retries_only_identified_transient_transport_error(monkeypatch, outcome):
+    run = controlled.ControlledRun(Mock(), "run-1", make_spec("cpu-hog"))
+    run.target = {
+        "pod": "orders-pod", "uid": "pod-uid", "container": "orders",
+        "container_id": "containerd://id",
+    }
+    run.application_container_status = Mock(return_value={
+        "running": True,
+        "container_id": "containerd://other" if outcome == "container_changed" else "containerd://id",
+    })
+    run.record_cgroup_read_failure = Mock()
+    transport_error = SimpleNamespace(
+        returncode=1, stdout="",
+        stderr="error: error stream protocol error: unknown error",
+    )
+    output = (
+        "__cpu_max__\n30000 100000\n"
+        "__cpu_stat__\nusage_usec 5000\nnr_throttled 3\nthrottled_usec 1000\n"
+        "__memory_current__\n1048576\n__memory_max__\n268435456\n"
+        "__memory_events__\noom 0\noom_kill 0\n"
+    )
+    command = Mock(side_effect=[
+        transport_error,
+        transport_error if outcome == "repeated_transport_error" else SimpleNamespace(
+            returncode=0, stdout=output, stderr="",
+        ),
+    ])
+    monkeypatch.setattr(controlled.subprocess, "run", command)
+    wall = iter([10.0, 30.0, 31.0])
+    monotonic = iter([10.0, 30.0, 31.0])
+    monkeypatch.setattr(controlled.time, "time", lambda: next(wall))
+    monkeypatch.setattr(controlled.time, "monotonic", lambda: next(monotonic))
+
+    if outcome == "success":
+        run.sample_cgroup()
+        assert len(run.cgroup_samples) == 1
+        assert run.cgroup_samples[0]["read_duration_seconds"] == 1
+        assert run.cgroup_samples[0]["timestamp"] == 30.5
+        assert command.call_count == 2
+        retry = run.report["telemetry"]["cgroup_v2_read_retries"][0]
+        assert retry["error"] == transport_error.stderr
+        assert retry["attempt"] == 1
+        run.record_cgroup_read_failure.assert_not_called()
+    else:
+        with pytest.raises(controlled.GateBlocked, match=(
+            "identity changed" if outcome == "container_changed" else "stream protocol error"
+        )):
+            run.sample_cgroup()
+        assert command.call_count == (1 if outcome == "container_changed" else 2)
+        assert run.cgroup_samples == []
+        run.record_cgroup_read_failure.assert_called_once()
 
 
 def test_cgroup_failure_records_restart_and_events_without_hiding_the_error(monkeypatch):
@@ -1370,6 +1681,12 @@ def test_memory_workflow_samples_after_submission_before_first_safety_check(monk
     spec["chaos_profile"] = {}
     run = controlled.ControlledRun(engine, "run-1", spec)
     run.cgroup_sampling_enabled = True
+    run.observe_memory_stressor = Mock()
+    run.report["memory_stressor_window"] = {
+        "first_observed_at": "2026-10-18T10:01:00Z",
+        "last_observed_at": "2026-10-18T10:03:00Z",
+        "continuous_at_poll_observations": True,
+    }
     order = []
 
     def sample():
@@ -1435,7 +1752,10 @@ def test_litmus_duration_remains_estimated_not_workflow_elapsed(monkeypatch):
 
 def test_scrape_metadata_and_freshness_use_the_metrics_mcp_backend(monkeypatch):
     run = controlled.ControlledRun(Mock(), "run-1", make_spec())
-    run.spec["observability"]["metrics"] = {"mcp_sse_url": "http://same-mcp/sse"}
+    run.spec["observability"]["metrics"] = {
+        "mcp_sse_url": "http://same-mcp/sse",
+        "history_campaign_id": "campaign-123",
+    }
     run.target = {"pod": "orders-pod"}
     client = Mock()
     client.call_tool_json.side_effect = [
@@ -1447,7 +1767,10 @@ def test_scrape_metadata_and_freshness_use_the_metrics_mcp_backend(monkeypatch):
     run.metadata()
     assert factory.call_args.kwargs["sse_url"] == "http://same-mcp/sse"
     assert client.call_tool_json.call_args_list[0].args == ("prometheus_scrape_targets", {})
+    age_query = client.call_tool_json.call_args_list[1].args[1]["query"]
+    assert 'history_campaign="campaign-123"' in age_query
     assert run.report["telemetry"]["sample_age_seconds"] == 10
+    assert run.report["telemetry"]["sample_age_history_campaign_id"] == "campaign-123"
     assert run.report["telemetry"]["requested_query_step_seconds"] == 5
     assert run.report["telemetry"]["scrapes"][0]["scrapeInterval"] == "15s"
 

@@ -34,6 +34,24 @@ def test_matrix_is_seeded_application_only_and_avoids_consecutive_service(level,
         assert {cell["replica_idx"] for cell in plan} == set(range(5))
 
 
+def test_rag_strategy_check_accepts_additive_capabilities():
+    info = {
+        "version": "skill-rag-ab-v1",
+        "modes": list(campaign.RAG_STRATEGY_MODES),
+        "recommended_procedural_retriever": "opensearch-bm25-metric-gated-rrf-v6",
+    }
+
+    assert campaign.loaded_rca_version_matches(
+        info, {"version": "skill-rag-ab-v1"}
+    )
+    assert not campaign.loaded_rca_version_matches(
+        {**info, "version": "unexpected"}, {"version": "skill-rag-ab-v1"}
+    )
+    assert not campaign.loaded_rca_version_matches(
+        {**info, "modes": ["annotate"]}, {"version": "skill-rag-ab-v1"}
+    )
+
+
 def test_train_only_plan_is_exactly_35_train_cells_with_cpu_first():
     plan = campaign.build_plan("train-only", 42)
 
@@ -799,6 +817,52 @@ def test_invalid_calibration_yaml_fails_before_creating_campaign(tmp_path, capsy
 def config(tmp_path):
     source = yaml.safe_load((campaign.HERE / "config.yaml").read_text())
     return campaign.build_config(source, tmp_path, "small", 42, {})
+
+
+@pytest.mark.parametrize("level", ["supplemental-6", "test-replication-35-v1"])
+def test_supplemental_completed_train_case_defers_cohort_rca_evaluation(
+    monkeypatch, tmp_path, level,
+):
+    cfg = config(tmp_path)
+    cell = {
+        "cell_id": "front-end-memory-hog-r0",
+        "service": "front-end",
+        "chaos_type": "memory-hog",
+        "replica_idx": 0,
+        "phase": "train",
+    }
+    cfg["controlled_campaign"]["level"] = level
+    cfg["train_experiments"] = [cell]
+    cfg["test_experiments"] = []
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+    (tmp_path / "plan.json").write_text(json.dumps([cell]))
+    campaign.append_ledger(tmp_path / "ledger.jsonl", {
+        "cell_id": cell["cell_id"],
+        "run_id": "completed-run",
+        "status": "completed",
+        "gates": {
+            "submitted": True,
+            "recovery": {"passed": True},
+            "cleanup": {"passed": True},
+            "load_stopped": {"stopped": True},
+        },
+    })
+    api = Mock(base_url=cfg["platform"]["api_base"])
+    api.get.return_value = []
+    monkeypatch.setattr(campaign.runner, "ApiClient", Mock(return_value=api))
+    monkeypatch.setattr(campaign, "_get_strategy_info", lambda **kwargs: {
+        "strategy_version": campaign.STRATEGY_VERSION,
+        "prompt_version": campaign.PROMPT_VERSION,
+    })
+    monkeypatch.setattr(
+        campaign,
+        "evaluate_campaign",
+        Mock(side_effect=AssertionError("single train case has no RCA test cohort")),
+    )
+
+    assert campaign.execute(tmp_path, resume=True) == 0
+    campaign.evaluate_campaign.assert_not_called()
+    api.post.assert_not_called()
 
 
 @pytest.fixture
@@ -1836,7 +1900,7 @@ def test_recovered_aborted_run_advances_without_reinjection_and_keeps_failed_sta
 
         def get(self, path):
             if path == "/api/controlled-campaign/capabilities":
-                return {"protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION}
+                return campaign.controlled_backend_capabilities()
             if path == "/api/runs":
                 return known
             calls.append(path)
@@ -2135,9 +2199,7 @@ def test_retry_blocked_cell_preserves_history_and_uses_unique_attempt(
 
         def get(self, path):
             if path == "/api/controlled-campaign/capabilities":
-                return {
-                    "protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION
-                }
+                return campaign.controlled_backend_capabilities()
             if path == "/api/runs":
                 return []
             assert path == "/api/runs/retry-run"
@@ -2213,9 +2275,7 @@ def test_automatic_retry_uses_fresh_attempt_after_clean_pre_injection_block(
 
         def get(self, path):
             if path == "/api/controlled-campaign/capabilities":
-                return {
-                    "protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION
-                }
+                return campaign.controlled_backend_capabilities()
             if path == "/api/runs":
                 return []
             if path == "/api/runs/blocked-run":
@@ -2369,7 +2429,7 @@ def test_retry_invalid_window_preserves_history_and_exports_latest_attempt(
 
         def get(self, path):
             if path == "/api/controlled-campaign/capabilities":
-                return {"protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION}
+                return campaign.controlled_backend_capabilities()
             if path == "/api/runs":
                 return []
             assert path == "/api/runs/retry-run"
@@ -2518,9 +2578,7 @@ def test_lost_start_response_reconnects_without_posting_and_exports_effect(monke
 
         def get(self, path):
             if path == "/api/controlled-campaign/capabilities":
-                return {
-                    "protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION,
-                }
+                return campaign.controlled_backend_capabilities()
             if path == "/api/runs":
                 return [run]
             assert path == "/api/runs/original"
@@ -2586,9 +2644,7 @@ def test_missing_scrape_metadata_tool_blocks_campaign_before_run_submission(monk
 
         def get(self, path):
             if path == "/api/controlled-campaign/capabilities":
-                return {
-                    "protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION,
-                }
+                return campaign.controlled_backend_capabilities()
             pytest.fail(f"unexpected API request before tool preflight: {path}")
 
         def post(self, *a, **kw):
@@ -2623,6 +2679,23 @@ def test_campaign_rejects_malformed_or_incompatible_capabilities(capabilities):
         campaign.require_controlled_backend(API())
 
 
+def test_campaign_rejects_stale_code_even_with_matching_protocol():
+    capabilities = campaign.controlled_backend_capabilities()
+    capabilities["implementation_sha256"] = "0" * 64
+    api = Mock()
+    api.get.return_value = capabilities
+
+    with pytest.raises(RuntimeError, match="implementation mismatch.*restart"):
+        campaign.require_controlled_backend(api)
+
+
+def test_campaign_accepts_matching_loaded_implementation():
+    api = Mock()
+    api.get.return_value = campaign.controlled_backend_capabilities()
+
+    campaign.require_controlled_backend(api)
+
+
 def test_missing_controlled_status_is_recorded_as_protocol_abort(monkeypatch, tmp_path):
     cfg = config(tmp_path)
     cfg["test_experiments"] = cfg["test_experiments"][:1]
@@ -2635,9 +2708,7 @@ def test_missing_controlled_status_is_recorded_as_protocol_abort(monkeypatch, tm
 
         def get(self, path):
             if path == "/api/controlled-campaign/capabilities":
-                return {
-                    "protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION,
-                }
+                return campaign.controlled_backend_capabilities()
             if path == "/api/runs":
                 return []
             assert path == "/api/runs/legacy-run"
@@ -2907,9 +2978,7 @@ def test_failed_preflight_stops_before_registering_or_starting_run(monkeypatch, 
     cfg = config(tmp_path)
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
     api = Mock(base_url=cfg["platform"]["api_base"])
-    api.get.side_effect = lambda path: [] if path == "/api/runs" else {
-        "protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION,
-    }
+    api.get.side_effect = lambda path: [] if path == "/api/runs" else campaign.controlled_backend_capabilities()
     monkeypatch.setattr(campaign.runner, "ApiClient", Mock(return_value=api))
     monkeypatch.setattr(campaign, "_get_strategy_info", lambda **kw: {
         "strategy_version": campaign.STRATEGY_VERSION, "prompt_version": campaign.PROMPT_VERSION,
@@ -2987,7 +3056,7 @@ def test_preflight_is_rechecked_before_each_new_submission(monkeypatch, tmp_path
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
     api = Mock(base_url=cfg["platform"]["api_base"])
     api.get.side_effect = lambda path: (
-        {"protocol_version": campaign.CONTROLLED_CAMPAIGN_PROTOCOL_VERSION}
+        campaign.controlled_backend_capabilities()
         if path == "/api/controlled-campaign/capabilities" else []
         if path == "/api/runs" else {"status": "completed", "summary": {
             "controlled_status": "completed", "controlled_gates": {

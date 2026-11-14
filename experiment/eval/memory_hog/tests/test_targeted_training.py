@@ -74,6 +74,24 @@ def test_resource_chaos_spec_exposes_active_injection_duration(monkeypatch):
         assert spec["chaos_profile"]["fault_duration_seconds"] == 120
 
 
+def test_run_spec_carries_history_campaign_id(monkeypatch):
+    config = yaml.safe_load(targeted.BASE_CONFIG.read_text(encoding="utf-8"))
+    config["experiment_campaign_id"] = "test-campaign"
+    config["historical_observability"]["campaign_id"] = "history-campaign"
+    monkeypatch.setattr(
+        runner_module,
+        "_target_container_limits",
+        lambda service, namespace: {"cpu": "300m", "memory": "500Mi"},
+    )
+
+    spec = build_spec(config, "orders", 0, "cpu-hog")
+
+    assert (
+        spec["observability"]["metrics"]["history_campaign_id"]
+        == "history-campaign"
+    )
+
+
 def test_generated_queries_have_service_labels_and_30_second_windows(tmp_path):
     base_config = yaml.safe_load(targeted.BASE_CONFIG.read_text(encoding="utf-8"))
     config = targeted.build_training_config(base_config)

@@ -38,6 +38,7 @@ def istio_expression(
     *,
     service: str | None = None,
     reporter: str | None = None,
+    source_workload_unknown: bool = False,
     codes: str | None = None,
     lookback: str | None = None,
     normalize_destination: bool = False,
@@ -48,6 +49,10 @@ def istio_expression(
         extra += f",reporter={json.dumps(reporter)}"
         if reporter == "source":
             extra += ',source_workload!="unknown"'
+    if source_workload_unknown:
+        if reporter == "source":
+            raise ValueError("source_workload_unknown cannot be combined with source reporter")
+        extra += ',source_workload="unknown"'
     if codes is not None:
         extra += f",response_code=~{json.dumps(codes)}"
     known = f'destination_workload_namespace={ns},destination_workload!="unknown"'

@@ -89,7 +89,7 @@ def test_test_only_preparation_reuses_existing_corpus_and_open_search(
         def __init__(self, url, sha256, *, retriever_version):
             assert url == exploratory.DEFAULT_OPENSEARCH_URL
             assert sha256 == "b" * 64
-            assert retriever_version == knowledge.OPENSEARCH_RETRIEVER_VERSION
+            assert retriever_version == knowledge.OPENSEARCH_RETRIEVER_V1
 
         def connect_existing(self, *, expected_pair_ids, expected_a_text_version):
             assert expected_pair_ids == {pair["pair_id"] for pair in pairs}
@@ -137,6 +137,7 @@ def test_test_only_preparation_reuses_existing_corpus_and_open_search(
         source_campaign,
         corpus_id=corpus_id,
         opensearch_base_sha256="b" * 64,
+        retriever_version=knowledge.OPENSEARCH_RETRIEVER_V1,
         allow_legacy_skill_hash=True,
         allow_legacy_model_mismatch=True,
         include_unvalidated_experimental=True,
@@ -149,6 +150,10 @@ def test_test_only_preparation_reuses_existing_corpus_and_open_search(
     ledger = (directory / "ledger.jsonl").read_text().splitlines()
     assert prepared["knowledge_campaign"]["corpus_id"] == corpus_id
     assert prepared["knowledge_campaign"]["retrieval_backend"] == "opensearch"
+    assert (
+        prepared["knowledge_campaign"]["retriever_version"]
+        == knowledge.OPENSEARCH_RETRIEVER_V1
+    )
     assert prepared["knowledge_campaign"]["opensearch_base_sha256"] == "b" * 64
     assert prepared["knowledge_campaign"]["opensearch_source_skill_sha256"] == "d" * 64
     assert prepared["knowledge_campaign"]["allow_legacy_skill_hash"] is True
@@ -184,5 +189,6 @@ def test_test_only_preparation_reuses_existing_corpus_and_open_search(
         "legacy_model_mismatch_allowed": True,
     }
     assert manifest["opensearch_index"]["index_name"] == "frozen-index"
+    assert manifest["retriever_version"] == knowledge.OPENSEARCH_RETRIEVER_V1
     assert manifest["unvalidated_pair_count"] == 8
     assert manifest["include_unvalidated_experimental"] is True

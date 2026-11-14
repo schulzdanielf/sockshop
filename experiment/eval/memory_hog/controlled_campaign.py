@@ -25,6 +25,7 @@ from experiment.platform.backend.controlled_experiment import (
     CGROUP_READ_COMMAND, GateBlocked, kubectl, parse_cgroup_v2,
     validate_cpu_profile, validate_workflow_template,
     build_time_budget, controlled_time_budget,
+    controlled_backend_capabilities,
 )
 from experiment.platform.backend.history_config import (
     DEFAULT_HISTORICAL_MCP_SSE_URL,
@@ -49,6 +50,13 @@ PRE_INTERVENTION_RETRY_MODE = "automatic_pre_intervention"
 SAFE_PRE_INTERVENTION_SKIP_VERSION = "clean-pre-intervention-block-skip-v1"
 TECHNICAL_FAILURE_CONTINUATION_VERSION = (
     "controlled-train-only-technical-failure-continuation-v2"
+)
+RAG_STRATEGY_MODES = (
+    "annotate",
+    "control",
+    "rag",
+    "exploratory_control",
+    "exploratory_rag",
 )
 CPU_MEAN80_AMENDMENT_VERSION = "controlled-cpu-fault-mean80-v1"
 CPU_MEAN80_AMENDMENT_FILE = "cpu-mean80-amendment.yaml"
@@ -225,6 +233,23 @@ def build_config(
 
 def campaign_cells(config: dict[str, Any]) -> list[dict[str, Any]]:
     return list(config.get("train_experiments") or []) + list(config["test_experiments"])
+
+
+def loaded_rca_version_matches(
+    info: Any, knowledge_campaign: dict[str, Any] | None
+) -> bool:
+    if knowledge_campaign:
+        modes = info.get("modes") if isinstance(info, dict) else None
+        return (
+            isinstance(info, dict)
+            and info.get("version") == knowledge_campaign.get("version")
+            and isinstance(modes, list)
+            and all(mode in modes for mode in RAG_STRATEGY_MODES)
+        )
+    return info == {
+        "strategy_version": STRATEGY_VERSION,
+        "prompt_version": PROMPT_VERSION,
+    }
 
 
 def validate_train_only_plan(
@@ -2579,6 +2604,16 @@ def require_controlled_backend(api: Any) -> None:
             f"expected {CONTROLLED_CAMPAIGN_PROTOCOL_VERSION}, got {version!r}. "
             "No new run was submitted."
         )
+    expected = controlled_backend_capabilities()
+    mismatches = {
+        key: {"expected": value, "actual": capabilities.get(key)}
+        for key, value in expected.items() if capabilities.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            "controlled backend implementation mismatch; restart the API from the "
+            f"same checkout before continuing: {mismatches}. No new run was submitted."
+        )
 
 
 def require_scrape_metadata_tool(config: dict[str, Any], cell: dict[str, Any]) -> None:
@@ -3173,14 +3208,7 @@ def _execute(
     ]
     api = runner.ApiClient(config["platform"]["api_base"], role=config["platform"]["user_role"])
     info = api.get("/api/skill-rag/strategy") if rag else _get_strategy_info(api_base=api.base_url, timeout_seconds=10)
-    expected_modes = [
-        "annotate", "control", "rag",
-        "exploratory_control", "exploratory_rag",
-    ]
-    expected = {"version": rag["version"], "modes": expected_modes} if rag else {
-        "strategy_version": STRATEGY_VERSION, "prompt_version": PROMPT_VERSION
-    }
-    if info != expected:
+    if not loaded_rca_version_matches(info, rag):
         raise RuntimeError(f"loaded RCA version mismatch: {info}")
     if pending_cells:
         require_controlled_backend(api)
@@ -3809,6 +3837,10 @@ def _execute(
             else "rag_evaluation.json"
         )
         print(f"RAG report: {directory / report_name}")
+    elif (config.get("controlled_campaign") or {}).get("level") in {
+        "supplemental-6", "test-replication-35-v1",
+    }:
+        print("Collection-only case: RCA evaluation deferred.")
     else:
         markdown, data = evaluate_campaign(directory, api_base=api.base_url)
         print(f"Multiagent reports: {markdown}, {data}")
@@ -4161,14 +4193,7 @@ def main(argv: list[str] | None = None) -> int:
             require_scrape_metadata_tool(config, target_cell)
             rag = config.get("knowledge_campaign")
             info = api.get("/api/skill-rag/strategy") if rag else _get_strategy_info(api_base=api.base_url, timeout_seconds=10)
-            expected_modes = [
-                "annotate", "control", "rag",
-                "exploratory_control", "exploratory_rag",
-            ]
-            expected = {"version": rag["version"], "modes": expected_modes} if rag else {
-                "strategy_version": STRATEGY_VERSION, "prompt_version": PROMPT_VERSION
-            }
-            if info != expected:
+            if not loaded_rca_version_matches(info, rag):
                 raise RuntimeError(f"loaded RCA version mismatch: {info}")
             active = [r["run_id"] for r in api.get("/api/runs")
                       if r["status"] in {"pending", "running", "pending_approval"}]

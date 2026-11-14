@@ -94,7 +94,10 @@ este fluxo usa `/api/runs/{id}/skill-rca`.
 5. **Nivel 4 - traces:** compare fases, confira amostras e aprofunde ate dois
    traces de erro; se nao houver traces de erro, aprofunde traces fault com
    regressao de latencia sobre o P95 baseline da mesma operacao, quando houver
-   amostras comparaveis. Se `history_archive_traces` estiver disponivel, trate-o
+   amostras comparaveis. Para latencia por aresta positiva, direcione a busca
+   por spans CLIENT ao chamador, destino e janela fault; so aprofunde IDs
+   associados a erro ou a regressao comparavel ja validada. Se
+   `history_archive_traces` estiver disponivel, trate-o
    como spans originais da familia `traces`, lidos do bundle S3 verificado por
    SHA-256; nao altere IDs ou timestamps e nao conte a copia arquivada como
    familia independente do Tempo. Confira `trace_count_parity`,

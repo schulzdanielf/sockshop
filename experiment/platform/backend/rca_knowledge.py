@@ -28,17 +28,18 @@ from .analysis.telemetry_coverage import (
     termination_summary,
     phase_series_summary,
 )
+from .evidence_projection import EVIDENCE_FORMAT_NOTICE
 from .evidence_projection import (
     MODEL_EVIDENCE_CONTEXT_CHARS as MODEL_EVIDENCE_CONTEXT_CHARS,
-    EVIDENCE_FORMAT_NOTICE,
-    compact_evidence_for_model,
 )
+from .evidence_projection import EvidenceProjectionSession, compact_evidence_for_model
 from .rca_options import MAX_ADDITIONAL_MCP_CHECKS, RCABenchmarkOptions
 from .rca_skill import (
     Diagnosis,
     StrictModel,
     TOOL_ERRORS,
     _families,
+    _evidence_source_provenance,
     _json_content,
     _observation_count,
     _sanitize,
@@ -46,6 +47,7 @@ from .rca_skill import (
     load_skill,
     validate_diagnosis,
 )
+from .resource_signature import options_fingerprint, resource_signature_text
 from .agent_console import (
     _rca_next_trace_candidate,
     _rca_normalize_loki_range_result,
@@ -69,6 +71,7 @@ TRAINING_B_PROCEDURAL_SCHEMA_VERSION = "qwen35-procedural-b-v1"
 EXPLORATORY_HISTORY_DOCUMENT_CHAR_LIMIT = 8000
 TRAINING_HISTORY_DOCUMENT_CHAR_LIMIT = 24000
 BLIND_LIVE_REVIEW_STATUS = "blind_live_review_adjudicated"
+BLIND_LIVE_REVIEW_BYPASSED_STATUS = "not_reviewed_user_authorized"
 IDENTIFIER = r"^[A-Za-z0-9_-]{1,100}$"
 LEGACY_A_TEXT_VERSION = "incident-a-v1"
 A_TEXT_VERSION = "incident-a-v2"
@@ -637,7 +640,91 @@ def digest(value: Any) -> str:
     return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
 
 
-def compact_model_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def validated_blind_review_bypass_source_run_ids(
+    base: dict[str, Any],
+) -> set[str]:
+    policy = base.get("blind_live_review_bypass")
+    if policy is None:
+        return set()
+    if (
+        not isinstance(policy, dict)
+        or policy.get("policy") != "user_authorized_procedural_status"
+    ):
+        raise ValueError("exploratory base has an invalid blind-review bypass policy")
+    authorized_at = policy.get("authorized_at")
+    try:
+        parsed_authorized_at = datetime.fromisoformat(
+            authorized_at.replace("Z", "+00:00")
+        )
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(
+            "blind-review bypass is missing its authorization timestamp"
+        ) from exc
+    if parsed_authorized_at.tzinfo is None:
+        raise ValueError(
+            "blind-review bypass authorization timestamp has no timezone"
+        )
+    source_run_ids = policy.get("unreviewed_source_run_ids")
+    import_metadata = base.get("supplemental_training_import")
+    training_runs = (
+        import_metadata.get("training_runs")
+        if isinstance(import_metadata, dict) else None
+    )
+    expected_source_run_ids = {
+        item.get("run_id")
+        for item in training_runs or []
+        if isinstance(item, dict) and isinstance(item.get("run_id"), str)
+    }
+    if (
+        not isinstance(source_run_ids, list)
+        or len(source_run_ids) != 3
+        or not all(isinstance(run_id, str) for run_id in source_run_ids)
+        or len(set(source_run_ids)) != 3
+        or set(source_run_ids) != expected_source_run_ids
+        or not set(source_run_ids) <= set(base.get("training_run_ids") or [])
+    ):
+        raise ValueError(
+            "blind-review bypass must cover exactly the three supplemental runs"
+        )
+    pairs = base.get("pairs")
+    if not isinstance(pairs, list):
+        raise ValueError("blind-review bypass base has no pair list")
+    pairs_by_run = {
+        pair.get("source_run_id"): pair
+        for pair in pairs
+        if isinstance(pair, dict) and isinstance(pair.get("source_run_id"), str)
+    }
+    bypass_source_run_ids = set(source_run_ids)
+    if len(pairs_by_run) != len(pairs) or not bypass_source_run_ids <= set(pairs_by_run):
+        raise ValueError("blind-review bypass pairs have missing or duplicate run IDs")
+    for source_run_id, pair in pairs_by_run.items():
+        if source_run_id in bypass_source_run_ids:
+            if (
+                pair.get("review_status") != BLIND_LIVE_REVIEW_BYPASSED_STATUS
+                or "review_manifest_sha256" in pair
+            ):
+                raise ValueError(
+                    "bypassed pair claims review provenance it does not have"
+                )
+        elif (
+            pair.get("review_status") != BLIND_LIVE_REVIEW_STATUS
+            or not re.fullmatch(
+                r"[a-f0-9]{64}",
+                str(pair.get("review_manifest_sha256") or ""),
+            )
+        ):
+            raise ValueError(
+                "blind-review bypass cannot cover unreviewed parent pairs"
+            )
+    return bypass_source_run_ids
+
+
+def compact_model_messages(
+    messages: list[dict[str, Any]],
+    evidence_projector: (
+        Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None
+    ) = None,
+) -> list[dict[str, Any]]:
     """Keep the current stage and static RCA references, not duplicate prior payloads."""
     stage_index = None
     stage_payload = None
@@ -669,14 +756,22 @@ def compact_model_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
 
     evidence = stage_payload.get("evidence")
     if isinstance(evidence, list) and all(isinstance(item, dict) for item in evidence):
-        stage_payload["evidence"] = compact_evidence_for_model(evidence)
+        stage_payload["evidence"] = (
+            evidence_projector(evidence)
+            if evidence_projector
+            else compact_evidence_for_model(evidence)
+        )
     context = stage_payload.get("context")
     if isinstance(context, dict):
         context_evidence = context.get("evidence")
         if isinstance(context_evidence, list) and all(
             isinstance(item, dict) for item in context_evidence
         ):
-            context["evidence"] = compact_evidence_for_model(context_evidence)
+            context["evidence"] = (
+                evidence_projector(context_evidence)
+                if evidence_projector
+                else compact_evidence_for_model(context_evidence)
+            )
     compacted.append(
         {
             **messages[stage_index],
@@ -745,6 +840,78 @@ def procedural_metric_step_matches_target(
         and metric_step.get("family") in expected_families
         and metric_step.get("phase") == "fault"
         and bool(metric_step.get("evidence_ids"))
+    )
+
+
+def _pair_skill_hash_compatible(
+    base: dict[str, Any], pair: dict[str, Any]
+) -> bool:
+    if pair.get("skill_hash") == base.get("skill_sha256"):
+        return True
+
+    import_metadata = base.get("supplemental_training_import")
+    if not isinstance(import_metadata, dict):
+        return False
+    parent_run_ids = import_metadata.get("parent_training_run_ids")
+    parent_skill_hash = import_metadata.get("parent_skill_sha256")
+    parent_hash = import_metadata.get("parent_base_sha256")
+    source_hashes = import_metadata.get("source_hashes")
+    parent_pair_count = import_metadata.get("parent_pair_count")
+    if (
+        import_metadata.get("protocol_version") != "supplemental-training-import-v2"
+        or not isinstance(parent_run_ids, list)
+        or type(parent_pair_count) is not int
+        or len(parent_run_ids) != parent_pair_count
+        or len(set(parent_run_ids)) != parent_pair_count
+        or not isinstance(parent_skill_hash, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", parent_skill_hash)
+        or not isinstance(parent_hash, str)
+        or parent_hash != base.get("parent_base_sha256")
+        or not isinstance(source_hashes, dict)
+        or source_hashes.get("parent_base_content_sha256") != parent_hash
+    ):
+        return False
+
+    parent_run_set = set(parent_run_ids)
+    parent_pairs = [
+        item for item in base.get("pairs", [])
+        if item.get("source_run_id") in parent_run_set
+    ]
+    if (
+        len(parent_pairs) != parent_pair_count
+        or len({item.get("source_run_id") for item in parent_pairs})
+        != parent_pair_count
+        or len({item.get("pair_id") for item in parent_pairs})
+        != parent_pair_count
+        or pair not in parent_pairs
+        or pair.get("source_run_id") not in parent_run_set
+        or pair.get("skill_hash") != parent_skill_hash
+        or any(item.get("skill_hash") != parent_skill_hash for item in parent_pairs)
+    ):
+        return False
+    parent_pair_ids = {item.get("pair_id") for item in parent_pairs}
+    index = base.get("index")
+    if not isinstance(index, dict) or not parent_pair_ids <= set(index):
+        return False
+
+    parent_payload = {
+        key: value for key, value in base.items()
+        if key not in {
+            "sha256", "parent_base_sha256", "supplemental_training_import",
+            "blind_live_review_bypass",
+        }
+    }
+    parent_payload["pairs"] = parent_pairs
+    parent_payload["index"] = {
+        pair_id: vector
+        for pair_id, vector in index.items()
+        if pair_id in parent_pair_ids
+    }
+    parent_payload["training_run_ids"] = parent_run_ids
+    parent_payload["skill_sha256"] = parent_skill_hash
+    return (
+        len(parent_payload["index"]) == parent_pair_count
+        and digest(parent_payload) == parent_hash
     )
 
 
@@ -898,11 +1065,18 @@ class KnowledgeStore:
             or not isinstance(base["index"], dict)
         ):
             raise ValueError("malformed exploratory base")
+        blind_review_bypass_source_run_ids = (
+            validated_blind_review_bypass_source_run_ids(base)
+        )
         for pair in base["pairs"]:
             diagnosis = Diagnosis.model_validate(pair["b"]["diagnosis"])
             labels = pair.get("labels")
             review_status = pair.get("review_status")
             blind_live_reviewed = review_status == BLIND_LIVE_REVIEW_STATUS
+            blind_review_bypassed = (
+                pair.get("source_run_id") in blind_review_bypass_source_run_ids
+                and review_status == BLIND_LIVE_REVIEW_BYPASSED_STATUS
+            )
             if procedural_qwen35:
                 rebuilt_status = pair.get("guide_status")
                 procedural_status = pair.get("b_procedural_status")
@@ -978,9 +1152,15 @@ class KnowledgeStore:
                     and history.get("historical_status") == rebuilt_status
                     and history.get("procedural_status") == procedural_status
                     and not (references - evidence_ids)
-                    and re.fullmatch(
-                        r"[a-f0-9]{64}",
-                        str(pair.get("review_manifest_sha256") or ""),
+                    and (
+                        blind_review_bypassed
+                        or (
+                            blind_live_reviewed
+                            and re.fullmatch(
+                                r"[a-f0-9]{64}",
+                                str(pair.get("review_manifest_sha256") or ""),
+                            )
+                        )
                     )
                 )
                 if procedural_status == "passed":
@@ -1009,10 +1189,10 @@ class KnowledgeStore:
                     )
                 if (
                     not valid_rebuild
-                    or not blind_live_reviewed
+                    or not (blind_live_reviewed or blind_review_bypassed)
                     or pair.get("source_run_id") not in base["training_run_ids"]
                     or pair.get("pair_id") not in base["index"]
-                    or pair.get("skill_hash") != base["skill_sha256"]
+                    or not _pair_skill_hash_compatible(base, pair)
                     or not isinstance(pair.get("effect_validated"), bool)
                     or pair.get("sha256")
                     != digest(
@@ -1805,23 +1985,27 @@ class ModelSession:
         )
         self.started = time.monotonic()
         self.attempts: list[dict[str, Any]] = []
+        self.budget_rejections: list[dict[str, Any]] = []
         self.tokens = 0
+        self.evidence_projector = EvidenceProjectionSession(
+            self.invoke,
+            model=self.model,
+            temperature=options.temperature,
+            seed=options.seed,
+        )
 
     def invoke(
         self, messages: list[dict[str, Any]], tools: list, **kwargs: Any
     ) -> dict[str, Any]:
-        messages = compact_model_messages(messages)
+        messages = compact_model_messages(
+            messages, evidence_projector=self.evidence_projector.model_view
+        )
         if len(self.attempts) >= self.options.max_model_calls:
             raise ValueError("knowledge model call budget exhausted")
         if time.monotonic() - self.started >= self.options.timeout_seconds:
             raise ValueError("knowledge investigation timeout")
         estimated_input = len(canonical(messages)) // 4
-        if (
-            self.tokens + estimated_input + kwargs.get("max_new_tokens", 4096)
-            > self.options.max_total_tokens
-        ):
-            raise ValueError("knowledge token budget exhausted")
-        started = time.monotonic()
+        max_new_tokens = kwargs.get("max_new_tokens", 4096)
         stage = next(
             (
                 payload["stage"]
@@ -1830,7 +2014,30 @@ class ModelSession:
             ),
             "repair",
         )
-        attempt: dict[str, Any] = {"status": "started", "stage": stage}
+        estimated_total = self.tokens + estimated_input + max_new_tokens
+        if (
+            estimated_total > self.options.max_total_tokens
+        ):
+            self.budget_rejections.append(
+                {
+                    "stage": stage,
+                    "reason": "token_budget",
+                    "tokens_before": self.tokens,
+                    "estimated_input_tokens": estimated_input,
+                    "reserved_output_tokens": max_new_tokens,
+                    "estimated_total_tokens": estimated_total,
+                    "token_limit": self.options.max_total_tokens,
+                }
+            )
+            raise ValueError("knowledge token budget exhausted")
+        started = time.monotonic()
+        attempt: dict[str, Any] = {
+            "status": "started",
+            "stage": stage,
+            "estimated_input_tokens": estimated_input,
+            "reserved_output_tokens": max_new_tokens,
+            "tokens_before": self.tokens,
+        }
         self.attempts.append(attempt)
         try:
             kwargs.setdefault("model", self.model)
@@ -1848,9 +2055,16 @@ class ModelSession:
             usage=response.get("usage", {}),
         )
         usage = response.get("usage") or {}
-        self.tokens += int(
-            usage.get("total_tokens")
+        reported_tokens = usage.get("total_tokens")
+        used_tokens = int(
+            reported_tokens
             or estimated_input + len(str(response.get("content", ""))) // 4
+        )
+        self.tokens += used_tokens
+        attempt.update(
+            total_tokens=used_tokens,
+            token_usage="provider" if reported_tokens else "estimated",
+            cumulative_tokens=self.tokens,
         )
         return response
 
@@ -1865,6 +2079,9 @@ class ModelSession:
         allowed_evidence_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         output_schema = schema.model_json_schema()
+        signature_prompt = resource_signature_text(
+            self.options.resource_signature_policy
+        )
         if allowed_fault_types:
             constrain_fault_type_schema(output_schema, allowed_fault_types)
         if allowed_services:
@@ -1887,6 +2104,7 @@ class ModelSession:
                     "nao houver itens. "
                     "Retorne somente JSON estrito conforme output_schema. "
                     + EVIDENCE_FORMAT_NOTICE
+                    + ("\n\n" + signature_prompt if signature_prompt else "")
                 ),
             },
             {
@@ -1934,6 +2152,10 @@ class ModelSession:
 
 class CheckUnavailable(ValueError):
     """A rejected proposal, not a telemetry transport failure."""
+
+    def __init__(self, message: str, *, evidence_id: str | None = None):
+        super().__init__(message)
+        self.evidence_id = evidence_id
 
 
 def prepare_check(
@@ -2039,8 +2261,18 @@ def prepare_check(
         }
     if name not in tools:
         raise CheckUnavailable(f"requested MCP tool unavailable: {name}")
-    if any(call["tool"] == name and call["arguments"] == arguments for call in calls):
-        raise CheckUnavailable("query already executed in current investigation")
+    duplicate_call = next(
+        (
+            call for call in calls
+            if call["tool"] == name and call["arguments"] == arguments
+        ),
+        None,
+    )
+    if duplicate_call is not None:
+        raise CheckUnavailable(
+            "query already executed in current investigation",
+            evidence_id=duplicate_call.get("evidence_id"),
+        )
     return name, arguments, family, candidate
 
 
@@ -2075,6 +2307,17 @@ def check_inventory(
         "mcp_tools": sorted(tools),
         "executable_checks": executable,
         "next_trace_candidate": _rca_next_trace_candidate(calls),
+        "check_capabilities": {
+            "sdk_http": {
+                "available": False,
+                "status": "not_queried",
+                "reason": (
+                    "No SDK-specific query contract is registered. The executable "
+                    "http check queries Istio request rates only; SDK histograms "
+                    "must not be treated as absent or mixed into those rates."
+                ),
+            },
+        },
         "measurement_limits": [
             "cpu/memory medem saturacao, nao GC, threads ou throttling.",
             "cpu_throttling mede periodos CFS em %, gc mede tempo de coleta JVM em s/s; "
@@ -2169,6 +2412,12 @@ def execute_check(
         "level": 5,
         "tool": name,
         "family": family,
+        "kind": check.kind,
+        "source_provenance": _evidence_source_provenance(
+            name, family, check.kind, result
+        ),
+        "service": check.service,
+        "phase": check.phase,
         "status": result.get("status", "ok" if count else "no_data"),
         "source": (
             evidence_source
@@ -2187,6 +2436,7 @@ def execute_check(
             "tool": name,
             "arguments": arguments,
             "result": result,
+            "evidence_id": identifier,
             "duration_ms": round((time.monotonic() - started) * 1000),
         }
     )
@@ -2261,7 +2511,7 @@ def investigate(
     if saved_pair:
         if (
             saved_pair["labels"] != labels
-            or saved_pair["options_sha256"] != digest(options.model_dump())
+            or saved_pair["options_sha256"] != digest(options_fingerprint(options))
             or saved_pair["sha256"]
             != digest(
                 {key: value for key, value in saved_pair.items() if key != "sha256"}
@@ -2288,6 +2538,7 @@ def investigate(
         "source_run_id": run_id,
         "status": "error",
         "model_attempts": session.attempts,
+        "model_budget_rejections": session.budget_rejections,
     }
     try:
         card = load_system_card(namespace)
@@ -2300,8 +2551,10 @@ def investigate(
                 namespace=namespace,
                 window_metadata=window_metadata,
                 possible_fault_types=options.possible_fault_types,
+                resource_signature_policy=options.resource_signature_policy,
                 require_best_guess=options.require_best_guess,
                 evidence_source=evidence_source,
+                evidence_projector=session.evidence_projector,
                 llm=session.invoke,
             )
             result["initial_result"] = skill
@@ -2354,13 +2607,13 @@ def investigate(
                 "phases": phases,
                 "namespace": namespace,
                 "version": VERSION,
-                "options_sha256": digest(options.model_dump()),
+                "options_sha256": digest(options_fingerprint(options)),
             }
             if labels:
                 store.save_record(run_id, "initial", initial)
         if initial["phases"] != phases or initial["namespace"] != namespace:
             raise ValueError("persisted initial context differs from current run")
-        if initial["options_sha256"] != digest(options.model_dump()):
+        if initial["options_sha256"] != digest(options_fingerprint(options)):
             raise ValueError("persisted initial options differ from annotation request")
         a = IncidentA.model_validate(initial["a"])
         evidence = json.loads(canonical(initial["skill"]["evidence"]))
@@ -2621,7 +2874,7 @@ def investigate(
                 "round": round_number,
                 "application_context": render_system_card(namespace),
                 "a": a.model_dump(),
-                "evidence": compact_evidence_for_model(evidence),
+                "evidence": session.evidence_projector.model_view(evidence),
                 "history": loaded,
                 "available_historical_pair_ids": sorted(selected_ids),
                 "previous_checks": result["additional_checks"],
@@ -2773,7 +3026,7 @@ def investigate(
             "possible_fault_types": options.possible_fault_types,
             "known_services": sorted(known),
             "a": a.model_dump(),
-            "evidence": compact_evidence_for_model(evidence),
+            "evidence": session.evidence_projector.model_view(evidence),
             "history": loaded,
             "executed_checks": result["additional_checks"],
             "investigation_stop_reason": result.get("stop_reason"),
@@ -2917,12 +3170,13 @@ def investigate(
                 "executed_checks": result["additional_checks"],
                 "skill_hash": initial["skill"]["skill"]["sha256"],
                 "validation": "automated; no mandatory human review",
-                "options_sha256": digest(options.model_dump()),
+                "options_sha256": digest(options_fingerprint(options)),
                 "generation": {
                     "model_attempts": session.attempts,
                     "model_calls": len(session.attempts),
                     "total_tokens": session.tokens,
                     "duration_ms": round((time.monotonic() - session.started) * 1000),
+                    "evidence_context_projection": session.evidence_projector.audit,
                 },
             }
             pair["sha256"] = digest(pair)
@@ -2936,4 +3190,6 @@ def investigate(
     result["duration_ms"] = round((time.monotonic() - session.started) * 1000)
     result["model_calls"] = len(session.attempts)
     result["total_tokens"] = session.tokens
+    result["model_budget_rejections"] = session.budget_rejections
+    result["evidence_context_projection"] = session.evidence_projector.audit
     return result

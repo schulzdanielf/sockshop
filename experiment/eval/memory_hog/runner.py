@@ -484,6 +484,7 @@ def build_spec(
             "metrics": {
                 "provider": "mcp-prometheus",
                 "mcp_sse_url": historical_url,
+                "history_campaign_id": historical.get("campaign_id") or exp_id,
                 "timeout_seconds": max(10, history_timeout),
                 # ── Golden Signals (Google SRE) ───────────────────────────
                 # Four dimensions: traffic, errors, latency, saturation.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -26,28 +27,31 @@ from .agent_console import (
     _rca_redact_text,
     _rca_tool_arguments,
     _rca_tool_digest,
+    _rca_trace_candidates,
     rca_reference_phases,
 )
 from .analysis.edge_latency import (
     build_edge_latency_queries,
     normalize_edge_latency_result,
 )
-from .analysis.istio_edges import http_status_query
+from .analysis.istio_edges import http_status_query, resolve_istio_destination
 from .analysis.llm_client import LLMClientError, call_llm_tool_messages
 from .analysis.system_card import load_system_card, render_system_card
-from .evidence_projection import compact_evidence_for_model, EVIDENCE_FORMAT_NOTICE
 from .analysis.telemetry_coverage import (
     phase_series_summary,
     termination_query,
     termination_summary,
 )
-from .rca_options import (
-    MAX_ADDITIONAL_MCP_CHECKS,
-    validate_possible_fault_types,
+from .evidence_projection import EVIDENCE_FORMAT_NOTICE, EvidenceProjectionSession
+from .rca_options import MAX_ADDITIONAL_MCP_CHECKS, validate_possible_fault_types
+from .resource_signature import (
+    ResourceSignaturePolicy,
+    resource_signature_metadata,
+    resource_signature_text,
 )
 
 SKILL_DIR = Path(__file__).resolve().parents[3] / ".github" / "skills" / "rca"
-MAX_LOG_SERVICES = 6
+MAX_LOG_SERVICES = 4
 MAX_LOG_LINES = 150
 MAX_SKILL_MODEL_ATTEMPTS = 3
 _RAW_OVERRIDE = object()
@@ -67,13 +71,27 @@ class SkillRCAError(ValueError):
     pass
 
 
+class SkillBudgetExceeded(SkillRCAError):
+    pass
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+class CausalHypothesis(StrictModel):
+    hypothesis_id: Literal["H1", "H2", "H3", "H4", "H5"]
+    service: str | None
+    category: str = Field(max_length=80)
+    mechanism: str = Field(min_length=1, max_length=600)
+    supporting_evidence: list[str] = Field(max_length=10)
+    contradicting_evidence: list[str] = Field(max_length=10)
+    unresolved_questions: list[str] = Field(max_length=6)
+
+
 class InvestigationPlan(StrictModel):
     candidates: list[str] = Field(min_length=1, max_length=3)
-    hypotheses: list[str] = Field(min_length=2, max_length=5)
+    hypotheses: list[CausalHypothesis] = Field(min_length=2, max_length=5)
     reasoning: str = Field(min_length=1, max_length=2000)
 
 
@@ -176,6 +194,10 @@ def _observation_count(
         values = [phases.get(phase_name)] if phase_name else phases.values()
         return [value for value in values if isinstance(value, dict)]
 
+    if name == "tempo_search_traces":
+        if phase_name and result.get("phase") != phase_name:
+            return 0
+        return len(result.get("traces") or [])
     if name == "tempo_service_graph_phases":
         return sum(
             int(phase.get("trace_count") or 0)
@@ -231,14 +253,357 @@ def _sanitize(value: Any) -> Any:
     return value
 
 
-def _families(ids: list[str], evidence: list[dict[str, Any]]) -> set[str]:
-    return {
-        item["family"]
-        for item in evidence
-        if item["id"] in ids
-        and item["status"] == "ok"
+_KNOWN_METRIC_PROVENANCE = {
+    "prometheus_golden_signals",
+    "prometheus_kube_state_metrics",
+    "prometheus_cadvisor",
+    "prometheus_istio",
+    "prometheus_jvm",
+}
+_SPAN_DERIVED_PROVENANCE = {
+    "span_derived",
+    "otel_span_metrics",
+    "tempo_span_metrics",
+    "prometheus_span_metrics",
+}
+
+
+def _evidence_source_provenance(
+    tool: str,
+    family: str,
+    kind: str | None = None,
+    result: dict[str, Any] | None = None,
+) -> str:
+    if family == "logs":
+        return "loki_logs"
+    if family == "traces":
+        return "tempo_traces"
+    if family != "metrics":
+        return "unknown"
+    if tool == "get_run_golden_signals":
+        return "prometheus_golden_signals"
+    if tool in {
+        "check_service_readiness",
+        "check_oom_kills",
+        "check_pod_restarts",
+    }:
+        return "prometheus_kube_state_metrics"
+    if tool in {
+        "get_cpu_saturation_top",
+        "get_memory_saturation_top",
+        "check_network_packet_drops",
+    }:
+        return "prometheus_cadvisor"
+    if tool == "prometheus_range_query":
+        purpose_to_kind = {
+            "http_status_rates": "http",
+            "network_edge_latency": "network",
+            "cpu_throttling": "cpu_throttling",
+            "gc_collection_time": "gc",
+        }
+        kind = kind or purpose_to_kind.get((result or {}).get("purpose"))
+        return {
+            "http": "prometheus_istio",
+            "network": "prometheus_istio",
+            "lifecycle": "prometheus_kube_state_metrics",
+            "cpu_throttling": "prometheus_cadvisor",
+            "gc": "prometheus_jvm",
+        }.get(kind, "unknown")
+    return "unknown"
+
+
+def _evidence_mentions_service(item: dict[str, Any], service: str) -> bool:
+    if item.get("service") == service:
+        return True
+    content = item.get("text")
+    if not isinstance(content, str):
+        content = json.dumps(
+            {
+                key: item[key]
+                for key in ("digest", "result", "arguments")
+                if key in item
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    return bool(
+        re.search(
+            rf"(?<![a-z0-9-]){re.escape(service.lower())}(?![a-z0-9-])",
+            content.lower(),
+        )
+    )
+
+
+def _resolved_evidence_provenance(item: dict[str, Any]) -> str:
+    family = item.get("family")
+    provenance = item.get("source_provenance")
+    if not isinstance(provenance, str):
+        provenance = _evidence_source_provenance(
+            str(item.get("tool") or ""),
+            str(family or ""),
+            item.get("kind") if isinstance(item.get("kind"), str) else None,
+            item.get("digest") if isinstance(item.get("digest"), dict) else None,
+        )
+    return provenance
+
+
+def _independent_evidence_family(item: dict[str, Any]) -> str | None:
+    if item.get("is_causal_evidence") is False:
+        return None
+    family = item.get("family")
+    provenance = _resolved_evidence_provenance(item)
+    if provenance in _SPAN_DERIVED_PROVENANCE:
+        return "traces"
+    if family == "logs" and provenance == "loki_logs":
+        return "logs"
+    if family == "traces" and provenance == "tempo_traces":
+        return "traces"
+    if family == "metrics" and provenance in _KNOWN_METRIC_PROVENANCE:
+        return "metrics"
+    return None
+
+
+def _has_unknown_metric_provenance(
+    evidence: list[dict[str, Any]], evidence_ids: list[str]
+) -> bool:
+    selected_ids = set(evidence_ids)
+    return any(
+        item.get("id") in selected_ids
+        and item.get("family") == "metrics"
+        and item.get("usable") is not False
+        and item.get("status") in {"ok", "partial", "success"}
+        and isinstance(item.get("fault_observation_count"), int)
         and item["fault_observation_count"] > 0
-    }
+        and ("phases" not in item or "fault" in item.get("phases", []))
+        and _resolved_evidence_provenance(item) == "unknown"
+        for item in evidence
+    )
+
+
+def independent_evidence_families(
+    evidence: list[dict[str, Any]],
+    evidence_ids: list[str] | None = None,
+    *,
+    target_service: str | None = None,
+) -> set[str]:
+    selected_ids = set(evidence_ids) if evidence_ids is not None else None
+    families = set()
+    for item in evidence:
+        if selected_ids is not None and item.get("id") not in selected_ids:
+            continue
+        fault_count = item.get("fault_observation_count")
+        if (
+            item.get("usable") is False
+            or item.get("is_causal_evidence") is False
+            or item.get("status") not in {"ok", "partial", "success"}
+            or ("phases" in item and "fault" not in item.get("phases", []))
+            or not isinstance(fault_count, int)
+            or fault_count <= 0
+        ):
+            continue
+        if target_service and not _evidence_mentions_service(item, target_service):
+            continue
+        family = _independent_evidence_family(item)
+        if family:
+            families.add(family)
+    return families
+
+
+def _evidence_result(item: dict[str, Any]) -> dict[str, Any]:
+    result = item.get("result") or item.get("digest")
+    if isinstance(result, dict):
+        return result
+    text = item.get("text")
+    if isinstance(text, str):
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _http_fault_row_has_positive_rate(row: dict[str, Any]) -> bool:
+    for key in ("mean", "max"):
+        value = row.get(key)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0
+        ):
+            return True
+    return False
+
+
+def _fault_phase_result(
+    item: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any] | None:
+    phases = result.get("phases")
+    if isinstance(phases, dict) and isinstance(phases.get("fault"), dict):
+        return phases["fault"]
+    if item.get("phase") == "fault" or result.get("phase") == "fault":
+        return result
+    return None
+
+
+def _http_edge_error_spans(
+    phase: dict[str, Any],
+    edges: set[tuple[str | None, str]],
+) -> bool:
+    for span in phase.get("error_spans") or []:
+        if not isinstance(span, dict) or not re.fullmatch(
+            r"5\d\d", str(span.get("http_status_code", ""))
+        ):
+            continue
+        service = span.get("service")
+        remote_service = span.get("remote_service")
+        if not remote_service:
+            endpoint = span.get("remote_endpoint")
+            if isinstance(endpoint, str):
+                match = re.match(r"^(?:https?://)?([a-z0-9-]+)", endpoint)
+                remote_service = match.group(1) if match else None
+        if service and (service, remote_service) in edges:
+            return True
+        if service and any(target == service for _, target in edges):
+            return True
+    return False
+
+
+def _http_edge_error_logs(
+    item: dict[str, Any],
+    result: dict[str, Any],
+    phase: dict[str, Any],
+    edges: set[tuple[str | None, str]],
+) -> bool:
+    source = result.get("service") or item.get("service")
+    messages = [
+        row.get("message")
+        for row in phase.get("sample_lines") or []
+        if isinstance(row, dict) and isinstance(row.get("message"), str)
+    ]
+    for signature in phase.get("signatures") or []:
+        if not isinstance(signature, dict):
+            continue
+        messages.extend(
+            example.get("message")
+            for example in signature.get("examples") or []
+            if isinstance(example, dict) and isinstance(example.get("message"), str)
+        )
+    for message in messages:
+        if not re.search(r"\b5\d\d\b|HttpServerErrorException", message, re.I):
+            continue
+        for caller, target in edges:
+            if source == target:
+                return True
+            if source != caller:
+                continue
+            endpoint = re.search(
+                rf"(?:https?://)?{re.escape(target)}"
+                rf"(?:\.sock-shop\.svc(?:\.cluster\.local)?|[/:])",
+                message,
+                re.I,
+            )
+            if endpoint:
+                return True
+    return False
+
+
+def http_independent_evidence_families(
+    evidence: list[dict[str, Any]],
+    evidence_ids: list[str],
+    target_service: str,
+) -> set[str]:
+    selected_ids = set(evidence_ids)
+    fault_edges: set[tuple[str | None, str]] = set()
+
+    for item in evidence:
+        if (
+            item.get("id") not in selected_ids
+            or item.get("family") != "metrics"
+            or item.get("is_causal_evidence") is False
+            or _resolved_evidence_provenance(item) != "prometheus_istio"
+            or item.get("status") not in {"ok", "partial", "success"}
+            or item.get("usable") is False
+            or ("phases" in item and "fault" not in item.get("phases", []))
+            or (
+                isinstance(item.get("fault_observation_count"), int)
+                and item["fault_observation_count"] <= 0
+            )
+        ):
+            continue
+        result = _evidence_result(item)
+        if (
+            result.get("purpose") != "http_status_rates"
+            or result.get("service") != target_service
+        ):
+            continue
+        phase = _fault_phase_result(item, result)
+        if phase is None:
+            continue
+        for row in phase.get("series") or []:
+            if not _http_fault_row_has_positive_rate(row):
+                continue
+            labels = row.get("labels") or {}
+            response_code = str(labels.get("response_code", ""))
+            caller = labels.get("source_workload")
+            namespace = (
+                labels.get("source_workload_namespace")
+                or labels.get("destination_workload_namespace")
+                or "sock-shop"
+            )
+            if (
+                re.fullmatch(r"5\d\d", response_code)
+                and resolve_istio_destination(labels, namespace) == target_service
+            ):
+                fault_edges.add(
+                    (
+                        (
+                            caller
+                            if isinstance(caller, str) and caller != "unknown"
+                            else None
+                        ),
+                        target_service,
+                    )
+                )
+
+    families = {"metrics"} if fault_edges else set()
+    for item in evidence:
+        if (
+            item.get("id") not in selected_ids
+            or item.get("status") not in {"ok", "partial", "success"}
+            or item.get("usable") is False
+            or (
+                isinstance(item.get("fault_observation_count"), int)
+                and item["fault_observation_count"] <= 0
+            )
+        ):
+            continue
+        family = _independent_evidence_family(item)
+        if family not in {"logs", "traces"} or not independent_evidence_families(
+            [item]
+        ):
+            continue
+        result = _evidence_result(item)
+        phase = _fault_phase_result(item, result)
+        if phase is None:
+            continue
+        if family == "traces" and _http_edge_error_spans(phase, fault_edges):
+            families.add(family)
+        elif family == "logs" and _http_edge_error_logs(
+            item, result, phase, fault_edges
+        ):
+            families.add(family)
+    return families
+
+
+def _families(
+    ids: list[str],
+    evidence: list[dict[str, Any]],
+    *,
+    target_service: str | None = None,
+) -> set[str]:
+    return independent_evidence_families(evidence, ids, target_service=target_service)
 
 
 def _edge_latency_candidates(
@@ -256,6 +621,59 @@ def _edge_latency_candidates(
                 ):
                     candidates.append(service)
     return candidates
+
+
+def _edge_trace_search_targets(
+    results: list[dict[str, Any]], known_services: set[str]
+) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    by_edge: dict[tuple[str, str], dict[str, Any]] = {}
+    for result in results:
+        for metric_name, metric in (result.get("metrics") or {}).items():
+            positive_rows = [
+                row
+                for row in metric.get("top_delta") or []
+                if isinstance(row, dict)
+                and isinstance(row.get("delta"), (int, float))
+                and not isinstance(row.get("delta"), bool)
+                and row["delta"] > 0
+            ]
+            if not positive_rows:
+                continue
+            row = max(positive_rows, key=lambda item: item["delta"])
+            source = row.get("source_workload") or row.get("client")
+            destination = (
+                row.get("destination_workload")
+                or row.get("server")
+                or row.get("service")
+            )
+            if (
+                source not in known_services
+                or destination not in known_services
+                or source == destination
+            ):
+                continue
+            edge = (source, destination)
+            existing = by_edge.get(edge)
+            profile = {
+                "metric": metric_name,
+                "unit": metric.get("unit"),
+                "baseline": row.get("baseline"),
+                "fault": row.get("fault"),
+                "delta": row["delta"],
+                "baseline_sample_count": row.get("baseline_sample_count"),
+                "fault_sample_count": row.get("fault_sample_count"),
+            }
+            if existing is None:
+                existing = {
+                    "source_service": source,
+                    "destination_service": destination,
+                    "metric_profiles": [],
+                }
+                by_edge[edge] = existing
+                targets.append(existing)
+            existing["metric_profiles"].append(profile)
+    return targets[:3]
 
 
 def _prepare_skill_additional_check(
@@ -353,9 +771,7 @@ def _prepare_skill_additional_check(
         name, family = "prometheus_range_query", "metrics"
         namespace_selector = json.dumps(namespace)
         workload_selector = json.dumps(check.service)
-        pod_selector = json.dumps(
-            f"^{re.escape(check.service)}-[a-z0-9]+-[a-z0-9]+$"
-        )
+        pod_selector = json.dumps(f"^{re.escape(check.service)}-[a-z0-9]+-[a-z0-9]+$")
         if check.kind == "lifecycle":
             query = termination_query(namespace, [check.service])
         elif check.kind == "cpu_throttling":
@@ -400,7 +816,11 @@ def _prepare_skill_additional_check(
             }
             purpose, unit = purposes[check.kind]
             normalize = lambda raw: phase_series_summary(
-                raw, windows, purpose=purpose, unit=unit, service=check.service,
+                raw,
+                windows,
+                purpose=purpose,
+                unit=unit,
+                service=check.service,
                 namespace=namespace,
             )
     else:
@@ -408,9 +828,7 @@ def _prepare_skill_additional_check(
 
     if name not in tools:
         raise SkillRCAError(f"Requested MCP tool unavailable: {name}")
-    if any(
-        call["tool"] == name and call["arguments"] == arguments for call in calls
-    ):
+    if any(call["tool"] == name and call["arguments"] == arguments for call in calls):
         raise SkillRCAError("Additional check repeats an executed MCP query")
     return name, arguments, family, normalize, candidate
 
@@ -525,15 +943,34 @@ def validate_diagnosis(
     for restart in diagnosis.restart_analysis:
         if (
             restart.reason_status == "supported"
-            and len(_families(restart.supporting_evidence, evidence)) < 2
+            and len(
+                _families(
+                    restart.supporting_evidence,
+                    evidence,
+                    target_service=restart.service,
+                )
+            )
+            < 2
         ):
             restart.reason_status = "unknown"
             diagnosis.limitations.append(
                 f"{restart.service}: motivo do restart sem corroboração independente"
             )
+    support_families = (
+        http_independent_evidence_families(
+            evidence, diagnosis.supporting_evidence, diagnosis.primary_service
+        )
+        if diagnosis.fault_type == "http-status-code" and diagnosis.primary_service
+        else _families(diagnosis.supporting_evidence, evidence)
+    )
     gates = []
-    if len(_families(diagnosis.supporting_evidence, evidence)) < 2:
+    if len(support_families) < 2:
         gates.append("Causa sem suporte de duas familias de telemetria independentes")
+        if _has_unknown_metric_provenance(evidence, diagnosis.supporting_evidence):
+            diagnosis.limitations.append(
+                "Proveniencia de uma metrica desconhecida; ela nao foi contada como "
+                "corroboracao independente."
+            )
     if not diagnosis.primary_service or diagnosis.category == "unknown":
         gates.append("Origem ou mecanismo nao determinados")
     restart = restart_by_service.get(diagnosis.primary_service or "")
@@ -553,14 +990,19 @@ def answer_skill_rca(
     phases: dict[str, dict[str, str]],
     namespace: str,
     max_additional_checks: int = 0,
+    max_model_calls: int | None = None,
+    max_total_tokens: int | None = None,
+    timeout_seconds: int | None = None,
     window_metadata: dict[str, Any] | None = None,
     possible_fault_types: list[str] | None = None,
+    resource_signature_policy: ResourceSignaturePolicy = "none",
     require_best_guess: bool = False,
     archive_traces: dict[str, Any] | None = None,
     evidence_source: Literal["live", "history"] = "live",
     model: str | None = None,
     temperature: float | None = None,
     seed: int | None = None,
+    evidence_projector: EvidenceProjectionSession | None = None,
     llm: Callable[..., dict[str, Any]] = call_llm_tool_messages,
 ) -> dict[str, Any]:
     skill, references, skill_hash = load_skill()
@@ -584,13 +1026,18 @@ def answer_skill_rca(
         raise SkillRCAError("Invalid namespace")
     card = load_system_card(namespace)
     known = set((card.get("services") or {}).keys())
+    allowed_categories = sorted(card.get("allowed_fault_categories") or [])
     if not known or not {"baseline", "fault"}.issubset(phases):
         raise SkillRCAError(
             "Skill RCA requires a system card and baseline/fault windows"
         )
     windows, reference_source = rca_reference_phases(
-        phases, baseline_source=((window_metadata or {}).get("phase_sources") or {}).get("baseline"),
+        phases,
+        baseline_source=((window_metadata or {}).get("phase_sources") or {}).get(
+            "baseline"
+        ),
     )
+    signature_prompt = resource_signature_text(resource_signature_policy)
     for window in windows.values():
         start = datetime.fromisoformat(window["start"].replace("Z", "+00:00"))
         end = datetime.fromisoformat(window["end"].replace("Z", "+00:00"))
@@ -603,11 +1050,170 @@ def answer_skill_rca(
     evidence: list[dict[str, Any]] = []
     limitations: list[str] = []
     model_attempts: list[dict[str, Any]] = []
+    model_budget_rejections: list[dict[str, Any]] = []
+    budget_limits = (max_model_calls, max_total_tokens, timeout_seconds)
+    budget_enabled = any(value is not None for value in budget_limits)
+    if budget_enabled and (
+        max_model_calls is None or max_total_tokens is None or timeout_seconds is None
+    ):
+        raise SkillRCAError("Skill model budget limits must be set together")
+    if budget_enabled and (
+        isinstance(max_model_calls, bool)
+        or not isinstance(max_model_calls, int)
+        or not 6 <= max_model_calls <= 30
+        or isinstance(max_total_tokens, bool)
+        or not isinstance(max_total_tokens, int)
+        or not 8_000 <= max_total_tokens <= 500_000
+        or isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 30 <= timeout_seconds <= 1_800
+    ):
+        raise SkillRCAError("Skill model budget limits are outside the allowed range")
+
+    model_call_limit = max_model_calls if max_model_calls is not None else 0
+    token_limit = max_total_tokens if max_total_tokens is not None else 0
+    time_limit = timeout_seconds if timeout_seconds is not None else 0
+    budget_started = time.monotonic()
+    model_calls_used = 0
+    model_tokens_used = 0
+
+    def model_stage(messages: list[dict[str, Any]]) -> str:
+        for message in reversed(messages):
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("stage"), str):
+                return payload["stage"]
+        return "model_call"
+
+    def budgeted_llm(
+        messages: list[dict[str, Any]], tools: list, **kwargs: Any
+    ) -> dict[str, Any]:
+        nonlocal model_calls_used, model_tokens_used
+        if not budget_enabled:
+            return llm(messages, tools, **kwargs)
+        if model_calls_used >= model_call_limit:
+            raise SkillBudgetExceeded("Skill model call budget exhausted")
+        if time.monotonic() - budget_started >= time_limit:
+            raise SkillBudgetExceeded("Skill model timeout exhausted")
+        estimated_input = (
+            len(
+                json.dumps(
+                    messages,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+            // 4
+        )
+        max_new_tokens = kwargs.get("max_new_tokens", 4_096)
+        if (
+            isinstance(max_new_tokens, bool)
+            or not isinstance(max_new_tokens, int)
+            or max_new_tokens < 0
+        ):
+            raise SkillRCAError("Model max_new_tokens must be a non-negative integer")
+        stage = model_stage(messages)
+        estimated_total = model_tokens_used + estimated_input + max_new_tokens
+        if estimated_total > token_limit:
+            model_budget_rejections.append(
+                {
+                    "stage": stage,
+                    "reason": "token_budget",
+                    "tokens_before": model_tokens_used,
+                    "estimated_input_tokens": estimated_input,
+                    "reserved_output_tokens": max_new_tokens,
+                    "estimated_total_tokens": estimated_total,
+                    "token_limit": token_limit,
+                }
+            )
+            raise SkillBudgetExceeded("Skill model token budget exhausted")
+
+        attempt = {
+            "stage": stage,
+            "status": "started",
+            "estimated_input_tokens": estimated_input,
+            "reserved_output_tokens": max_new_tokens,
+            "tokens_before": model_tokens_used,
+        }
+        model_attempts.append(attempt)
+        model_calls_used += 1
+        started = time.monotonic()
+        returned = False
+        try:
+            response = llm(messages, tools, **kwargs)
+            returned = True
+        except (*TOOL_ERRORS, LLMClientError) as exc:
+            attempt.update(
+                status="error",
+                error=_rca_redact_text(_mcp_exception_detail(exc)),
+            )
+            raise
+        finally:
+            attempt["duration_ms"] = round((time.monotonic() - started) * 1000)
+            if not returned and attempt["status"] == "started":
+                attempt["status"] = "error"
+
+        usage_value = response.get("usage")
+        if usage_value is not None and not isinstance(usage_value, dict):
+            attempt["status"] = "error"
+            raise SkillRCAError("Model returned invalid token usage")
+        usage = usage_value or {}
+        reported_tokens = usage.get("total_tokens")
+        if reported_tokens is not None and (
+            isinstance(reported_tokens, bool)
+            or not isinstance(reported_tokens, int)
+            or reported_tokens < 0
+        ):
+            attempt["status"] = "error"
+            raise SkillRCAError("Model returned invalid total_tokens usage")
+        provider_tokens = isinstance(reported_tokens, int) and reported_tokens > 0
+        used_tokens = (
+            reported_tokens
+            if provider_tokens
+            else estimated_input + len(str(response.get("content", ""))) // 4
+        )
+        model_tokens_used += used_tokens
+        attempt.update(
+            status="returned",
+            usage=usage,
+            total_tokens=used_tokens,
+            token_usage="provider" if provider_tokens else "estimated",
+            cumulative_tokens=model_tokens_used,
+        )
+        return response
+
+    model_llm = budgeted_llm if budget_enabled else llm
+    evidence_projector = evidence_projector or EvidenceProjectionSession(
+        model_llm,
+        model=model,
+        temperature=temperature,
+        seed=seed,
+        attempt_log=None if budget_enabled else model_attempts,
+    )
+    if budget_enabled and evidence_projector.llm is not model_llm:
+        evidence_projector.llm = model_llm
+        evidence_projector.attempt_log = None
     restarted: list[str] = []
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": skill + "\n" + render_system_card(namespace) + "\n" + EVIDENCE_FORMAT_NOTICE,
+            "content": (
+                skill
+                + "\n"
+                + render_system_card(namespace)
+                + "\n"
+                + EVIDENCE_FORMAT_NOTICE
+                + "\nReferencias de evidencia são IDs exatos em listas próprias; "
+                "nunca acrescente explicações ao ID. Mantenha causa e narrativa "
+                "em campos separados."
+                + ("\n\n" + signature_prompt if signature_prompt else "")
+            ),
         },
         {
             "role": "user",
@@ -640,7 +1246,10 @@ def answer_skill_rca(
         started = time.monotonic()
         if raw_override is not _RAW_OVERRIDE:
             if not isinstance(raw_override, dict):
-                result = {"status": "tool_error", "error": "Archive returned a non-object result"}
+                result = {
+                    "status": "tool_error",
+                    "error": "Archive returned a non-object result",
+                }
             else:
                 result = normalize(raw_override) if normalize else raw_override
         elif name not in tools:
@@ -674,11 +1283,15 @@ def answer_skill_rca(
             }
             count = fault_count = 0
         status = result.get("status", "ok" if count else "no_data")
+        identifier = f"E{len(evidence) + 1:03d}"
         item = {
-            "id": f"E{len(evidence) + 1:03d}",
+            "id": identifier,
             "level": level,
             "tool": name,
             "family": family,
+            "source_provenance": _evidence_source_provenance(
+                name, family, kind, result
+            ),
             "status": status,
             "source": (
                 evidence_source
@@ -688,10 +1301,12 @@ def answer_skill_rca(
             ),
             "observation_count": count,
             "fault_observation_count": fault_count,
+            **({"is_causal_evidence": False} if name == "tempo_search_traces" else {}),
             "arguments": arguments,
             "digest": _rca_tool_digest(name, result),
             **({"service": service} if service else {}),
             **({"phase": phase} if phase else {}),
+            **({"kind": kind} if kind else {}),
         }
         evidence.append(item)
         calls.append(
@@ -699,6 +1314,7 @@ def answer_skill_rca(
                 "tool": name,
                 "level": level,
                 "arguments": arguments,
+                "evidence_id": identifier,
                 "duration_ms": round((time.monotonic() - started) * 1000),
                 "result": {**result, "status": status},
                 **({"service": service} if service else {}),
@@ -731,6 +1347,7 @@ def answer_skill_rca(
         *,
         allowed_fault_types: list[str] | None = None,
         allowed_services: list[str] | None = None,
+        allowed_categories: list[str] | None = None,
         validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         output_schema = schema.model_json_schema()
@@ -745,17 +1362,51 @@ def answer_skill_rca(
                 required.append("fault_type")
         if allowed_services:
             field = output_schema.get("properties", {}).get("primary_service")
-            if not isinstance(field, dict):
-                raise SkillRCAError(f"Schema for {stage} has no primary_service field")
-            field.clear()
-            field.update({"type": "string", "enum": allowed_services})
-            required = output_schema.setdefault("required", [])
-            if "primary_service" not in required:
-                required.append("primary_service")
+            if isinstance(field, dict):
+                field.clear()
+                field.update({"type": "string", "enum": allowed_services})
+                required = output_schema.setdefault("required", [])
+                if "primary_service" not in required:
+                    required.append("primary_service")
+
+        allowed_evidence_ids = sorted(item["id"] for item in evidence)
+
+        def constrain_schema(node: Any, property_name: str | None = None) -> None:
+            if isinstance(node, dict):
+                if property_name == "category" and allowed_categories:
+                    node["enum"] = allowed_categories
+                if property_name == "service" and allowed_services:
+                    if isinstance(node.get("anyOf"), list):
+                        for option in node["anyOf"]:
+                            if option.get("type") == "string":
+                                option["enum"] = allowed_services
+                    else:
+                        node["enum"] = allowed_services
+                if (
+                    property_name in {"supporting_evidence", "contradicting_evidence"}
+                    and node.get("type") == "array"
+                ):
+                    if allowed_evidence_ids:
+                        node.setdefault("items", {})["enum"] = allowed_evidence_ids
+                    else:
+                        node["maxItems"] = 0
+                for key, value in node.items():
+                    constrain_schema(value, key)
+            elif isinstance(node, list):
+                for value in node:
+                    constrain_schema(value, property_name)
+
+        constrain_schema(output_schema)
         if schema is SkillAdditionalCheckDecision:
             check_schema = output_schema["$defs"]["SkillAdditionalCheck"]["properties"]
             check_schema["service"]["enum"] = sorted(known)
             check_schema["phase"]["enum"] = sorted(windows)
+        if allowed_services:
+            candidate_items = (
+                output_schema.get("properties", {}).get("candidates") or {}
+            ).get("items")
+            if isinstance(candidate_items, dict):
+                candidate_items["enum"] = allowed_services
         messages.append(
             {
                 "role": "user",
@@ -763,7 +1414,12 @@ def answer_skill_rca(
                     {
                         "stage": stage,
                         "context": context,
-                        "evidence": compact_evidence_for_model(evidence),
+                        "evidence": evidence_projector.model_view(evidence),
+                        "allowed_evidence_ids": (
+                            allowed_evidence_ids
+                            if schema in {InvestigationPlan, Diagnosis}
+                            else None
+                        ),
                         "output_schema": output_schema,
                     },
                     ensure_ascii=False,
@@ -783,7 +1439,9 @@ def answer_skill_rca(
                 message
                 for message in messages[:current_stage]
                 if message["role"] in {"user", "system"}
-                and not message["content"].startswith(('{"stage":', "Resposta invalida:"))
+                and not message["content"].startswith(
+                    ('{"stage":', "Resposta invalida:")
+                )
             ] + messages[current_stage:]
             generation_options: dict[str, Any] = {}
             if model is not None:
@@ -792,7 +1450,8 @@ def answer_skill_rca(
                 generation_options["temperature"] = temperature
             if seed is not None:
                 generation_options["seed"] = seed
-            response = llm(
+            attempt_index = len(model_attempts)
+            response = model_llm(
                 model_messages,
                 [],
                 tool_choice="none",
@@ -807,6 +1466,11 @@ def answer_skill_rca(
                     },
                 },
                 **generation_options,
+            )
+            call_attempt = (
+                model_attempts[attempt_index]
+                if budget_enabled and len(model_attempts) > attempt_index
+                else None
             )
             try:
                 value = _json_content(response)
@@ -823,6 +1487,7 @@ def answer_skill_rca(
                     )
                 if (
                     allowed_services
+                    and "primary_service" in schema.model_fields
                     and value.get("primary_service") not in allowed_services
                 ):
                     raise ValueError(
@@ -830,13 +1495,19 @@ def answer_skill_rca(
                         + ", ".join(allowed_services)
                     )
             except (ValueError, ValidationError) as exc:
-                model_attempts.append(
-                    {
-                        "stage": stage,
-                        "status": "invalid_response",
-                        "error": _rca_redact_text(exc),
-                    }
-                )
+                if call_attempt is not None:
+                    call_attempt.update(
+                        status="invalid_response",
+                        error=_rca_redact_text(exc),
+                    )
+                else:
+                    model_attempts.append(
+                        {
+                            "stage": stage,
+                            "status": "invalid_response",
+                            "error": _rca_redact_text(exc),
+                        }
+                    )
                 if attempt + 1 == MAX_SKILL_MODEL_ATTEMPTS:
                     raise SkillRCAError(f"Qwen returned invalid {stage} JSON") from exc
                 messages.append(
@@ -850,7 +1521,10 @@ def answer_skill_rca(
                     }
                 )
             else:
-                model_attempts.append({"stage": stage, "status": "valid_response"})
+                if call_attempt is not None:
+                    call_attempt["status"] = "valid_response"
+                else:
+                    model_attempts.append({"stage": stage, "status": "valid_response"})
                 messages.append(
                     {
                         "role": "assistant",
@@ -876,21 +1550,23 @@ def answer_skill_rca(
             if isinstance(tool, dict) and isinstance(tool.get("name"), str)
         }
         messages.append({"role": "user", "content": references["evidence-contract.md"]})
-        messages.append({
-            "role": "user",
-            "content": (
-                "Em HTTP, distinga a aplicacao-alvo do proxy que respondeu. FI em "
-                "response_flags indica fault injection no proxy; destination_workload "
-                "unknown nao elimina a identidade quando o FQDN valida o servico. "
-                "Compare codigo/flags/aresta por reporter e busque logs do chamador "
-                "e seu istio-proxy ou spans CLIENT. Um abort pode impedir o span "
-                "SERVER e o log da aplicacao-alvo. Ausencia desses registros nao "
-                "comprova o abort; exija corroboracao da mesma ocorrencia. "
-                "Complemente com familias http_client_* e http_server_* do SDK, "
-                "por namespace/job e codigo/metodo/rota, separando probes de "
-                "trafego de negocio e respeitando as unidades dos histogramas."
-            ),
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Em HTTP, distinga a aplicacao-alvo do proxy que respondeu. FI em "
+                    "response_flags indica fault injection no proxy; destination_workload "
+                    "unknown nao elimina a identidade quando o FQDN valida o servico. "
+                    "Compare codigo/flags/aresta por reporter e busque logs do chamador "
+                    "e seu istio-proxy ou spans CLIENT. Um abort pode impedir o span "
+                    "SERVER e o log da aplicacao-alvo. Ausencia desses registros nao "
+                    "comprova o abort; exija corroboracao da mesma ocorrencia. "
+                    "Complemente com familias http_client_* e http_server_* do SDK, "
+                    "por namespace/job e codigo/metodo/rota, separando probes de "
+                    "trafego de negocio e respeitando as unidades dos histogramas."
+                ),
+            }
+        )
         for name, level in (
             ("get_run_golden_signals", 1),
             ("check_service_readiness", 2),
@@ -929,6 +1605,7 @@ def answer_skill_rca(
                 "metrics",
                 arguments,
                 lambda raw: termination_summary(raw, windows),
+                kind="lifecycle",
             )
         else:
             limitations.append(
@@ -937,15 +1614,24 @@ def answer_skill_rca(
         if "prometheus_range_query" in tools:
             query_end = windows.get("post", windows["fault"])["end"]
             query(
-                "prometheus_range_query", 1, "metrics",
+                "prometheus_range_query",
+                1,
+                "metrics",
                 {
                     "query": http_status_query(namespace),
-                    "start": windows["baseline"]["start"], "end": query_end, "step": "15s",
+                    "start": windows["baseline"]["start"],
+                    "end": query_end,
+                    "step": "15s",
                 },
                 lambda raw: phase_series_summary(
-                    raw, windows, purpose="http_status_rates", unit="req/s",
-                    service=None, namespace=namespace,
+                    raw,
+                    windows,
+                    purpose="http_status_rates",
+                    unit="req/s",
+                    service=None,
+                    namespace=namespace,
                 ),
+                kind="http",
             )
             for spec in build_edge_latency_queries(namespace, sorted(known)):
                 arguments = {
@@ -966,6 +1652,7 @@ def answer_skill_rca(
                             phases=windows,
                             known_services=sorted(known),
                         ),
+                        kind="network",
                     )
                 )
         else:
@@ -973,6 +1660,44 @@ def answer_skill_rca(
                 "Latencia por aresta indisponivel: prometheus_range_query ausente"
             )
         edge_candidates = _edge_latency_candidates(edge_latency_results, known)
+
+        def validate_plan(value: dict[str, Any]) -> None:
+            identifiers = {
+                item["id"] for item in evidence if isinstance(item.get("id"), str)
+            }
+            hypotheses = value.get("hypotheses") or []
+            signatures = set()
+            hypothesis_ids = set()
+            for hypothesis in hypotheses:
+                hypothesis_id = hypothesis["hypothesis_id"]
+                if hypothesis_id in hypothesis_ids:
+                    raise ValueError("plan hypothesis IDs must be unique")
+                hypothesis_ids.add(hypothesis_id)
+                service = hypothesis.get("service")
+                if service is not None and service not in known:
+                    raise ValueError(
+                        "hypothesis service must be a known service or null"
+                    )
+                if hypothesis.get("category") not in allowed_categories:
+                    raise ValueError(
+                        "hypothesis category must be allowed by the system card"
+                    )
+                references = set(hypothesis.get("supporting_evidence") or []) | set(
+                    hypothesis.get("contradicting_evidence") or []
+                )
+                if references - identifiers:
+                    raise ValueError(
+                        "hypothesis references must be exact current evidence IDs"
+                    )
+                signature = (
+                    service,
+                    hypothesis.get("category"),
+                    hypothesis.get("mechanism", "").strip().casefold(),
+                )
+                if signature in signatures:
+                    raise ValueError("plan hypotheses must be causally distinct")
+                signatures.add(signature)
+
         plan = InvestigationPlan.model_validate(
             model_json(
                 "plan",
@@ -980,7 +1705,18 @@ def answer_skill_rca(
                 {
                     "restarted_services": restarted,
                     "edge_latency_candidates": edge_candidates,
+                    "known_services": sorted(known),
+                    "allowed_categories": allowed_categories,
+                    "hypothesis_contract": (
+                        "Retorne ao menos duas hipóteses causalmente distintas. "
+                        "Cada uma deve nomear serviço conhecido ou null, categoria "
+                        "permitida, mecanismo verificável, IDs exatos de suporte/"
+                        "contradição e perguntas em aberto. Não trate ranking como prova."
+                    ),
                 },
+                allowed_services=sorted(known),
+                allowed_categories=allowed_categories,
+                validator=validate_plan,
             )
         )
         invalid_candidates = sorted(set(plan.candidates) - known)
@@ -1036,7 +1772,10 @@ def answer_skill_rca(
 
                 def normalize_logs(raw: dict[str, Any]) -> dict[str, Any]:
                     normalized = _rca_normalize_loki_range_result(
-                        raw, service=service, namespace=namespace, fault_window=window,
+                        raw,
+                        service=service,
+                        namespace=namespace,
+                        fault_window=window,
                         line_limit=MAX_LOG_LINES,
                     )
                     logs = normalized.get("phases") or {}
@@ -1059,16 +1798,165 @@ def answer_skill_rca(
         if evidence_source == "history":
             arguments["limit"] = min(int(arguments.get("limit", 20)), 10)
         query(name, 4, "traces", arguments)
-        for _ in range(2):
-            candidate = _rca_next_trace_candidate(calls)
-            if candidate is None:
+        targeted_trace_candidates: list[dict[str, Any]] = []
+        trace_scope = set(services[:MAX_LOG_SERVICES])
+        all_trace_search_targets = _edge_trace_search_targets(
+            edge_latency_results, known
+        )
+        trace_search_targets = [
+            edge
+            for edge in all_trace_search_targets
+            if edge["source_service"] in trace_scope
+            and edge["destination_service"] in trace_scope
+        ]
+        if len(trace_search_targets) < len(all_trace_search_targets):
+            limitations.append(
+                "Busca dirigida de traces limitada ao escopo autorizado de servicos"
+            )
+        eligible_trace_candidates = {
+            candidate["trace_id"]: candidate
+            for candidate in _rca_trace_candidates(calls)
+        }
+        unqualified_trace_count = 0
+        if trace_search_targets and {
+            "tempo_search_traces",
+            "tempo_analyze_trace",
+        }.issubset(tools):
+            for edge in trace_search_targets:
+                source = edge["source_service"]
+                destination = edge["destination_service"]
+                destination_host = re.escape(destination).replace(r"\-", "-")
+                service_host = re.escape(namespace).replace(r"\-", "-")
+                endpoint_pattern = (
+                    rf"http://{destination_host}"
+                    rf"(?:\.{service_host}\.svc(?:\.cluster\.local)?"
+                    rf"(?::\d+)?|(?::\d+)?)/.*"
+                )
+                trace_query = (
+                    f'{{ resource.k8s.namespace.name = "{namespace}" '
+                    f'&& resource.service.name = "{source}" '
+                    f"&& kind = client "
+                    f"&& span.http.url =~ {json.dumps(endpoint_pattern)} }}"
+                )
+                search_limit = 5
+
+                def normalize_edge_search(raw: dict[str, Any]) -> dict[str, Any]:
+                    traces = raw.get("traces")
+                    return {
+                        **raw,
+                        "phase": "fault",
+                        "status": (
+                            "ok" if isinstance(traces, list) and traces else "no_data"
+                        ),
+                    }
+
+                search_result = query(
+                    "tempo_search_traces",
+                    4,
+                    "traces",
+                    {
+                        "query": trace_query,
+                        "service_name": source,
+                        "start": windows["fault"]["start"],
+                        "end": windows["fault"]["end"],
+                        "limit": search_limit,
+                    },
+                    normalize_edge_search,
+                    service=source,
+                    phase="fault",
+                    kind="network_edge",
+                )
+                found_traces = search_result.get("traces") or []
+                if len(found_traces) >= search_limit:
+                    limitations.append(
+                        f"Busca dirigida de traces para {source}->{destination} "
+                        f"atingiu o limite {search_limit}"
+                    )
+                for trace in found_traces:
+                    if not isinstance(trace, dict):
+                        continue
+                    trace_id = (
+                        trace.get("traceID")
+                        or trace.get("traceId")
+                        or trace.get("trace_id")
+                    )
+                    if not isinstance(trace_id, str) or not re.fullmatch(
+                        r"[0-9a-fA-F]{16,64}", trace_id
+                    ):
+                        unqualified_trace_count += 1
+                        continue
+                    eligible_candidate = eligible_trace_candidates.get(trace_id)
+                    if eligible_candidate is None:
+                        unqualified_trace_count += 1
+                        continue
+                    if any(
+                        item["trace_id"] == trace_id
+                        for item in targeted_trace_candidates
+                    ):
+                        continue
+                    targeted_trace_candidates.append(
+                        {
+                            **eligible_candidate,
+                            "trace_id": trace_id,
+                            "phase": "fault",
+                            "source_service": source,
+                            "destination_service": destination,
+                            "metric_profiles": edge["metric_profiles"],
+                        }
+                    )
+        elif trace_search_targets:
+            limitations.append(
+                "Busca dirigida de spans CLIENT indisponivel; ferramenta Tempo ausente"
+            )
+        if unqualified_trace_count:
+            limitations.append(
+                f"{unqualified_trace_count} trace(s) da busca dirigida nao tinham "
+                "ID utilizavel, assinatura de erro ou regressao sobre P95 baseline comparavel; "
+                "nao foram aprofundados"
+            )
+
+        analyzed_trace_ids: set[str] = set()
+        for candidate in targeted_trace_candidates:
+            if len(analyzed_trace_ids) >= 2:
                 break
             query(
                 "tempo_analyze_trace",
                 4,
                 "traces",
                 {"trace_id": candidate["trace_id"]},
-                lambda raw: _rca_normalize_trace_result(raw, candidate),
+                lambda raw, selected=candidate: _rca_normalize_trace_result(
+                    raw, selected
+                ),
+                service=candidate["source_service"],
+                phase="fault",
+                kind="network_edge",
+            )
+            analyzed_trace_ids.add(candidate["trace_id"])
+        out_of_scope_trace_count = 0
+        for candidate in _rca_trace_candidates(calls):
+            if len(analyzed_trace_ids) >= 2:
+                break
+            if candidate["trace_id"] in analyzed_trace_ids:
+                continue
+            if candidate.get("affected_service") not in trace_scope:
+                out_of_scope_trace_count += 1
+                continue
+            query(
+                "tempo_analyze_trace",
+                4,
+                "traces",
+                {"trace_id": candidate["trace_id"]},
+                lambda raw, selected=candidate: _rca_normalize_trace_result(
+                    raw, selected
+                ),
+                service=candidate.get("affected_service"),
+                phase=candidate["phase"],
+            )
+            analyzed_trace_ids.add(candidate["trace_id"])
+        if out_of_scope_trace_count:
+            limitations.append(
+                f"{out_of_scope_trace_count} trace(s) do escopo de traces do grafo "
+                "nao foram aprofundados por falta de servico autorizado"
             )
         if archive_traces is not None:
             query(
@@ -1122,15 +2010,13 @@ def answer_skill_rca(
                             patterns=patterns,
                         )
                         try:
-                            name, _, _, _, _ = (
-                                _prepare_skill_additional_check(
-                                    candidate_check,
-                                    namespace,
-                                    windows,
-                                    known,
-                                    calls,
-                                    tools,
-                                )
+                            name, _, _, _, _ = _prepare_skill_additional_check(
+                                candidate_check,
+                                namespace,
+                                windows,
+                                known,
+                                calls,
+                                tools,
                             )
                         except SkillRCAError:
                             continue
@@ -1171,7 +2057,7 @@ def answer_skill_rca(
                             "plan": plan.model_dump(),
                             "restarted_services": restarted,
                             "edge_latency_candidates": edge_candidates,
-                            "evidence": compact_evidence_for_model(evidence),
+                            "evidence": evidence_projector.model_view(evidence),
                             "previous_checks": additional_checks,
                             "executable_checks": executable_checks,
                             "rules": [
@@ -1185,10 +2071,13 @@ def answer_skill_rca(
                         validator=validate_additional_check,
                     )
                 )
-            except (*TOOL_ERRORS, LLMClientError, SkillRCAError, ValidationError) as exc:
-                additional_check_error = _rca_redact_text(
-                    _mcp_exception_detail(exc)
-                )
+            except (
+                *TOOL_ERRORS,
+                LLMClientError,
+                SkillRCAError,
+                ValidationError,
+            ) as exc:
+                additional_check_error = _rca_redact_text(_mcp_exception_detail(exc))
                 additional_check_stop_reason = "additional_check_model_error"
                 limitations.append(
                     "Checks adicionais interrompidos por erro do modelo: "
@@ -1254,18 +2143,20 @@ def answer_skill_rca(
                         "Always choose the most likely primary_service and fault_type "
                         "from the supplied options, even when evidence is insufficient "
                         "for confirmation. Do not return null or unknown for these fields."
-                        if require_best_guess else None
+                        if require_best_guess
+                        else None
                     ),
                 },
                 allowed_fault_types=possible_fault_types or None,
                 allowed_services=sorted(known) if require_best_guess else None,
+                allowed_categories=allowed_categories,
             )
         )
         diagnosis = validate_diagnosis(
             diagnosis,
             evidence,
             known,
-            set(card.get("allowed_fault_categories") or []),
+            set(allowed_categories),
             restarted,
             possible_fault_types,
             require_best_guess=require_best_guess,
@@ -1306,23 +2197,48 @@ def answer_skill_rca(
     bundle = _rca_evidence_bundle(calls, "", windows)
     bundle["limitations"] = list(dict.fromkeys(bundle["limitations"] + limitations))
     bundle["localized_service"] = diagnosis.primary_service if diagnosis else None
-    return {
+    result = {
         "status": diagnosis.status if diagnosis else "error",
         "answer": answer,
         "diagnosis": diagnosis.model_dump() if diagnosis else None,
         "possible_fault_types": possible_fault_types,
+        "resource_signature": resource_signature_metadata(resource_signature_policy),
         "error": error,
         "skill": {"name": "rca", "sha256": skill_hash},
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "reference_source": reference_source,
         "calls": calls,
         "evidence": evidence,
+        "evidence_context_projection": evidence_projector.audit,
         "additional_checks": additional_checks,
         "additional_check_stop_reason": additional_check_stop_reason,
         "additional_check_error": additional_check_error,
         "evidence_bundle": bundle,
         "model_attempts": model_attempts,
+        "model_budget_rejections": model_budget_rejections,
         "tools_used": [call["tool"] for call in calls],
         "iterations": len(model_attempts),
         "stop_reason": "skill_completed" if diagnosis else "skill_error",
     }
+    if budget_enabled:
+        measured_calls = sum(
+            bool((attempt.get("usage") or {}).get("total_tokens"))
+            for attempt in model_attempts
+        )
+        result.update(
+            model_calls=model_calls_used,
+            total_tokens=model_tokens_used,
+            budget={
+                "max_model_calls": model_call_limit,
+                "max_total_tokens": token_limit,
+                "timeout_seconds": time_limit,
+                "max_additional_checks": max_additional_checks,
+                "model_calls_used": model_calls_used,
+                "total_tokens_used": model_tokens_used,
+                "additional_checks_used": len(additional_checks),
+                "measured_token_usage_calls": measured_calls,
+                "estimated_token_usage_calls": model_calls_used - measured_calls,
+                "elapsed_seconds": round(time.monotonic() - budget_started, 3),
+            },
+        )
+    return result

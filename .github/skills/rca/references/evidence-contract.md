@@ -100,7 +100,12 @@ Traces fault sem spans de erro continuam sendo candidatos uteis quando sua
 duracao excede o P95 baseline da mesma operacao. O aprofundamento deve
 priorizar traces de erro e, se nao existirem, traces com essa regressao de
 latencia. Sem amostras baseline comparaveis, nao classifique a duracao isolada
-como regressao; registre a limitacao.
+como regressao; registre a limitacao. Uma busca dirigida de spans CLIENT
+associa a aresta positiva ao chamador, destino e janela fault, mas so permite
+aprofundar IDs que tambem tenham assinatura de erro ou regressao comparavel
+validada pelo grafo. A busca e uma sonda de cobertura, nao corroboracao causal
+por si so. IDs sem esse suporte ficam registrados como limitacao, e o limite
+global de aprofundamentos continua sendo dois traces.
 
 `history_archive_traces` e uma leitura direta do bundle de spans do run,
 verificada pelo SHA-256 do manifesto, e pertence a familia `traces`. Confira a

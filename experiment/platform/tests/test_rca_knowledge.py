@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from experiment.platform.backend import evidence_projection as projection
 from experiment.platform.backend import rca_knowledge as knowledge
 from experiment.platform.tests.test_rca_skill import PHASES, FakeMCP, diagnosis
 
@@ -43,7 +44,11 @@ class Model:
         self.missing_query_check = missing_query_check
 
     def __call__(self, messages, tools, **kwargs):
-        payload = json.loads(messages[-1]["content"])
+        payload = next(
+            json.loads(message["content"])
+            for message in reversed(messages)
+            if knowledge._is_model_stage_message(message)
+        )
         self.payloads.append(copy.deepcopy(payload))
         stage = payload["stage"]
         context = payload.get("context", {})
@@ -63,7 +68,28 @@ class Model:
         if stage == "plan":
             value = {
                 "candidates": ["front-end"],
-                "hypotheses": ["Rede", "CPU"],
+                "hypotheses": [
+                    {
+                        "hypothesis_id": "H1",
+                        "service": "front-end",
+                        "category": "network-latency",
+                        "mechanism": "A chamada do cliente excede a latência basal da aresta",
+                        "supporting_evidence": [],
+                        "contradicting_evidence": [],
+                        "unresolved_questions": [
+                            "A operação tem amostras comparáveis?"
+                        ],
+                    },
+                    {
+                        "hypothesis_id": "H2",
+                        "service": "front-end",
+                        "category": "http-error",
+                        "mechanism": "A dependência retorna erro HTTP na janela fault",
+                        "supporting_evidence": [],
+                        "contradicting_evidence": [],
+                        "unresolved_questions": ["Há log ou span do mesmo erro?"],
+                    },
+                ],
                 "reasoning": "Comparar sinais",
             }
         elif stage == "build_a":
@@ -156,9 +182,7 @@ def test_initial_diagnosis_receives_best_guess_option(tmp_path, monkeypatch, req
         return answer_skill_rca(*args, **kwargs)
 
     monkeypatch.setattr(knowledge, "answer_skill_rca", tracking_answer_skill_rca)
-    result = investigate(
-        tmp_path, model=Model(query=True), require_best_guess=required
-    )
+    result = investigate(tmp_path, model=Model(query=True), require_best_guess=required)
 
     assert result["status"] == "confirmed", result
     assert received == [required]
@@ -171,7 +195,9 @@ def test_model_builds_a_blind_and_b_guided_with_actual_queries(tmp_path):
     pair = result["pair"]
     assert pair["guide_status"] == "validated"
     assert pair["causal_status"] == "supported"
-    build_a = next(payload for payload in model.payloads if payload["stage"] == "build_a")
+    build_a = next(
+        payload for payload in model.payloads if payload["stage"] == "build_a"
+    )
     evidence_ids_by_family = build_a["context"]["evidence_ids_by_family"]
     for family in ("metrics", "logs", "traces"):
         expected = sorted(
@@ -268,7 +294,12 @@ def test_model_evidence_context_is_bounded_and_keeps_all_evidence_ids():
     )
 
 
-def test_model_session_drops_prior_stage_payloads_before_budgeting():
+def test_model_session_drops_prior_stage_payloads_before_budgeting(monkeypatch):
+    monkeypatch.setattr(
+        projection,
+        "MODEL_EVIDENCE_SUMMARY_THRESHOLD_CHARS",
+        projection.MODEL_EVIDENCE_CONTEXT_CHARS,
+    )
     evidence = [
         {
             "id": f"E{index:03d}",
@@ -349,6 +380,115 @@ def test_model_session_drops_prior_stage_payloads_before_budgeting():
     ]
     assert captured[-1]["content"] == "Resposta invalida: corrija o JSON"
     assert messages == original_messages
+
+
+def test_model_message_compaction_uses_projector_for_both_evidence_surfaces():
+    source = [{"id": "E001", "digest": {"critical_path": ["raw"]}}]
+    projected = [{"id": "E001", "digest_summary": {"summary": "bounded"}}]
+    calls = []
+
+    def project(evidence):
+        calls.append(evidence)
+        return projected
+
+    messages = [
+        {"role": "system", "content": "Skill instructions"},
+        {
+            "role": "user",
+            "content": knowledge.canonical(
+                {
+                    "stage": "diagnosis",
+                    "context": {"evidence": source},
+                    "evidence": source,
+                }
+            ),
+        },
+    ]
+
+    compacted = knowledge.compact_model_messages(messages, evidence_projector=project)
+    payload = json.loads(compacted[-1]["content"])
+
+    assert len(calls) == 2
+    assert payload["evidence"] == projected
+    assert payload["context"]["evidence"] == projected
+
+
+def test_model_session_splits_oversized_evidence_before_generation():
+    evidence = [
+        {
+            "id": f"E{index:03d}",
+            "tool": "prometheus_range_query",
+            "family": "metrics",
+            "source": "history",
+            "status": "ok",
+            "observation_count": 1,
+            "fault_observation_count": 1,
+            "arguments": {},
+            "digest": {
+                "top_delta": [{"service": "shipping", "observation": "x" * 45_000}]
+            },
+        }
+        for index in range(1, 4)
+    ]
+    captured = []
+
+    def call_model(messages, tools, **kwargs):
+        payload = json.loads(messages[-1]["content"])
+        captured.append(payload)
+        if payload["stage"].startswith("evidence_projection_chunk_"):
+            return {
+                "content": json.dumps(
+                    {
+                        "items": [
+                            {
+                                "evidence_id": item["id"],
+                                "summary": "Large critical observation retained.",
+                            }
+                            for item in payload["evidence"]
+                        ]
+                    }
+                )
+            }
+        return {"content": "{}", "usage": {"total_tokens": 1}}
+
+    session = knowledge.ModelSession(
+        call_model,
+        knowledge.KnowledgeOptions(
+            corpus_id="corpus",
+            mode="annotate",
+            possible_fault_types=["cpu-hog"],
+        ),
+    )
+    messages = [
+        {"role": "system", "content": "Skill instructions"},
+        {
+            "role": "user",
+            "content": knowledge.canonical(
+                {
+                    "stage": "diagnosis",
+                    "evidence": evidence,
+                    "context": {"evidence": evidence},
+                }
+            ),
+        },
+    ]
+
+    session.invoke(messages, [])
+
+    assert [attempt["stage"] for attempt in session.attempts] == [
+        "evidence_projection_chunk_1",
+        "evidence_projection_chunk_2",
+        "diagnosis",
+    ]
+    final_payload = captured[-1]
+    assert [item["id"] for item in final_payload["evidence"]] == [
+        item["id"] for item in evidence
+    ]
+    assert final_payload["context"]["evidence"] == final_payload["evidence"]
+    assert len(knowledge.canonical(final_payload["evidence"])) <= (
+        knowledge.MODEL_EVIDENCE_CONTEXT_CHARS
+    )
+    assert session.evidence_projector.audit[0]["split"] is True
 
 
 def test_model_generation_repairs_invalid_json_and_evidence_references():
@@ -561,8 +701,7 @@ def test_query_without_check_is_rejected_and_corrected(tmp_path):
         }
     ]
     check_requests = [
-        payload for payload in model.payloads
-        if payload["stage"] == "annotation_check"
+        payload for payload in model.payloads if payload["stage"] == "annotation_check"
     ]
     assert len(check_requests) == 2
     assert check_requests[-1]["context"]["proposal_corrections_remaining"] == 0
@@ -780,9 +919,7 @@ def test_blind_live_review_keeps_predictions_separate_from_labels(
         },
     )()
     monkeypatch.setattr(knowledge, "get_embedding_provider", lambda: provider)
-    monkeypatch.setattr(
-        knowledge, "load_skill", lambda: ("", {}, pair["skill_hash"])
-    )
+    monkeypatch.setattr(knowledge, "load_skill", lambda: ("", {}, pair["skill_hash"]))
     payload = {
         "version": knowledge.VERSION,
         "a_text_version": pair["a"]["text_version"],
@@ -812,6 +949,67 @@ def test_blind_live_review_keeps_predictions_separate_from_labels(
     assert "diagnosis" not in projected
 
 
+def test_supplemental_base_accepts_parent_skill_hash_only_via_verified_parent():
+    parent_skill = "a" * 64
+    active_skill = "b" * 64
+    old_pair = {
+        "pair_id": "parent-pair",
+        "source_run_id": "parent-run",
+        "skill_hash": parent_skill,
+    }
+    parent_payload = {
+        "version": knowledge.VERSION,
+        "mode": "exploratory",
+        "model": knowledge.QWEN35_MODEL_ID,
+        "b_rebuild_version": knowledge.TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
+        "embedding_provider": "test-provider",
+        "embedding_dim": 2,
+        "skill_sha256": parent_skill,
+        "training_run_ids": ["parent-run"],
+        "pairs": [old_pair],
+        "index": {"parent-pair": [1.0, 0.0]},
+    }
+    parent_hash = knowledge.digest(parent_payload)
+    supplemental_pair = {
+        "pair_id": "supplemental-pair",
+        "source_run_id": "supplemental-run",
+        "skill_hash": active_skill,
+    }
+    base = {
+        **parent_payload,
+        "skill_sha256": active_skill,
+        "training_run_ids": ["parent-run", "supplemental-run"],
+        "pairs": [old_pair, supplemental_pair],
+        "index": {
+            "parent-pair": [1.0, 0.0],
+            "supplemental-pair": [0.0, 1.0],
+        },
+        "parent_base_sha256": parent_hash,
+        "supplemental_training_import": {
+            "protocol_version": "supplemental-training-import-v2",
+            "parent_base_sha256": parent_hash,
+            "parent_pair_count": 1,
+            "parent_training_run_ids": ["parent-run"],
+            "parent_skill_sha256": parent_skill,
+            "source_hashes": {"parent_base_content_sha256": parent_hash},
+        },
+        "blind_live_review_bypass": {
+            "policy": "user_authorized_procedural_status",
+            "authorized_at": "2026-11-10T06:00:00-03:00",
+            "unreviewed_source_run_ids": ["supplemental-run"],
+        },
+    }
+
+    assert knowledge._pair_skill_hash_compatible(base, old_pair)
+    assert knowledge._pair_skill_hash_compatible(base, supplemental_pair)
+
+    tampered = copy.deepcopy(base)
+    tampered["pairs"][0]["source_run_id"] = "changed-run"
+    assert not knowledge._pair_skill_hash_compatible(
+        tampered, tampered["pairs"][0]
+    )
+
+
 def test_unvalidated_experimental_inclusion_requires_exploratory_rag():
     with pytest.raises(ValueError, match="requires exploratory_rag mode"):
         knowledge.KnowledgeOptions(
@@ -836,9 +1034,7 @@ def test_legacy_exploratory_model_requires_pinned_opensearch_opt_in(
     )
     provider = type("Provider", (), {"name": "test-provider", "dim": 2})()
     monkeypatch.setattr(knowledge, "get_embedding_provider", lambda: provider)
-    monkeypatch.setattr(
-        knowledge, "load_skill", lambda: ("", {}, pair["skill_hash"])
-    )
+    monkeypatch.setattr(knowledge, "load_skill", lambda: ("", {}, pair["skill_hash"]))
     source_model = "qwen-14b"
     current_model = "qwen3.5-9b-grafana"
     payload = {
@@ -886,9 +1082,7 @@ def test_legacy_exploratory_model_requires_pinned_opensearch_opt_in(
     }
     with pytest.raises(ValueError, match="legacy model compatibility"):
         knowledge.KnowledgeOptions(**options)
-    allowed = knowledge.KnowledgeOptions(
-        **options, allow_legacy_model_mismatch=True
-    )
+    allowed = knowledge.KnowledgeOptions(**options, allow_legacy_model_mismatch=True)
     assert allowed.allow_legacy_model_mismatch is True
     with pytest.raises(ValueError, match="pinned current model"):
         knowledge.KnowledgeOptions(
@@ -1300,15 +1494,21 @@ def test_a_v2_extracts_metric_links_from_evidence_not_model_descriptions():
     assert "orders" not in a.metric_changes[0].description
 
 
-@pytest.mark.parametrize("replacement", [
-    "Servico=carts; request_rate=99.94/95.53",
-    "Servico=front-end; latency_p95 aumentou de 0.69 para 0.62",
-    "Servico=orders; error_rate aumentou de 0.04 para 0.02",
-])
-def test_factual_metric_narrative_rejects_entity_direction_and_value_changes(replacement):
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "Servico=carts; request_rate=99.94/95.53",
+        "Servico=front-end; latency_p95 aumentou de 0.69 para 0.62",
+        "Servico=orders; error_rate aumentou de 0.04 para 0.02",
+    ],
+)
+def test_factual_metric_narrative_rejects_entity_direction_and_value_changes(
+    replacement,
+):
     evidence = metric_evidence()
     a = knowledge.enrich_incident_a(
-        knowledge.IncidentA.model_validate(document()), evidence,
+        knowledge.IncidentA.model_validate(document()),
+        evidence,
         {"catalogue", "front-end"},
     )
     saved = knowledge.IncidentA.model_validate(a.model_dump())
@@ -1321,12 +1521,17 @@ def test_factual_metric_narrative_rejects_entity_direction_and_value_changes(rep
 def test_factual_a_supports_online_historical_golden_mean_rows():
     evidence = metric_evidence()
     metric = evidence[0]["digest"]["metrics"]["cpu_saturation_pct"]
-    metric["top"] = [{
-        "service": "catalogue", "baseline_mean": 15.07, "fault_mean": 54.73,
-    }]
+    metric["top"] = [
+        {
+            "service": "catalogue",
+            "baseline_mean": 15.07,
+            "fault_mean": 54.73,
+        }
+    ]
     del metric["top_delta"]
     a = knowledge.enrich_incident_a(
-        knowledge.IncidentA.model_validate(document()), evidence,
+        knowledge.IncidentA.model_validate(document()),
+        evidence,
         {"catalogue", "front-end"},
     )
     assert len(a.metric_facts) == 1
@@ -1604,6 +1809,8 @@ def test_single_phase_metrics_do_not_count_baseline_as_fault():
     )
     assert evidence[0]["observation_count"] > 0
     assert evidence[0]["fault_observation_count"] == 0
+    assert evidence[0]["kind"] == "cpu"
+    assert evidence[0]["source_provenance"] == "prometheus_cadvisor"
 
 
 def test_historical_query_evidence_is_labeled_as_history():
@@ -1698,15 +1905,27 @@ def test_inventory_reports_concrete_duplicates_before_model_query():
     name, arguments, _, _ = knowledge.prepare_check(
         check, "sock-shop", PHASES, {"front-end"}, [], tools
     )
-    calls = [{"tool": name, "arguments": arguments}]
+    calls = [{"tool": name, "arguments": arguments, "evidence_id": "N010"}]
     inventory = knowledge.check_inventory(
         tools, "sock-shop", PHASES, {"front-end"}, calls
     )
     assert {"kind": "cpu", "service": "front-end", "phase": "fault"} not in (
         inventory["executable_checks"]
     )
-    with pytest.raises(knowledge.CheckUnavailable, match="already executed"):
+    assert inventory["check_capabilities"]["sdk_http"] == {
+        "available": False,
+        "status": "not_queried",
+        "reason": (
+            "No SDK-specific query contract is registered. The executable "
+            "http check queries Istio request rates only; SDK histograms "
+            "must not be treated as absent or mixed into those rates."
+        ),
+    }
+    with pytest.raises(
+        knowledge.CheckUnavailable, match="already executed"
+    ) as duplicate:
         knowledge.prepare_check(check, "sock-shop", PHASES, {"front-end"}, calls, tools)
+    assert duplicate.value.evidence_id == "N010"
 
 
 @pytest.mark.parametrize(
@@ -1844,6 +2063,83 @@ def test_model_session_forwards_configured_temperature_and_seed():
     assert received["temperature"] == 0.1
     assert received["seed"] == 20261107
     assert received["model"] == "qwen3.5-9b-grafana"
+
+
+def test_model_session_records_token_estimates_and_budget_rejections():
+    calls = []
+
+    def capture(messages, tools, **kwargs):
+        calls.append(messages)
+        return {"content": "ok", "usage": {}}
+
+    session = knowledge.ModelSession(
+        capture,
+        knowledge.KnowledgeOptions(
+            corpus_id="corpus",
+            mode="annotate",
+            max_total_tokens=8_000,
+        ),
+    )
+    session.invoke(
+        [{"role": "user", "content": json.dumps({"stage": "plan"})}],
+        [],
+        max_new_tokens=8,
+    )
+    attempt = session.attempts[0]
+    assert attempt["stage"] == "plan"
+    assert attempt["token_usage"] == "estimated"
+    assert attempt["estimated_input_tokens"] > 0
+    assert attempt["reserved_output_tokens"] == 8
+    assert attempt["total_tokens"] == attempt["cumulative_tokens"]
+
+    with pytest.raises(ValueError, match="knowledge token budget exhausted"):
+        session.invoke(
+            [
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"stage": "diagnosis", "context": {"payload": "x" * 40_000}}
+                    ),
+                }
+            ],
+            [],
+        )
+
+    assert len(calls) == 1
+    rejection = session.budget_rejections[0]
+    assert rejection["stage"] == "diagnosis"
+    assert rejection["reason"] == "token_budget"
+    assert rejection["tokens_before"] == attempt["total_tokens"]
+    assert rejection["reserved_output_tokens"] == 4096
+    assert rejection["token_limit"] == 8_000
+    assert rejection["estimated_total_tokens"] > 8_000
+
+
+def test_model_session_includes_shared_resource_signature_in_generated_stages():
+    class Output(knowledge.StrictModel):
+        answer: str
+
+    captured = []
+
+    def capture(messages, tools, **kwargs):
+        captured.extend(messages)
+        return {"content": '{"answer":"inconclusive"}', "usage": {"total_tokens": 1}}
+
+    options = knowledge.KnowledgeOptions(
+        corpus_id="qwen35-corpus",
+        mode="exploratory_rag",
+        possible_fault_types=["cpu-hog", "memory-hog"],
+        resource_signature_policy="cpu-memory-v1",
+    )
+    result = knowledge.ModelSession(capture, options).generate(
+        "diagnosis", Output, {"evidence": []}
+    )
+
+    system_message = next(item for item in captured if item["role"] == "system")
+    assert result == {"answer": "inconclusive"}
+    assert "`memory-hog`" in system_message["content"]
+    assert "`cpu-hog`" in system_message["content"]
+    assert "uma unica familia de evidencia" in system_message["content"]
 
 
 def test_qwen35_procedural_retriever_has_separate_effect_eligibility():
@@ -2044,9 +2340,12 @@ def test_procedural_qwen35_projection_separates_guide_and_effect_status():
     assert knowledge.compact_exploratory_history(pair) is history
 
     with pytest.raises(ValueError, match="procedural guidance status"):
-        knowledge.compact_exploratory_history({
-            **pair, "b_procedural_status": "pending",
-        })
+        knowledge.compact_exploratory_history(
+            {
+                **pair,
+                "b_procedural_status": "pending",
+            }
+        )
 
 
 def test_procedural_metric_confirmation_allows_lifecycle_for_container_kill():

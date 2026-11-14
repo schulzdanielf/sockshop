@@ -654,6 +654,10 @@ def procedural_qwen35_base():
         pair["guide_status"] = (
             "procedurally_validated" if passed else "procedural_pending"
         )
+        pair["review_status"] = (
+            knowledge.BLIND_LIVE_REVIEW_BYPASSED_STATUS
+            if passed else knowledge.BLIND_LIVE_REVIEW_STATUS
+        )
         pair["causal_status"] = "not_assessed"
         pair["b_procedural_status"] = "passed" if passed else "pending"
         pair["b_rebuild_version"] = knowledge.TRAINING_B_PROCEDURAL_SCHEMA_VERSION
@@ -826,6 +830,7 @@ def test_v4_indexes_procedural_guides_independently_of_effect_validation(monkeyp
                 knowledge.TRAINING_B_PROCEDURAL_SCHEMA_VERSION
             )
             assert "b_procedural_status" in payload["mappings"]["properties"]
+            assert "review_status" in payload["mappings"]["properties"]
             return {"acknowledged": True}
         if method == "POST" and path == f"/{index.index_name}/_bulk":
             lines = payload.decode("utf-8").splitlines()
@@ -847,6 +852,9 @@ def test_v4_indexes_procedural_guides_independently_of_effect_validation(monkeyp
     index.index_base(base, a_text_version="incident-a-v2")
     assert documents["pair-valid"]["effect_validated"] is False
     assert documents["pair-valid"]["b_procedural_status"] == "passed"
+    assert documents["pair-valid"]["review_status"] == (
+        knowledge.BLIND_LIVE_REVIEW_BYPASSED_STATUS
+    )
     assert documents["pair-not-valid"]["b_procedural_status"] == "pending"
 
 

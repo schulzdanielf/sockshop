@@ -59,6 +59,18 @@ def _window_times(run: Dict[str, Any]) -> Tuple[datetime, datetime]:
     return start, end
 
 
+def _history_campaign_for_run(run: Dict[str, Any]) -> Optional[str]:
+    window = run.get("observation_window")
+    experiment_id = window.get("experiment_id") if isinstance(window, dict) else None
+    if not isinstance(experiment_id, str):
+        return None
+    match = re.match(
+        r"^((?:controlled|exploratory-rag)-\d{8}T\d{12}Z)-",
+        experiment_id,
+    )
+    return match.group(1) if match else None
+
+
 def _epoch_seconds(value: datetime) -> float:
     return value.timestamp()
 
@@ -153,6 +165,7 @@ def migrate_metrics(
     *,
     dry_run: bool = False,
     metric_family: str = "all",
+    expected_history_campaign: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     source = _prom_range(client, source_url, start, end, namespace, metric_family=metric_family)
     source_samples, unsupported = _prom_samples(source)
@@ -180,6 +193,28 @@ def migrate_metrics(
         return index
 
     target_index = target_sample_index(target_samples)
+    target_campaigns = {
+        item["labels"]["history_campaign"]
+        for item in target_samples
+        if item["labels"].get("history_campaign")
+    }
+    source_campaigns = {
+        item["labels"]["history_campaign"]
+        for item in source_samples
+        if item["labels"].get("history_campaign")
+    }
+    if len(target_campaigns) > 1:
+        raise ValueError("Refusing metric migration: multiple target history campaigns in run window")
+    if source_campaigns and target_campaigns and source_campaigns != target_campaigns:
+        raise ValueError("Refusing metric migration: source and target history campaigns differ")
+    if expected_history_campaign and target_campaigns != {expected_history_campaign}:
+        raise ValueError(
+            "Refusing metric migration: target history campaign does not match run metadata"
+        )
+    write_history_campaign = (
+        next(iter(target_campaigns))
+        if target_campaigns and ignore_target_campaign else None
+    )
     conflicts = [
         item for item in source_samples
         if sample_key(item) in target_index
@@ -196,7 +231,21 @@ def migrate_metrics(
             or target.get("warnings") or target.get("infos")
         ):
             raise ValueError("Refusing metric migration from an incomplete raw response")
-        written = _remote_write(client, target_url, missing)
+        write_samples = [
+            {
+                **item,
+                "labels": {
+                    **item["labels"],
+                    **(
+                        {"history_campaign": write_history_campaign}
+                        if write_history_campaign and "history_campaign" not in item["labels"]
+                        else {}
+                    ),
+                },
+            }
+            for item in missing
+        ]
+        written = _remote_write(client, target_url, write_samples)
         target = _prom_range(client, target_url, start, end, namespace, metric_family=metric_family)
         target_samples, target_unsupported = _prom_samples(target)
         target_index = target_sample_index(target_samples)
@@ -216,6 +265,7 @@ def migrate_metrics(
         "dry_run": dry_run,
         "metric_family": metric_family,
         "coverage_ignored_target_labels": ["history_campaign"] if ignore_target_campaign else [],
+        "write_history_campaign": write_history_campaign,
         "source_samples": len(source_samples),
         "target_samples": len(target_samples),
         "matched_source_samples": len(covered),
@@ -1421,6 +1471,7 @@ def run_migration(
                         os.environ["TARGET_PROMETHEUS_URL"], start, end,
                         str(run.get("namespace") or "sock-shop"), dry_run=dry_run,
                         metric_family=metric_family,
+                        expected_history_campaign=_history_campaign_for_run(run),
                     )
                 except (httpx.HTTPError, ValueError, KeyError) as exc:
                     if not dry_run:

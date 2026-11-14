@@ -72,6 +72,20 @@ def test_raw_prometheus_migration_preserves_scrape_timestamps():
     assert {sample["timestamp_ms"] for sample in samples} == {100125, 115125}
 
 
+def test_history_campaign_is_derived_from_original_run_metadata():
+    assert history._history_campaign_for_run({
+        "observation_window": {
+            "experiment_id": "controlled-20261103T234452388707Z-orders-memory-hog-r0",
+        },
+    }) == "controlled-20261103T234452388707Z"
+    assert history._history_campaign_for_run({
+        "observation_window": {
+            "experiment_id": "exploratory-rag-20261101T214710257439Z-carts-network-latency-r1",
+        },
+    }) == "exploratory-rag-20261101T214710257439Z"
+    assert history._history_campaign_for_run({"observation_window": {}}) is None
+
+
 def test_metrics_dry_run_preserves_data_and_reports_only_missing_samples():
     matrix = lambda values: {
         "status": "success", "data": {"resultType": "matrix", "result": [{
@@ -188,6 +202,89 @@ def test_history_campaign_provenance_does_not_duplicate_existing_scrapes():
     assert result["source_sha256"] == result["matched_source_sha256"]
     assert result["coverage_ignored_target_labels"] == ["history_campaign"]
     assert archived["metric"]["history_campaign"] == "campaign-1"
+    write.assert_not_called()
+
+
+def test_missing_samples_keep_target_campaign_provenance_without_mutating_source():
+    from unittest.mock import Mock
+
+    source_series = {
+        "metric": {"__name__": "istio_requests_total", "namespace": "sock-shop"},
+        "values": [[100.125, "2"], [115.125, "3"]],
+    }
+    target_series = {
+        "metric": {
+            "__name__": "istio_requests_total", "namespace": "sock-shop",
+            "history_campaign": "campaign-1",
+        },
+        "values": [[100.125, "2"]],
+    }
+    completed_target = {
+        **target_series,
+        "values": [[100.125, "2"], [115.125, "3"]],
+    }
+    source = {"status": "success", "data": {"resultType": "matrix", "result": [source_series]}}
+    target = {"status": "success", "data": {"resultType": "matrix", "result": [target_series]}}
+    completed = {
+        "status": "success", "data": {"resultType": "matrix", "result": [completed_target]},
+    }
+    client = Mock()
+    captured = []
+
+    def write(_client, _url, samples):
+        captured.extend(samples)
+        return sum(len(items) for items in [samples])
+
+    with patch.object(history, "_prom_range", side_effect=[source, target, completed]), \
+         patch.object(history, "_remote_write", side_effect=write):
+        result, raw_source = history.migrate_metrics(
+            client, "http://live", "http://history",
+            datetime.fromtimestamp(100, timezone.utc),
+            datetime.fromtimestamp(120, timezone.utc), "sock-shop",
+        )
+
+    assert result["status"] == "complete"
+    assert result["written_samples"] == 1
+    assert result["matched_source_samples"] == 2
+    assert result["write_history_campaign"] == "campaign-1"
+    assert captured == [{
+        "labels": {**source_series["metric"], "history_campaign": "campaign-1"},
+        "timestamp_ms": 115125, "value": 3.0,
+    }]
+    assert "history_campaign" not in raw_source["data"]["result"][0]["metric"]
+    assert "history_campaign" not in source_series["metric"]
+
+
+def test_metrics_migration_refuses_ambiguous_target_campaigns():
+    source = {
+        "status": "success", "data": {"resultType": "matrix", "result": [{
+            "metric": {"__name__": "counter", "namespace": "sock-shop"},
+            "values": [[100.125, "2"]],
+        }]},
+    }
+    target = {
+        "status": "success", "data": {"resultType": "matrix", "result": [
+            {
+                "metric": {
+                    "__name__": "counter", "namespace": "sock-shop",
+                    "history_campaign": campaign,
+                }, "values": [[100.125, "2"]],
+            }
+            for campaign in ("campaign-1", "campaign-2")
+        ]},
+    }
+    with patch.object(history, "_prom_range", side_effect=[source, target]), \
+         patch.object(history, "_remote_write") as write:
+        try:
+            history.migrate_metrics(
+                None, "http://live", "http://history",
+                datetime.fromtimestamp(100, timezone.utc),
+                datetime.fromtimestamp(120, timezone.utc), "sock-shop",
+            )
+        except ValueError as exc:
+            assert "multiple target history campaigns" in str(exc)
+        else:
+            raise AssertionError("Ambiguous campaign labels must block writes")
     write.assert_not_called()
 
 

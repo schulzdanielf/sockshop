@@ -35,6 +35,7 @@ from experiment.eval.memory_hog.rag_campaign import (
 )
 from experiment.platform.backend.rca_knowledge import (
     DEFAULT_LLM_MODEL,
+    OPENSEARCH_RETRIEVER_V1,
     OPENSEARCH_RETRIEVER_V3,
     OPENSEARCH_RETRIEVER_V6,
     OPENSEARCH_RETRIEVER_VERSION,
@@ -365,6 +366,7 @@ def prepare_test_only_campaign(
     *,
     corpus_id: str,
     opensearch_base_sha256: str,
+    retriever_version: str | None = None,
     allow_legacy_skill_hash: bool = False,
     allow_legacy_model_mismatch: bool = False,
     include_unvalidated_experimental: bool = False,
@@ -407,7 +409,7 @@ def prepare_test_only_campaign(
     source_skill_sha256 = stored_base.get("skill_sha256")
     source_model = stored_base.get("model")
     current_model = QWEN35_MODEL_ID if rebuilt_qwen35 else DEFAULT_LLM_MODEL
-    retriever_version = (
+    default_retriever_version = (
         OPENSEARCH_RETRIEVER_V6
         if procedural_qwen35
         else (
@@ -416,6 +418,15 @@ def prepare_test_only_campaign(
             else OPENSEARCH_RETRIEVER_VERSION
         )
     )
+    if retriever_version is None:
+        retriever_version = default_retriever_version
+    elif rebuilt_qwen35 and retriever_version != default_retriever_version:
+        raise ValueError("Qwen 3.5 RAG corpus requires its pinned retriever version")
+    elif not rebuilt_qwen35 and retriever_version not in {
+        OPENSEARCH_RETRIEVER_V1,
+        OPENSEARCH_RETRIEVER_VERSION,
+    }:
+        raise ValueError("legacy exploratory corpus requires a legacy retriever version")
     _, _, current_skill_sha256 = load_skill()
     legacy_skill_mismatch = source_skill_sha256 != current_skill_sha256
     legacy_model_mismatch = source_model != current_model
@@ -608,6 +619,7 @@ def prepare_test_only_campaign(
             "corpus_id": corpus_id,
             "base_sha256": base["sha256"],
             "opensearch_base_sha256": opensearch_base_sha256,
+            "retriever_version": retriever_version,
             "opensearch_index": index_metadata,
             "skill_compatibility": {
                 "source_skill_sha256": source_skill_sha256,
@@ -716,6 +728,13 @@ def main() -> None:
     parser.add_argument("--reuse-corpus-id")
     parser.add_argument("--opensearch-base-sha256")
     parser.add_argument(
+        "--retriever-version",
+        help=(
+            "Pin the retriever to the schema of the existing frozen index; "
+            "legacy corpora support v1 or v2"
+        ),
+    )
+    parser.add_argument(
         "--allow-legacy-skill-corpus",
         action="store_true",
         help="Explicitly allow a pinned exploratory corpus built with a different Skill hash",
@@ -787,6 +806,7 @@ def main() -> None:
             args.source_campaign,
             corpus_id=args.reuse_corpus_id,
             opensearch_base_sha256=args.opensearch_base_sha256,
+            retriever_version=args.retriever_version,
             allow_legacy_skill_hash=args.allow_legacy_skill_corpus,
             allow_legacy_model_mismatch=args.allow_legacy_model_mismatch,
             include_unvalidated_experimental=(

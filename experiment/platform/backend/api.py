@@ -8,16 +8,16 @@ HTTP requests into domain operations and serialises domain state back out.
 
 from __future__ import annotations
 
-import os
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
-from uuid import uuid4
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
@@ -25,8 +25,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from opentelemetry.trace import Status, StatusCode
 from pydantic import ValidationError
+from starlette.responses import Response
+from starlette.types import Scope
 
 from .adapters.noop_notifier import NoopNotificationAdapter
+from .agent_console import (
+    _mcp_exception_detail,
+    answer_query,
+    answer_query_mcp,
+    answer_run_rca_mcp,
+    rca_reference_phases,
+)
 from .analysis import (
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_TIMEOUT,
@@ -48,22 +57,24 @@ from .analysis import (
     validate_fault_category,
     vector_to_blob,
 )
+from .analysis.llm_client import call_llm_tool_messages
+from .analysis.mcp_investigator import investigate_metric_window
+from .analysis.system_card import SystemCardError, load_system_card
+from .controlled_experiment import controlled_backend_capabilities
+from .domain import DomainEvent
 from .engine import (
     OrchestratorEngine,
     _build_observation_window,
     _build_partial_observation_window,
 )
-from .controlled_experiment import CONTROLLED_CAMPAIGN_PROTOCOL_VERSION
-from .domain import DomainEvent
-from .analysis.mcp_investigator import investigate_metric_window
-from .agent_console import (
-    _mcp_exception_detail,
-    answer_query,
-    answer_query_mcp,
-    answer_run_rca_mcp,
-    rca_reference_phases,
+from .history_archive import (
+    HistoryArchiveError,
+    HistoryArchiveNotFound,
+    HistoryArchiveReader,
 )
-from .plugins.mcp_client import CompositeMCPToolClient, MCPToolClient
+from .history_config import DEFAULT_HISTORICAL_MCP_SSE_URL
+from .history_job import HistoryMigrationDispatcher
+from .history_stream import validate_history_stream
 from .models import (
     ApproveRunRequest,
     CreateExperimentRequest,
@@ -72,6 +83,15 @@ from .models import (
     StartRunRequest,
     StopRunRequest,
     TelemetryChatRequest,
+)
+from .multiagent_rca import PROMPT_VERSION as MULTIAGENT_PROMPT_VERSION
+from .multiagent_rca import STRATEGY_VERSION as MULTIAGENT_STRATEGY_VERSION
+from .multiagent_rca import (
+    InvestigationBudget,
+    InvestigationContext,
+    InvestigationPlan,
+    answer_multiagent_rca,
+    build_investigation_plan,
 )
 from .observability import (
     GenAI,
@@ -85,52 +105,28 @@ from .observability import (
 )
 from .plugins.litmus_plugin import LitmusChaosPlugin
 from .plugins.locust_plugin import LocustLoadPlugin
-from .plugins.mcp_evidence_snapshot_plugin import (
-    MCPRcaEvidenceSnapshotPlugin,
-)
+from .plugins.mcp_client import CompositeMCPToolClient, MCPToolClient
+from .plugins.mcp_evidence_snapshot_plugin import MCPRcaEvidenceSnapshotPlugin
 from .plugins.mcp_metrics_plugin import MCPPrometheusMetricsPlugin
 from .plugins.mcp_traces_plugin import MCPTempoTracesPlugin
-from .history_job import HistoryMigrationDispatcher
-from .history_config import DEFAULT_HISTORICAL_MCP_SSE_URL
-from .history_archive import (
-    HistoryArchiveError,
-    HistoryArchiveNotFound,
-    HistoryArchiveReader,
-)
-from .history_stream import validate_history_stream
-from .security import require_roles
-from .rca_skill import (
-    SkillRCAError,
-    answer_skill_rca,
-)
-from .rca_options import RCABenchmarkOptions
 from .rca_knowledge import (
     OPENSEARCH_RETRIEVER_V4,
     OPENSEARCH_RETRIEVER_V5,
     OPENSEARCH_RETRIEVER_V6,
     QWEN35_MODEL_ID,
-    TRAINING_B_SCHEMA_VERSION,
     TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
-    VERSION as KNOWLEDGE_VERSION,
-    FreezeRequest,
-    KnowledgeOptions,
-    KnowledgeStore,
-    digest as knowledge_digest,
-    historical_evidence_sources_valid,
-    investigate as investigate_knowledge,
-    load_skill,
+    TRAINING_B_SCHEMA_VERSION,
 )
-from .analysis.llm_client import call_llm_tool_messages
-from .multiagent_rca import (
-    InvestigationBudget,
-    InvestigationContext,
-    InvestigationPlan,
-    PROMPT_VERSION as MULTIAGENT_PROMPT_VERSION,
-    STRATEGY_VERSION as MULTIAGENT_STRATEGY_VERSION,
-    answer_multiagent_rca,
-    build_investigation_plan,
-)
-from .analysis.system_card import SystemCardError, load_system_card
+from .rca_knowledge import VERSION as KNOWLEDGE_VERSION
+from .rca_knowledge import FreezeRequest, KnowledgeOptions, KnowledgeStore
+from .rca_knowledge import digest as knowledge_digest
+from .rca_knowledge import historical_evidence_sources_valid
+from .rca_knowledge import investigate as investigate_knowledge
+from .rca_knowledge import load_skill
+from .rca_options import RCABenchmarkOptions, SkillRCABenchmarkOptions
+from .rca_skill import SkillRCAError, answer_skill_rca
+from .resource_signature import options_fingerprint, resource_signature_metadata
+from .security import require_roles
 from .storage.sqlite_storage import SqliteStorage
 
 logger = logging.getLogger(__name__)
@@ -143,6 +139,13 @@ KNOWLEDGE_EVALUATION_ROOT = (
 )
 
 
+class FrontendStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def _select_telemetry_windows(
     observation_window: dict, scope: str
 ) -> tuple[dict, Optional[dict]]:
@@ -153,7 +156,11 @@ def _select_telemetry_windows(
 
     phases = observation_window.get("phases") or {}
     fault_window = phases.get("fault")
-    if not isinstance(fault_window, dict) or not fault_window.get("start") or not fault_window.get("end"):
+    if (
+        not isinstance(fault_window, dict)
+        or not fault_window.get("start")
+        or not fault_window.get("end")
+    ):
         raise ValueError("telemetry chat requires a fault phase window")
     baseline_window = phases.get("baseline")
     return fault_window, baseline_window if isinstance(baseline_window, dict) else None
@@ -205,6 +212,146 @@ def _mcp_client_timeout_seconds(
     return max(timeouts)
 
 
+def _validate_supplemental_test_cohort(
+    *,
+    evaluation_id: str,
+    corpus_id: str,
+    base_sha256: str,
+    run_id: str,
+    training_run_ids: set[str],
+) -> None:
+    root = KNOWLEDGE_EVALUATION_ROOT.resolve()
+    directory = (root / evaluation_id).resolve()
+    if directory.parent != root:
+        raise ValueError("external test evaluation directory is invalid")
+
+    evaluation_path = directory / "evaluation_manifest.json"
+    cohort_path = directory / "test_cohort.json"
+    precollection_path = directory / "precollection_manifest.json"
+    if not all(path.is_file() for path in (evaluation_path, cohort_path, precollection_path)):
+        raise ValueError("supplemental test evaluation manifests are incomplete")
+
+    evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    cohort_bytes = cohort_path.read_bytes()
+    cohort = json.loads(cohort_bytes)
+    precollection = json.loads(precollection_path.read_text(encoding="utf-8"))
+    if not all(isinstance(item, dict) for item in (evaluation, cohort, precollection)):
+        raise ValueError("supplemental test evaluation manifests must be objects")
+    runs = cohort.get("runs")
+    if not isinstance(runs, list) or not runs:
+        raise ValueError("supplemental test cohort is empty or invalid")
+
+    evaluation_payload = {
+        key: value for key, value in evaluation.items() if key != "sha256"
+    }
+    precollection_payload = {
+        key: value for key, value in precollection.items() if key != "sha256"
+    }
+    if evaluation.get("sha256") != knowledge_digest(evaluation_payload):
+        raise ValueError("supplemental test evaluation manifest hash is invalid")
+    if precollection.get("sha256") != knowledge_digest(precollection_payload):
+        raise ValueError("supplemental MCP precollection manifest hash is invalid")
+    if (
+        evaluation.get("protocol") != "supplemental_test_cohort_v1_exploratory"
+        or evaluation.get("evaluation_id") != evaluation_id
+        or evaluation.get("external_test_evaluation_id") != evaluation_id
+        or evaluation.get("corpus_id") != corpus_id
+        or evaluation.get("corpus_sha256") != base_sha256
+        or evaluation.get("external_test_base_sha256") != base_sha256
+        or evaluation.get("test_case_count") != len(runs)
+        or evaluation.get("test_run_ids_overlap_training") is not False
+        or evaluation.get("source_cohort_sha256")
+        != cohort.get("source_cohort_sha256")
+    ):
+        raise ValueError("supplemental test evaluation does not match the request")
+
+    run_records: dict[str, dict] = {}
+    cell_ids: list[str] = []
+    for item in runs:
+        if not isinstance(item, dict):
+            raise ValueError("supplemental test cohort contains an invalid run")
+        cohort_run_id = item.get("run_id")
+        cell = item.get("cell")
+        cell_id = cell.get("cell_id") if isinstance(cell, dict) else None
+        if (
+            not isinstance(cohort_run_id, str)
+            or not cohort_run_id
+            or not isinstance(cell_id, str)
+            or not cell_id
+            or cell.get("phase") != "test"
+            or item.get("status") != "completed"
+            or cohort_run_id in run_records
+            or cell_id in cell_ids
+        ):
+            raise ValueError("supplemental test cohort contains an invalid run")
+        run_records[cohort_run_id] = item
+        cell_ids.append(cell_id)
+
+    test_run_ids = cohort.get("test_run_ids")
+    cohort_training_ids = cohort.get("training_run_ids")
+    supplemental_ids = cohort.get("supplemental_test_run_ids")
+    manifest_supplemental_ids = evaluation.get("new_supplemental_test_run_ids")
+    if (
+        test_run_ids != sorted(run_records)
+        or not isinstance(cohort_training_ids, list)
+        or any(not isinstance(item, str) or not item for item in cohort_training_ids)
+        or len(cohort_training_ids) != len(set(cohort_training_ids))
+        or set(cohort_training_ids) != training_run_ids
+        or set(test_run_ids) & set(cohort_training_ids)
+        or not isinstance(supplemental_ids, list)
+        or any(not isinstance(item, str) or not item for item in supplemental_ids)
+        or len(supplemental_ids) != len(set(supplemental_ids))
+        or not set(supplemental_ids).issubset(run_records)
+        or supplemental_ids != manifest_supplemental_ids
+        or run_id not in supplemental_ids
+        or run_id not in run_records
+    ):
+        raise ValueError("run is not a member of the supplemental test cohort")
+
+    query_count = len({"metrics", "logs", "traces"}) * len(
+        {"baseline", "fault", "post"}
+    )
+    coverage = precollection.get("coverage_by_source_phase")
+    case_file_hashes = precollection.get("case_file_sha256")
+    if (
+        precollection.get("status") != "complete"
+        or precollection.get("evaluation_id") != evaluation_id
+        or precollection.get("case_count") != len(runs)
+        or precollection.get("queries_per_case") != query_count
+        or precollection.get("query_count") != len(runs) * query_count
+        or precollection.get("errors") != []
+        or precollection.get("cohort_sha256")
+        != hashlib.sha256(cohort_bytes).hexdigest()
+        or not isinstance(case_file_hashes, dict)
+        or set(case_file_hashes) != set(cell_ids)
+        or any(
+            not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+            for value in case_file_hashes.values()
+        )
+        or not isinstance(coverage, dict)
+    ):
+        raise ValueError("supplemental test cohort lacks a complete MCP precollection")
+    for source in ("metrics", "logs", "traces"):
+        source_coverage = coverage.get(source)
+        if not isinstance(source_coverage, dict):
+            raise ValueError("supplemental MCP precollection coverage is incomplete")
+        for phase in ("baseline", "fault", "post"):
+            phase_coverage = source_coverage.get(phase)
+            if not isinstance(phase_coverage, dict):
+                raise ValueError("supplemental MCP precollection coverage is incomplete")
+            ok = phase_coverage.get("ok")
+            no_data = phase_coverage.get("no_data")
+            errors = phase_coverage.get("errors")
+            if (
+                type(ok) is not int
+                or type(no_data) is not int
+                or type(errors) is not int
+                or ok + no_data != len(runs)
+                or errors != 0
+            ):
+                raise ValueError("supplemental MCP precollection has query errors")
+
+
 def create_app() -> FastAPI:
     backend_dir = Path(__file__).resolve().parent
     platform_dir = backend_dir.parent
@@ -250,7 +397,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/controlled-campaign/capabilities")
     def get_controlled_campaign_capabilities() -> dict:
-        return {"protocol_version": CONTROLLED_CAMPAIGN_PROTOCOL_VERSION}
+        return controlled_backend_capabilities()
 
     @app.post("/api/experiments")
     def create_experiment(
@@ -284,7 +431,10 @@ def create_app() -> FastAPI:
         return {
             "version": KNOWLEDGE_VERSION,
             "modes": [
-                "annotate", "control", "rag", "exploratory_control",
+                "annotate",
+                "control",
+                "rag",
+                "exploratory_control",
                 "exploratory_rag",
             ],
             "procedural_opensearch_retrievers": [
@@ -501,7 +651,8 @@ def create_app() -> FastAPI:
 
     @app.post("/api/skill-rag/{corpus_id}/freeze")
     def freeze_skill_knowledge(
-        corpus_id: str, request: FreezeRequest,
+        corpus_id: str,
+        request: FreezeRequest,
         _: str = Depends(require_roles({"chaos_engineer", "admin"})),
     ) -> dict:
         try:
@@ -513,12 +664,16 @@ def create_app() -> FastAPI:
                         source.experiment_id, source.experiment_version
                     ).spec
                     if spec.get("knowledge_campaign") != {
-                        "corpus_id": corpus_id, "split": "train"
+                        "corpus_id": corpus_id,
+                        "split": "train",
                     }:
-                        raise ValueError("freeze accepts only this corpus's training runs")
+                        raise ValueError(
+                            "freeze accepts only this corpus's training runs"
+                        )
                 base = store.freeze(request.training_run_ids)
             return {
-                "version": base["version"], "sha256": base["sha256"],
+                "version": base["version"],
+                "sha256": base["sha256"],
                 "annotation_count": base["annotation_count"],
                 "eligible_count": len(base["pairs"]),
                 "excluded_count": base["excluded_count"],
@@ -552,7 +707,8 @@ def create_app() -> FastAPI:
             _, _, current_skill_sha256 = load_skill()
             current_model = (
                 QWEN35_MODEL_ID
-                if base.get("b_rebuild_version") in {
+                if base.get("b_rebuild_version")
+                in {
                     TRAINING_B_SCHEMA_VERSION,
                     TRAINING_B_PROCEDURAL_SCHEMA_VERSION,
                 }
@@ -562,9 +718,7 @@ def create_app() -> FastAPI:
                 not allow_legacy_skill_hash
                 and base["skill_sha256"] != current_skill_sha256
             ):
-                raise ValueError(
-                    "exploratory base source Skill hash mismatch"
-                )
+                raise ValueError("exploratory base source Skill hash mismatch")
             return {
                 "version": base["version"],
                 "mode": base["mode"],
@@ -573,9 +727,7 @@ def create_app() -> FastAPI:
                 "source_run_ids": base["training_run_ids"],
                 "source_skill_sha256": base["skill_sha256"],
                 "current_skill_sha256": current_skill_sha256,
-                "skill_hashes_match": (
-                    base["skill_sha256"] == current_skill_sha256
-                ),
+                "skill_hashes_match": (base["skill_sha256"] == current_skill_sha256),
                 "legacy_skill_hash_allowed": allow_legacy_skill_hash,
                 "source_model": base["model"],
                 "current_model": current_model,
@@ -587,13 +739,16 @@ def create_app() -> FastAPI:
 
     @app.post("/api/runs/{run_id}/skill-rag")
     def run_skill_knowledge(
-        run_id: str, options: KnowledgeOptions,
+        run_id: str,
+        options: KnowledgeOptions,
         _: str = Depends(require_roles({"chaos_engineer", "admin"})),
     ) -> dict:
         window = get_observation_window(run_id)
         try:
             run = storage.get_run(run_id)
-            spec = storage.get_experiment(run.experiment_id, run.experiment_version).spec
+            spec = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            ).spec
             expected_split = "train" if options.mode == "annotate" else "test"
             store = knowledge_store(options.corpus_id)
             pinned_campaign = spec.get("knowledge_campaign") or {}
@@ -603,11 +758,16 @@ def create_app() -> FastAPI:
                     options.mode not in {"exploratory_control", "exploratory_rag"}
                     or getattr(getattr(run, "status", None), "value", None)
                     != "completed"
-                    or pinned_campaign.get("split") != "test"
                 ):
                     raise ValueError(
-                        "external test evaluation requires a completed run pinned "
-                        "to the test split and an exploratory mode"
+                        "external test evaluation requires a completed run and an "
+                        "exploratory mode"
+                    )
+                pinned_split = pinned_campaign.get("split")
+                if pinned_split not in {"test", None}:
+                    raise ValueError(
+                        "external test evaluation cannot use a run pinned to a "
+                        "non-test split"
                     )
                 external_test_base = store.load_exploratory_base(
                     expected_skill_sha256=(
@@ -640,6 +800,16 @@ def create_app() -> FastAPI:
                     raise ValueError(
                         "external test run is present in the frozen corpus training set"
                     )
+                if pinned_split is None:
+                    _validate_supplemental_test_cohort(
+                        evaluation_id=options.external_test_evaluation_id,
+                        corpus_id=options.corpus_id,
+                        base_sha256=options.external_test_base_sha256,
+                        run_id=run_id,
+                        training_run_ids=set(
+                            external_test_base.get("training_run_ids") or []
+                        ),
+                    )
                 if (
                     options.mode == "exploratory_rag"
                     and options.opensearch_base_sha256
@@ -649,9 +819,12 @@ def create_app() -> FastAPI:
                         "external test evaluation and OpenSearch base SHA-256 differ"
                     )
             elif pinned_campaign != {
-                "corpus_id": options.corpus_id, "split": expected_split
+                "corpus_id": options.corpus_id,
+                "split": expected_split,
             }:
-                raise ValueError("knowledge mode does not match the run's pinned split/corpus")
+                raise ValueError(
+                    "knowledge mode does not match the run's pinned split/corpus"
+                )
             experimental_suffix = (
                 "_include_unvalidated_experimental"
                 if options.include_unvalidated_experimental
@@ -666,18 +839,19 @@ def create_app() -> FastAPI:
                 f"skill_knowledge_{options.corpus_id}_{options.mode}"
                 f"{experimental_suffix}{external_test_suffix}"
             )
-            fingerprint = knowledge_digest(options.model_dump())
+            fingerprint = knowledge_digest(options_fingerprint(options))
             with store.locked():
                 previous = storage.get_artifact(run_id, key)
                 if previous and previous.get("status") != "error":
                     if previous["options_sha256"] != fingerprint:
-                        raise ValueError("completed knowledge attempt used different options")
-                    history = spec.get("historical_observability") or {}
-                    history_cache_valid = (
-                        previous.get("observability_source") == "history"
-                        and historical_evidence_sources_valid(
-                            previous.get("evidence")
+                        raise ValueError(
+                            "completed knowledge attempt used different options"
                         )
+                    history = spec.get("historical_observability") or {}
+                    history_cache_valid = previous.get(
+                        "observability_source"
+                    ) == "history" and historical_evidence_sources_valid(
+                        previous.get("evidence")
                     )
                     if history_cache_valid:
                         return {**previous, "cached": True}
@@ -704,16 +878,19 @@ def create_app() -> FastAPI:
                     store.load_base()
                 controlled = spec.get("controlled_campaign") or {}
                 labels = (
-                    {"service": controlled["service"], "fault_type": controlled["fault"]}
-                    if options.mode == "annotate" else None
+                    {
+                        "service": controlled["service"],
+                        "fault_type": controlled["fault"],
+                    }
+                    if options.mode == "annotate"
+                    else None
                 )
                 observability = spec.get("observability") or {}
                 metrics = observability.get("metrics") or {}
                 traces = observability.get("traces") or {}
                 historical = spec.get("historical_observability") or {}
                 historical_url = (
-                    historical.get("mcp_sse_url")
-                    or DEFAULT_HISTORICAL_MCP_SSE_URL
+                    historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
                 )
                 gates = run.summary.get("controlled_gates") or {}
                 effect = (
@@ -728,16 +905,25 @@ def create_app() -> FastAPI:
                     phases=window["phases"],
                     namespace=str(spec.get("scope", {}).get("namespace", "sock-shop")),
                     window_metadata={
-                        name: window[name] for name in (
-                            "phase_sources", "partial", "sampling_interval_seconds"
-                        ) if name in window
+                        name: window[name]
+                        for name in (
+                            "phase_sources",
+                            "partial",
+                            "sampling_interval_seconds",
+                        )
+                        if name in window
                     },
-                    options=options, run_id=run_id, store=store,
-                    llm=call_llm_tool_messages, labels=labels, effect_validated=effect,
+                    options=options,
+                    run_id=run_id,
+                    store=store,
+                    llm=call_llm_tool_messages,
+                    labels=labels,
+                    effect_validated=effect,
                     evidence_source="history",
                 )
                 result.update(
-                    run_id=run_id, attempt_id=uuid4().hex,
+                    run_id=run_id,
+                    attempt_id=uuid4().hex,
                     options_sha256=fingerprint,
                     model=(
                         options.opensearch_current_model
@@ -746,6 +932,9 @@ def create_app() -> FastAPI:
                     ),
                     temperature=options.temperature,
                     seed=options.seed,
+                    resource_signature=resource_signature_metadata(
+                        options.resource_signature_policy
+                    ),
                     observability_source="history",
                 )
                 if options.external_test_evaluation_id is not None:
@@ -753,9 +942,7 @@ def create_app() -> FastAPI:
                         external_test_evaluation_id=(
                             options.external_test_evaluation_id
                         ),
-                        external_test_base_sha256=(
-                            options.external_test_base_sha256
-                        ),
+                        external_test_base_sha256=(options.external_test_base_sha256),
                     )
                 path = storage.save_artifact(
                     run_id, f"{key}_{result['attempt_id']}", result
@@ -906,15 +1093,16 @@ def create_app() -> FastAPI:
             controlled_phases = (
                 controlled.get("phases") if isinstance(controlled, dict) else None
             )
-            if (
-                isinstance(controlled_phases, dict)
-                and {"baseline", "fault"}.issubset(controlled_phases)
+            if isinstance(controlled_phases, dict) and {"baseline", "fault"}.issubset(
+                controlled_phases
             ):
                 timings = run.timings
                 window = controlled.get("window")
                 phase_sources = controlled.get("phase_sources")
                 post_marker = run.timings.get("post_observation_started")
-                post_start = post_marker.get("at") if isinstance(post_marker, dict) else None
+                post_start = (
+                    post_marker.get("at") if isinstance(post_marker, dict) else None
+                )
                 post_end = window.get("end") if isinstance(window, dict) else None
                 if (
                     "post" not in controlled_phases
@@ -982,8 +1170,7 @@ def create_app() -> FastAPI:
             (
                 query
                 for query in queries
-                if metric_id
-                and (query.get("id") or query.get("name")) == metric_id
+                if metric_id and (query.get("id") or query.get("name")) == metric_id
             ),
             queries[0] if queries else None,
         )
@@ -1053,13 +1240,9 @@ def create_app() -> FastAPI:
         metrics_config = (
             experiment.spec.get("observability", {}).get("metrics", {}) or {}
         )
-        traces_config = (
-            experiment.spec.get("observability", {}).get("traces", {}) or {}
-        )
+        traces_config = experiment.spec.get("observability", {}).get("traces", {}) or {}
         historical = experiment.spec.get("historical_observability") or {}
-        mcp_url = (
-            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
-        )
+        mcp_url = historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
         mcp_client = MCPToolClient(
             str(mcp_url),
             _mcp_client_timeout_seconds(metrics_config, traces_config, historical),
@@ -1118,6 +1301,7 @@ def create_app() -> FastAPI:
                         max_new_tokens=req.max_new_tokens,
                     )
                 else:
+
                     class _MCPPrometheusAdapter:
                         def query_range(
                             self, query: str, start: str, end: str, step: str
@@ -1210,20 +1394,14 @@ def create_app() -> FastAPI:
         metrics_config = (
             experiment.spec.get("observability", {}).get("metrics", {}) or {}
         )
-        traces_config = (
-            experiment.spec.get("observability", {}).get("traces", {}) or {}
-        )
+        traces_config = experiment.spec.get("observability", {}).get("traces", {}) or {}
         historical = experiment.spec.get("historical_observability") or {}
-        historical_url = (
-            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
-        )
+        historical_url = historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
         mcp_client = MCPToolClient(
             str(historical_url),
             _mcp_client_timeout_seconds(metrics_config, traces_config, historical),
         )
-        namespace = str(
-            experiment.spec.get("scope", {}).get("namespace", "sock-shop")
-        )
+        namespace = str(experiment.spec.get("scope", {}).get("namespace", "sock-shop"))
         tracer = get_tracer()
         with tracer.start_as_current_span("agent.run_rca") as span:
             span.set_attribute(GenAI.OPERATION_NAME, "invoke_agent")
@@ -1235,7 +1413,8 @@ def create_app() -> FastAPI:
             span.set_attribute("rca.experiment_id", run.experiment_id)
             span.set_attribute("rca.agent.max_tool_calls", 10)
             rca_phases, reference_source = rca_reference_phases(
-                phases, baseline_source=(window.get("phase_sources") or {}).get("baseline"),
+                phases,
+                baseline_source=(window.get("phase_sources") or {}).get("baseline"),
             )
             span.set_attribute("rca.reference_source", reference_source)
             try:
@@ -1297,7 +1476,9 @@ def create_app() -> FastAPI:
         window = get_observation_window(run_id)
         try:
             run = storage.get_run(run_id)
-            experiment = storage.get_experiment(run.experiment_id, run.experiment_version)
+            experiment = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         namespace = experiment.spec.get("scope", {}).get("namespace", "sock-shop")
@@ -1318,7 +1499,9 @@ def create_app() -> FastAPI:
         window = get_observation_window(run_id)
         try:
             run = storage.get_run(run_id)
-            experiment = storage.get_experiment(run.experiment_id, run.experiment_version)
+            experiment = storage.get_experiment(
+                run.experiment_id, run.experiment_version
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         namespace = experiment.spec.get("scope", {}).get("namespace", "sock-shop")
@@ -1339,12 +1522,8 @@ def create_app() -> FastAPI:
         metrics_config = observability.get("metrics") or {}
         traces_config = observability.get("traces") or {}
         historical = experiment.spec.get("historical_observability") or {}
-        historical_url = (
-            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
-        )
-        timeout = _mcp_client_timeout_seconds(
-            metrics_config, traces_config, historical
-        )
+        historical_url = historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
+        timeout = _mcp_client_timeout_seconds(metrics_config, traces_config, historical)
         attempt_id = uuid4().hex
         with get_tracer().start_as_current_span("agent.multiagent_rca") as span:
             span.set_attribute("rca.run_id", run_id)
@@ -1370,7 +1549,11 @@ def create_app() -> FastAPI:
             )
             result["artifact_path"] = artifact_path
             if result["status"] == "error":
-                span.set_status(Status(StatusCode.ERROR, result.get("error") or "Multiagent RCA failed"))
+                span.set_status(
+                    Status(
+                        StatusCode.ERROR, result.get("error") or "Multiagent RCA failed"
+                    )
+                )
         storage.append_event(
             DomainEvent(
                 run_id=run_id,
@@ -1401,10 +1584,10 @@ def create_app() -> FastAPI:
     @app.post("/api/runs/{run_id}/skill-rca")
     def run_skill_rca(
         run_id: str,
-        options: RCABenchmarkOptions | None = None,
+        options: SkillRCABenchmarkOptions | None = None,
         history_campaign_id: str | None = None,
     ) -> dict:
-        options = options or RCABenchmarkOptions()
+        options = options or SkillRCABenchmarkOptions()
         window = get_observation_window(run_id)
         phases = window.get("phases") or {}
         if not {"baseline", "fault"}.issubset(phases):
@@ -1422,12 +1605,8 @@ def create_app() -> FastAPI:
         metrics_config = observability.get("metrics") or {}
         traces_config = observability.get("traces") or {}
         historical = experiment.spec.get("historical_observability") or {}
-        historical_url = (
-            historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
-        )
-        timeout = _mcp_client_timeout_seconds(
-            metrics_config, traces_config, historical
-        )
+        historical_url = historical.get("mcp_sse_url") or DEFAULT_HISTORICAL_MCP_SSE_URL
+        timeout = _mcp_client_timeout_seconds(metrics_config, traces_config, historical)
         archive_campaign_id = history_campaign_id or run.experiment_id
         archive_traces = None
         archive_status = "not_configured"
@@ -1458,14 +1637,24 @@ def create_app() -> FastAPI:
                 result = answer_skill_rca(
                     mcp_client=MCPToolClient(str(historical_url), timeout),
                     phases=phases,
-                    namespace=str(experiment.spec.get("scope", {}).get("namespace", "sock-shop")),
+                    namespace=str(
+                        experiment.spec.get("scope", {}).get("namespace", "sock-shop")
+                    ),
                     max_additional_checks=options.max_additional_checks,
+                    max_model_calls=options.max_model_calls,
+                    max_total_tokens=options.max_total_tokens,
+                    timeout_seconds=options.timeout_seconds,
                     window_metadata={
                         key: window[key]
-                        for key in ("phase_sources", "partial", "sampling_interval_seconds")
+                        for key in (
+                            "phase_sources",
+                            "partial",
+                            "sampling_interval_seconds",
+                        )
                         if key in window
                     },
                     possible_fault_types=options.possible_fault_types,
+                    resource_signature_policy=options.resource_signature_policy,
                     require_best_guess=options.require_best_guess,
                     archive_traces=archive_traces,
                     evidence_source="history",
@@ -1485,6 +1674,9 @@ def create_app() -> FastAPI:
                     "model": model,
                     "temperature": options.temperature,
                     "seed": options.seed,
+                    "resource_signature": resource_signature_metadata(
+                        options.resource_signature_policy
+                    ),
                     "history_archive": {
                         "status": archive_status,
                         "campaign_id": (
@@ -1509,7 +1701,11 @@ def create_app() -> FastAPI:
         storage.append_event(
             DomainEvent(
                 run_id=run_id,
-                event_type="skill_rca_completed" if result["status"] != "error" else "skill_rca_failed",
+                event_type=(
+                    "skill_rca_completed"
+                    if result["status"] != "error"
+                    else "skill_rca_failed"
+                ),
                 ts=result["generated_at"],
                 payload={
                     "attempt_id": attempt_id,
@@ -1521,7 +1717,11 @@ def create_app() -> FastAPI:
         if result["status"] == "error":
             raise HTTPException(
                 status_code=502,
-                detail={"error": result["error"], "artifact_path": artifact_path, "attempt_id": attempt_id},
+                detail={
+                    "error": result["error"],
+                    "artifact_path": artifact_path,
+                    "attempt_id": attempt_id,
+                },
             )
         return result
 
@@ -1545,9 +1745,7 @@ def create_app() -> FastAPI:
         migration = run.summary.get("history_migration") or {}
         if historical.get("mode") == "dual_write":
             mcp_url = historical.get("mcp_sse_url")
-            service = (experiment.spec.get("controlled_campaign") or {}).get(
-                "service"
-            )
+            service = (experiment.spec.get("controlled_campaign") or {}).get("service")
             namespace = (experiment.spec.get("scope") or {}).get(
                 "namespace", "sock-shop"
             )
@@ -2055,7 +2253,9 @@ def create_app() -> FastAPI:
                 return
             span.set_attribute(GenAI.USAGE_INPUT_TOKENS, input_tokens)
             span.set_attribute(GenAI.USAGE_OUTPUT_TOKENS, output_tokens)
-            span.set_attribute("gen_ai.usage.total_tokens", input_tokens + output_tokens)
+            span.set_attribute(
+                "gen_ai.usage.total_tokens", input_tokens + output_tokens
+            )
             span.set_attribute("rca.llm.token_count_source", "measured")
             record_llm_metrics(
                 input_tokens=input_tokens,
@@ -2281,7 +2481,9 @@ def create_app() -> FastAPI:
                     "attempt": 1,
                     "retry": False,
                     "response_chars": len(raw),
-                    "response_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12],
+                    "response_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest()[
+                        :12
+                    ],
                 }
                 if capture_content():
                     response_event["response"] = _trim_for_span(raw)
@@ -2565,13 +2767,17 @@ def create_app() -> FastAPI:
                 span.set_attribute("gen_ai.operation.name", "decision")
                 span.set_attribute("rca.decision.rca.source", rca_source)
                 span.set_attribute("rca.decision.fault_category.source", fault_source)
-                span.set_attribute("rca.decision.rca.value", str(analysis.get("rca") or ""))
+                span.set_attribute(
+                    "rca.decision.rca.value", str(analysis.get("rca") or "")
+                )
                 span.set_attribute(
                     "rca.decision.fault_category.value",
                     str(analysis.get("fault_category") or ""),
                 )
                 if analysis.get("confidence") is not None:
-                    span.set_attribute("rca.decision.confidence", float(analysis["confidence"]))
+                    span.set_attribute(
+                        "rca.decision.confidence", float(analysis["confidence"])
+                    )
                 span.set_attribute(
                     "rca.decision.citation_count",
                     len(parsed.get("citations") or []),
@@ -2735,5 +2941,9 @@ def create_app() -> FastAPI:
                 ) from exc
         return storage.list_chaos_catalog()
 
-    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
+    app.mount(
+        "/",
+        FrontendStaticFiles(directory=str(frontend_dir), html=True),
+        name="frontend",
+    )
     return app

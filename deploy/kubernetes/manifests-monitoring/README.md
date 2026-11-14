@@ -229,6 +229,9 @@ source samples to be covered, not the removal of unrelated target series.
 HTTP scope limits the scan to Istio RED, HTTP client/server and namespace-scoped
 Tempo metrics. Coverage tolerates the additional historical `history_campaign`
 provenance label without rewriting original labels or duplicating existing scrapes.
+When importing, the migrator copies the unique campaign label already present in
+that run's historical series onto missing samples; multiple campaign labels block
+the write. Source metric labels, timestamps and values otherwise remain unchanged.
 Unscoped legacy Tempo metrics are not automatically assigned to a namespace.
 
 Create the namespace and generated S3 credentials, then build the migrator
